@@ -1,0 +1,1132 @@
+from .LearningAgent import LearningAgent
+from .Action import Action
+from .Request import Request
+from .Path import PathNode, RequestInfo
+
+from typing import Type, List, Generator, Tuple, Deque, Dict
+
+from abc import ABCMeta, abstractmethod
+from random import choice, randint
+from pandas import read_csv
+from collections import deque
+import gurobipy as gp  # type: ignore
+from gurobipy import GRB  # type: ignore
+import re
+import random
+import numpy as np
+from .charging_station import ChargingStationManager, ChargingStation
+from .Action import Action, ChargingAction, ServiceAction
+from src.GurobiOptimizer import GurobiOptimizer
+
+class Environment(metaclass=ABCMeta):
+    """Defines a class for simulating the Environment for the RL agent"""
+
+    REQUEST_HISTORY_SIZE: int = 1000
+
+    def __init__(self, NUM_LOCATIONS: int, MAX_CAPACITY: int, EPOCH_LENGTH: float, NUM_AGENTS: int, START_EPOCH: float, STOP_EPOCH: float, DATA_DIR: str):
+        # Load environment
+        self.NUM_LOCATIONS = NUM_LOCATIONS
+        self.MAX_CAPACITY = MAX_CAPACITY
+        self.EPOCH_LENGTH = EPOCH_LENGTH
+        self.NUM_AGENTS = NUM_AGENTS
+        self.START_EPOCH = START_EPOCH
+        self.STOP_EPOCH = STOP_EPOCH
+        self.DATA_DIR = DATA_DIR
+
+        self.num_days_trained = 0
+        self.recent_request_history: Deque[Request] = deque(maxlen=self.REQUEST_HISTORY_SIZE)
+        self.current_time: float = 0.0
+        
+        # Q-learning components for ADP integration
+        self.q_table = {}  # Q-table for state-action values
+        self.learning_rate = 0.1
+        self.discount_factor = 0.9
+        self.epsilon = 0.1  # Exploration rate
+
+    @abstractmethod
+    def initialise_environment(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_request_batch(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_travel_time(self, source, destination):
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_next_location(self, source, destination):
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_initial_states(self, num_agents, is_training):
+        raise NotImplementedError
+
+    def simulate_motion(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True) -> None:
+        # Move all agents
+        agents_to_rebalance: List[Tuple[LearningAgent, float]] = []
+        for agent in agents:
+            time_remaining: float = self.EPOCH_LENGTH
+            time_remaining = self._move_agent(agent, time_remaining)
+            # If it has visited all the locations it needs to and has time left, rebalance
+            if (time_remaining > 0):
+                agents_to_rebalance.append((agent, time_remaining))
+
+        # Update recent_requests list
+        self.update_recent_requests(current_requests)
+
+        # Perform Rebalancing
+        if (rebalance and agents_to_rebalance):
+            rebalancing_targets = self._get_rebalance_targets([agent for agent, _ in agents_to_rebalance])
+
+            # Move cars according to the rebalancing_targets
+            for idx, target in enumerate(rebalancing_targets):
+                agent, time_remaining = agents_to_rebalance[idx]
+
+                # Insert dummy target
+                agent.path.requests.append(RequestInfo(target, False, True))
+                agent.path.request_order.append(PathNode(False, 0))  # adds pickup location to 'to-visit' list
+
+                # Move according to dummy target
+                self._move_agent(agent, time_remaining)
+
+                # Undo impact of creating dummy target
+                agent.path.request_order.clear()
+                agent.path.requests.clear()
+                agent.path.current_capacity = 0
+                agent.path.total_delay = 0
+
+    def _move_agent(self, agent: LearningAgent, time_remaining: float) -> float:
+        while(time_remaining >= 0):
+            time_remaining -= agent.position.time_to_next_location
+
+            # If we reach an intersection, make a decision about where to go next
+            if (time_remaining >= 0):
+                # If the intersection is an existing pick-up or drop-off location, update the Agent's path
+                if (agent.position.next_location == agent.path.get_next_location()):
+                    agent.path.visit_next_location(self.current_time + self.EPOCH_LENGTH - time_remaining)
+
+                # Go to the next location in the path, if it exists
+                if (not agent.path.is_empty()):
+                    next_location = self.get_next_location(agent.position.next_location, agent.path.get_next_location())
+                    agent.position.time_to_next_location = self.get_travel_time(agent.position.next_location, next_location)
+                    agent.position.next_location = next_location
+
+                # If no additional locations need to be visited, stop
+                else:
+                    agent.position.time_to_next_location = 0
+                    break
+            # Else, continue down the road you're on
+            else:
+                agent.position.time_to_next_location -= (time_remaining + agent.position.time_to_next_location)
+
+        return time_remaining
+
+    def get_state_representation(self, agent_position: int, target_position: int, 
+                                current_time: float) -> str:
+        """Get state representation for Q-learning"""
+        # Discretize time for state representation
+        time_slot = int(current_time // 10)  # 10-minute time slots
+        return f"{agent_position}_{target_position}_{time_slot}"
+    
+    def get_q_value(self, state: str, action: str) -> float:
+        """Get Q-value for state-action pair"""
+        key = f"{state}_{action}"
+        return self.q_table.get(key, 0.0)
+    
+    def update_q_value(self, state: str, action: str, reward: float, next_state: str):
+        """Update Q-value using Q-learning algorithm"""
+        key = f"{state}_{action}"
+        
+        # Get current Q-value
+        current_q = self.get_q_value(state, action)
+        
+        # Get max Q-value for next state (assuming action is assignment)
+        next_q_values = [self.get_q_value(next_state, f"assign_{i}") for i in range(10)]
+        max_next_q = max(next_q_values) if next_q_values else 0.0
+        
+        # Q-learning update
+        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
+        self.q_table[key] = new_q
+    
+    def get_assignment_q_value(self, agent_id: int, target_id: int, 
+                              agent_position: int, target_position: int) -> float:
+        """Get Q-value for a specific assignment"""
+        state = self.get_state_representation(agent_position, target_position, self.current_time)
+        action = f"assign_{target_id}"
+        return self.get_q_value(state, action)
+    
+    def _get_rebalance_targets(self, agents: List) -> List:
+        """Get rebalancing targets using Gurobi optimization with Q-learning integration"""
+        # Get a list of possible targets by sampling from recent_requests
+        possible_targets: List[Request] = []
+        num_targets = min(500, len(agents))
+        for _ in range(num_targets):
+            target = choice(self.recent_request_history)
+            possible_targets.append(target)
+
+        # Solve an LP to assign each agent to closest possible target
+        model = gp.Model()
+        model.setParam('OutputFlag', 0)  # Suppress output
+
+        # Define variables, a matrix defining the assignment of agents to targets
+        assignments = {}
+        for agent_id in range(len(agents)):
+            for target_id in range(len(possible_targets)):
+                assignments[agent_id, target_id] = model.addVar(vtype=GRB.Binary, 
+                                                              name=f'assignment_{agent_id}_{target_id}')
+
+        # Make sure one agent can only be assigned to one target
+        for agent_id in range(len(agents)):
+            model.addConstr(gp.quicksum(assignments[agent_id, target_id] 
+                                      for target_id in range(len(possible_targets))) == 1)
+
+        # Make sure one target can only be assigned to *ratio* agents
+        num_fractional_targets = len(agents) - (int(len(agents) / num_targets) * num_targets)
+        for target_id in range(len(possible_targets)):
+            num_agents_to_target = int(len(agents) / num_targets) + (1 if target_id < num_fractional_targets else 0)
+            model.addConstr(gp.quicksum(assignments[agent_id, target_id] 
+                                      for agent_id in range(len(agents))) == num_agents_to_target)
+
+        # Define the objective: Combine distance cost and Q-value benefit
+        distance_weight = 0.7
+        q_weight = 0.3
+        
+        # Distance cost component
+        distance_obj = gp.quicksum(assignments[agent_id, target_id] * 
+                                 self.get_travel_time(agents[agent_id].position.next_location, 
+                                                    possible_targets[target_id].pickup) 
+                                 for target_id in range(len(possible_targets)) 
+                                 for agent_id in range(len(agents)))
+        
+        # Q-value benefit component (negative because we want to maximize benefit)
+        q_value_obj = gp.quicksum(assignments[agent_id, target_id] * 
+                                (-self.get_assignment_q_value(agent_id, target_id,
+                                                            agents[agent_id].position.next_location,
+                                                            possible_targets[target_id].pickup))
+                                for target_id in range(len(possible_targets)) 
+                                for agent_id in range(len(agents)))
+        
+        # Combined objective function
+        obj = distance_weight * distance_obj + q_weight * q_value_obj
+        model.setObjective(obj, GRB.MINIMIZE)
+
+        # Solve
+        model.optimize()
+        assert model.status == GRB.OPTIMAL  # making sure that the model doesn't fail
+
+        # Get the assigned targets
+        assigned_targets: List[Request] = []
+        for agent_id in range(len(agents)):
+            for target_id in range(len(possible_targets)):
+                if (assignments[agent_id, target_id].x == 1):
+                    assigned_targets.append(possible_targets[target_id])
+                    break
+
+        return assigned_targets
+
+    def get_reward(self, action: Action) -> float:
+        """
+        Return the reward to an agent for a given (feasible) action.
+
+        (Feasibility is not checked!)
+        Defined in Environment class because of Reinforcement Learning
+        convention in literature.
+        """
+        return sum([request.value for request in action.requests])
+
+    def update_recent_requests(self, recent_requests: List[Request]):
+        self.recent_request_history.extend(recent_requests)
+
+
+class NYEnvironment(Environment):
+    """Define an Environment using the cleaned NYC Yellow Cab dataset."""
+
+    NUM_MAX_AGENTS: int = 3000
+    NUM_LOCATIONS: int = 4461
+
+    def __init__(self, NUM_AGENTS: int, START_EPOCH: float, STOP_EPOCH: float, MAX_CAPACITY, DATA_DIR: str='../data/ny/', EPOCH_LENGTH: float = 60.0):
+        super().__init__(NUM_LOCATIONS=self.NUM_LOCATIONS, MAX_CAPACITY=MAX_CAPACITY, EPOCH_LENGTH=EPOCH_LENGTH, NUM_AGENTS=NUM_AGENTS, START_EPOCH=START_EPOCH, STOP_EPOCH=STOP_EPOCH, DATA_DIR=DATA_DIR)
+        self.initialise_environment()
+
+    def initialise_environment(self):
+        print('Loading Environment...')
+
+        TRAVELTIME_FILE: str = self.DATA_DIR + 'zone_traveltime.csv'
+        self.travel_time = read_csv(TRAVELTIME_FILE, header=None).values
+
+        SHORTESTPATH_FILE: str = self.DATA_DIR + 'zone_path.csv'
+        self.shortest_path = read_csv(SHORTESTPATH_FILE, header=None).values
+
+        IGNOREDZONES_FILE: str = self.DATA_DIR + 'ignorezonelist.txt'
+        self.ignored_zones = read_csv(IGNOREDZONES_FILE, header=None).values.flatten()
+
+        INITIALZONES_FILE: str = self.DATA_DIR + 'taxi_3000_final.txt'
+        self.initial_zones = read_csv(INITIALZONES_FILE, header=None).values.flatten()
+
+        assert (self.EPOCH_LENGTH == 60) or (self.EPOCH_LENGTH == 30) or (self.EPOCH_LENGTH == 10)
+        self.DATA_FILE_PREFIX: str = "{}files_{}sec/test_flow_5000_".format(self.DATA_DIR, int(self.EPOCH_LENGTH))
+
+    def get_request_batch(self,
+                          day: int=2,
+                          downsample: float=1) -> Generator[List[Request], None, None]:
+
+        assert 0 < downsample <= 1
+        request_id = 0
+
+        def is_in_time_range(current_time):
+            current_hour = int(current_time / 3600)
+            return True if (current_hour >= self.START_EPOCH / 3600 and current_hour < self.STOP_EPOCH / 3600) else False
+
+        # Open file to read
+        with open(self.DATA_FILE_PREFIX + str(day) + '.txt', 'r') as data_file:
+            num_batches: int = int(data_file.readline().strip())
+
+            # Defines the 2 possible RE for lines in the data file
+            new_epoch_re = re.compile(r'Flows:(\d+)-\d+')
+            request_re = re.compile(r'(\d+),(\d+),(\d+)\.0')
+
+            # Parsing rest of the file
+            request_list: List[Request] = []
+            is_first_epoch = True
+            for line in data_file.readlines():
+                line = line.strip()
+
+                is_new_epoch = re.match(new_epoch_re, line)
+                if (is_new_epoch is not None):
+                    if not is_first_epoch:
+                        if is_in_time_range(self.current_time):
+                            yield request_list
+                        request_list.clear()  # starting afresh for new batch
+                    else:
+                        is_first_epoch = False
+
+                    current_epoch = int(is_new_epoch.group(1))
+                    self.current_time = current_epoch * self.EPOCH_LENGTH
+                else:
+                    request_data = re.match(request_re, line)
+                    assert request_data is not None  # Make sure there's nothing funky going on with the formatting
+
+                    num_requests = int(request_data.group(3))
+                    for _ in range(num_requests):
+                        # Take request according to downsampled rate
+                        rand_num = random()
+                        if (rand_num <= downsample):
+                            source = int(request_data.group(1))
+                            destination = int(request_data.group(2))
+                            if (source not in self.ignored_zones and destination not in self.ignored_zones and source != destination):
+                                    travel_time = self.get_travel_time(source, destination)
+                                    request_list.append(Request(request_id, source, destination, self.current_time, travel_time))
+                                    request_id += 1
+
+            if is_in_time_range(self.current_time):
+                yield request_list
+
+    def get_travel_time(self, source: int, destination: int) -> float:
+        return self.travel_time[source, destination]
+
+    def get_next_location(self, source: int, destination: int) -> int:
+        return self.shortest_path[source, destination]
+
+    def get_initial_states(self, num_agents: int, is_training: bool) -> List[int]:
+        """Give initial states for num_agents agents"""
+        if (num_agents > self.NUM_MAX_AGENTS):
+            print('Too many agents. Starting with random states.')
+            is_training = True
+
+        # If it's training, get random states
+        if is_training:
+            initial_states = []
+
+            for _ in range(num_agents):
+                initial_state = randint(0, self.NUM_LOCATIONS - 1)
+                # Make sure it's not an ignored zone
+                while (initial_state in self.ignored_zones):
+                    initial_state = randint(0, self.NUM_LOCATIONS - 1)
+
+                initial_states.append(initial_state)
+        # Else, pick deterministic initial states
+        else:
+            initial_states = self.initial_zones[:num_agents]
+
+        return initial_states
+
+    def has_valid_path(self, agent: LearningAgent) -> bool:
+        """Attempt to check if the request order meets deadline and capacity constraints"""
+        def invalid_path_trace(issue: str) -> bool:
+            print(issue)
+            print('Agent {}:'.format(agent.id))
+            print('Requests -> {}'.format(agent.path.requests))
+            print('Request Order -> {}'.format(agent.path.request_order))
+            print()
+            return False
+
+        # Make sure that its current capacity is sensible
+        if (agent.path.current_capacity < 0 or agent.path.current_capacity > self.MAX_CAPACITY):
+            return invalid_path_trace('Invalid current capacity')
+
+        # Make sure that it visits all the requests that it has accepted
+        if (not agent.path.is_complete()):
+            return invalid_path_trace('Incomplete path.')
+
+        # Start at global_time and current_capacity
+        current_time = self.current_time + agent.position.time_to_next_location
+        current_location = agent.position.next_location
+        current_capacity = agent.path.current_capacity
+
+        # Iterate over path
+        available_delay: float = 0
+        for node_idx, node in enumerate(agent.path.request_order):
+            next_location, deadline = agent.path.get_info(node)
+
+            # Delay related checks
+            travel_time = self.get_travel_time(current_location, next_location)
+            if (current_time + travel_time > deadline):
+                return invalid_path_trace('Does not meet deadline at node {}'.format(node_idx))
+
+            current_time += travel_time
+            current_location = next_location
+
+            # Updating available delay
+            if (node.expected_visit_time != current_time):
+                invalid_path_trace("(Ignored) Visit time incorrect at node {}".format(node_idx))
+                node.expected_visit_time = current_time
+
+            if (node.is_dropoff):
+                available_delay += deadline - node.expected_visit_time
+
+            # Capacity related checks
+            if (current_capacity > self.MAX_CAPACITY):
+                return invalid_path_trace('Exceeds MAX_CAPACITY at node {}'.format(node_idx))
+
+            if (node.is_dropoff):
+                next_capacity = current_capacity - 1
+            else:
+                next_capacity = current_capacity + 1
+            if (node.current_capacity != next_capacity):
+                invalid_path_trace("(Ignored) Capacity incorrect at node {}".format(node_idx))
+                node.current_capacity = next_capacity
+            current_capacity = node.current_capacity
+
+        # Check total_delay
+        if (agent.path.total_delay != available_delay):
+            invalid_path_trace("(Ignored) Total delay incorrect.")
+        agent.path.total_delay = available_delay
+
+        return True
+
+
+
+class ChargingIntegratedEnvironment(Environment):
+    """
+    Integrated charging environment class, inheriting from src.Environment
+    """
+    
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=10):
+        # Provide required parameters for base class
+        NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
+        MAX_CAPACITY = 4  # Maximum capacity per location
+        EPOCH_LENGTH = 1.0  # Length of each epoch
+        NUM_AGENTS = num_vehicles  # Number of vehicles/agents
+        START_EPOCH = 0.0  # Start time
+        STOP_EPOCH = 100.0  # Stop time
+        DATA_DIR = "data"  # Data directory (not used in this implementation)
+        
+        super().__init__(NUM_LOCATIONS, MAX_CAPACITY, EPOCH_LENGTH, NUM_AGENTS, START_EPOCH, STOP_EPOCH, DATA_DIR)
+        
+        self.num_vehicles = num_vehicles
+        self.num_stations = num_stations
+        self.grid_size = grid_size
+        
+        # Initialize charging station manager
+        self.charging_manager = ChargingStationManager()
+        self._setup_charging_stations()
+        
+        # Vehicle states
+        self.vehicles = {}
+        self._setup_vehicles()
+        
+        # Environment state
+        self.current_time = 0
+        self.episode_length = 100
+        
+        # Request system
+        self.active_requests = {}  # Active passenger requests
+        self.completed_requests = []  # Completed requests for analysis
+        self.rejected_requests = []  # Rejected requests for analysis
+        self.request_counter = 0
+        self.request_generation_rate = 0.3  # Probability of generating a request each step
+        
+        print(f"✓ Initialized integrated environment: {num_vehicles} vehicles, {num_stations} charging stations")
+    
+    def _setup_charging_stations(self):
+        """Setup charging stations dynamically based on num_stations"""
+        # Generate charging stations evenly distributed across the grid
+        stations = []
+        for i in range(self.num_stations):
+            # Distribute stations evenly across the grid
+            if self.num_stations == 1:
+                x, y = self.grid_size // 2, self.grid_size // 2
+            elif self.num_stations == 2:
+                positions = [(2, 2), (7, 7)]
+                x, y = positions[i]
+            elif self.num_stations == 3:
+                positions = [(2, 2), (5, 7), (8, 3)]
+                x, y = positions[i]
+            else:
+                # For more stations, distribute more evenly
+                cols = int(np.sqrt(self.num_stations))
+                rows = (self.num_stations + cols - 1) // cols
+                row = i // cols
+                col = i % cols
+                x = (col + 1) * self.grid_size // (cols + 1)
+                y = (row + 1) * self.grid_size // (rows + 1)
+            
+            location_index = y * self.grid_size + x
+            stations.append({
+                'id': i + 1,
+                'location': location_index,
+                'capacity': 10  # Unified capacity of 10
+            })
+        
+        for station_info in stations:
+            self.charging_manager.add_station(
+                station_info['id'],
+                station_info['location'],
+                station_info['capacity']
+            )
+    
+    def _setup_vehicles(self):
+        """Setup initial vehicle states with EV and AEV types"""
+        for i in range(self.num_vehicles):
+            # Convert grid coordinates to location index
+            x = random.randint(0, self.grid_size-1)
+            y = random.randint(0, self.grid_size-1)
+            location_index = y * self.grid_size + x
+            
+            # Determine vehicle type: 70% EV, 30% AEV
+            vehicle_type = 'AEV' if random.random() < 0.3 else 'EV'
+            
+            self.vehicles[i] = {
+                'type': vehicle_type,  # Vehicle type: EV or AEV
+                'location': location_index,  # Use location index instead of coordinates
+                'coordinates': (x, y),  # Keep coordinates for visualization
+                'battery': random.uniform(0.3, 0.9),  # 30%-90% battery
+                'charging_station': None,
+                'charging_time_left': 0,
+                'total_distance': 0,
+                'charging_count': 0,
+                'assigned_request': None,  # Currently assigned passenger request
+                'passenger_onboard': None,  # Passenger being transported
+                'service_earnings': 0,  # Total earnings from completed requests
+                'rejected_requests': 0  # Track rejected requests for analysis
+            }
+    
+    def _calculate_rejection_probability(self, vehicle_id, request):
+        """Calculate the probability that an EV rejects a request based on distance"""
+        vehicle = self.vehicles[vehicle_id]
+        
+        # AEV never rejects
+        if vehicle['type'] == 'AEV':
+            return 0.0
+        
+        # Calculate distance to pickup location
+        vehicle_coords = vehicle['coordinates']
+        pickup_coords = (request.pickup // self.grid_size, request.pickup % self.grid_size)
+        distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
+        
+        # Exponential distribution for rejection probability
+        # Base rejection rate increases exponentially with distance
+        base_rate = 0.1  # 10% base rejection rate for distance 0
+        distance_factor = 0.3  # Exponential growth factor
+        
+        rejection_prob = base_rate * np.exp(distance * distance_factor)
+        # Cap at 90% maximum rejection probability
+        return min(0.9, rejection_prob)
+    
+    def _should_reject_request(self, vehicle_id, request):
+        """Determine if a vehicle should reject a request"""
+        rejection_prob = self._calculate_rejection_probability(vehicle_id, request)
+        return random.random() < rejection_prob
+    
+    def _generate_requests(self):
+        """Generate new passenger requests"""
+        if random.random() < self.request_generation_rate:
+            self.request_counter += 1
+            
+            # Random pickup and dropoff locations
+            pickup_x = random.randint(0, self.grid_size - 1)
+            pickup_y = random.randint(0, self.grid_size - 1)
+            pickup_location = pickup_y * self.grid_size + pickup_x
+            
+            dropoff_x = random.randint(0, self.grid_size - 1)
+            dropoff_y = random.randint(0, self.grid_size - 1)
+            dropoff_location = dropoff_y * self.grid_size + dropoff_x
+            
+            # Ensure pickup and dropoff are different
+            while dropoff_location == pickup_location:
+                dropoff_x = random.randint(0, self.grid_size - 1)
+                dropoff_y = random.randint(0, self.grid_size - 1)
+                dropoff_location = dropoff_y * self.grid_size + dropoff_x
+            
+            # Calculate travel time (Manhattan distance)
+            travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+            
+            # Create request
+            request = Request(
+                request_id=self.request_counter,
+                source=pickup_location,
+                destination=dropoff_location,
+                current_time=self.current_time,
+                travel_time=travel_time,
+                value=2.0 + travel_time * 0.1  # Base fare + distance fare
+            )
+            
+            self.active_requests[self.request_counter] = request
+            print(f"Generated request {self.request_counter}: {request.pickup} -> {request.dropoff}")
+            return request
+        return None
+    
+    def _assign_request_to_vehicle(self, vehicle_id, request_id):
+        """Assign a request to a vehicle with rejection logic"""
+        if request_id in self.active_requests and vehicle_id in self.vehicles:
+            vehicle = self.vehicles[vehicle_id]
+            request = self.active_requests[request_id]
+            
+            if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
+                # Check if the vehicle rejects the request
+                if self._should_reject_request(vehicle_id, request):
+                    vehicle['rejected_requests'] += 1
+                    # Record rejected request if not already recorded
+                    if request not in self.rejected_requests:
+                        self.rejected_requests.append(request)
+                    return False  # Request rejected
+                
+                # Request accepted
+                vehicle['assigned_request'] = request_id
+                return True
+        return False
+    
+    def _pickup_passenger(self, vehicle_id):
+        """Vehicle picks up passenger at request pickup location"""
+        vehicle = self.vehicles[vehicle_id]
+        if vehicle['assigned_request'] is not None:
+            # Check if the assigned request still exists
+            if vehicle['assigned_request'] not in self.active_requests:
+                # Request has expired or been removed, clear the assignment
+                vehicle['assigned_request'] = None
+                return False
+                
+            request = self.active_requests[vehicle['assigned_request']]
+            vehicle_coords = vehicle['coordinates']
+            pickup_coords = (request.pickup // self.grid_size, request.pickup % self.grid_size)
+            
+            # Check if vehicle is at pickup location
+            if vehicle_coords == pickup_coords:
+                vehicle['passenger_onboard'] = vehicle['assigned_request']
+                vehicle['assigned_request'] = None
+                return True
+        return False
+    
+    def _dropoff_passenger(self, vehicle_id):
+        """Vehicle drops off passenger at destination"""
+        vehicle = self.vehicles[vehicle_id]
+        if vehicle['passenger_onboard'] is not None:
+            # Check if the passenger request still exists
+            if vehicle['passenger_onboard'] not in self.active_requests:
+                # Request has expired or been removed, clear the passenger
+                vehicle['passenger_onboard'] = None
+                return 0
+                
+            request = self.active_requests[vehicle['passenger_onboard']]
+            vehicle_coords = vehicle['coordinates']
+            dropoff_coords = (request.dropoff // self.grid_size, request.dropoff % self.grid_size)
+            
+            # Check if vehicle is at dropoff location
+            if vehicle_coords == dropoff_coords:
+                # Complete the request
+                completed_request = self.active_requests.pop(vehicle['passenger_onboard'])
+                self.completed_requests.append(completed_request)
+                
+                # Calculate earnings
+                earnings = completed_request.value
+                vehicle['passenger_onboard'] = None
+                
+                return earnings
+        return 0
+    
+    def get_initial_states(self, num_agents=None, is_training=True):
+        """Get initial states - implementing abstract method"""
+        if num_agents is None:
+            num_agents = self.num_vehicles
+        
+        states = {}
+        for vehicle_id in range(num_agents):
+            if vehicle_id in self.vehicles:
+                states[vehicle_id] = self._get_vehicle_state(vehicle_id)
+            else:
+                # Create default state for additional agents
+                states[vehicle_id] = np.array([0.5, 0.5, 0.5, 0, 0])
+        return states
+    
+    def initialise_environment(self):
+        """Initialize environment - implementing abstract method"""
+        self.current_time = 0
+        self._setup_vehicles()
+        return self.get_initial_states()
+    
+    def get_request_batch(self):
+        """Get request batch - implementing abstract method"""
+        # Return both passenger requests and charging needs
+        requests = []
+        
+        # Add passenger requests
+        for request_id, request in self.active_requests.items():
+            requests.append(request)
+        
+        # Add charging requests for low battery vehicles
+        for vehicle_id, vehicle in self.vehicles.items():
+            if vehicle['battery'] < 0.3:  # Low battery vehicles need charging
+                charging_request = Request(
+                    request_id=f"charge_{vehicle_id}",
+                    source=vehicle['location'],
+                    destination=vehicle['location'],  # Stay at same location for charging
+                    current_time=self.current_time,
+                    travel_time=0,
+                    value=0.5  # Small value for charging necessity
+                )
+                requests.append(charging_request)
+        
+        return requests
+    
+    def get_travel_time(self, source, destination):
+        """Get travel time between locations - implementing abstract method"""
+        if isinstance(source, tuple) and isinstance(destination, tuple):
+            # Manhattan distance as travel time
+            return abs(source[0] - destination[0]) + abs(source[1] - destination[1])
+        else:
+            # Default travel time
+            return 1.0
+    
+    def get_next_location(self, source, destination):
+        """Get next location towards destination - implementing abstract method"""
+        if isinstance(source, tuple) and isinstance(destination, tuple):
+            x_diff = destination[0] - source[0]
+            y_diff = destination[1] - source[1]
+            
+            # Move one step towards destination
+            next_x = source[0]
+            next_y = source[1]
+            
+            if x_diff > 0:
+                next_x += 1
+            elif x_diff < 0:
+                next_x -= 1
+            elif y_diff > 0:
+                next_y += 1
+            elif y_diff < 0:
+                next_y -= 1
+                
+            return (next_x, next_y)
+        else:
+            return source
+    
+    def _get_vehicle_state(self, vehicle_id):
+        """Get vehicle state vector"""
+        vehicle = self.vehicles[vehicle_id]
+        coords = vehicle['coordinates']
+        state = [
+            coords[0] / self.grid_size,  # Normalized x coordinate
+            coords[1] / self.grid_size,  # Normalized y coordinate
+            vehicle['battery'],                        # Battery level
+            float(vehicle['charging_station'] is not None),  # Whether charging
+            self.current_time / self.episode_length    # Time progress
+        ]
+        return np.array(state)
+    
+    def step(self, actions):
+        """执行一步环境交互"""
+        rewards = {}
+        next_states = {}
+        charging_events = []
+
+        # 处理每个车辆的动作
+        for vehicle_id, action in actions.items():
+            reward = self._execute_action(vehicle_id, action)
+            rewards[vehicle_id] = reward
+            next_states[vehicle_id] = self._get_vehicle_state(vehicle_id)
+
+            # Record charging events
+            if isinstance(action, ChargingAction):
+                charging_events.append({
+                    'vehicle_id': vehicle_id,
+                    'station_id': action.charging_station_id,
+                    'duration': action.charging_duration,
+                    'time': self.current_time
+                })
+
+        # 更新环境状态
+        self._update_environment()
+
+        # 集成Gurobi优化和Q-learning更新
+        current_requests = list(self.active_requests.values())
+        self.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+
+        # 执行Q-learning更新
+        self._update_q_learning(actions, rewards, next_states)
+
+        # 检查是否结束
+        done = self.current_time >= self.episode_length
+
+        return next_states, rewards, done, {'charging_events': charging_events}
+
+    def simulate_motion(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True) -> None:
+        """Override simulate_motion to integrate Gurobi optimization with Q-learning for charging environment"""
+        if agents is None:
+            agents = []
+
+        # For ChargingIntegratedEnvironment, we handle rebalancing differently
+        # Convert our vehicle states to a format compatible with Gurobi optimization
+
+        if rebalance and self.vehicles:
+            # Get vehicles that need rebalancing (not currently assigned to tasks or charging)
+            vehicles_to_rebalance = []
+            for vehicle_id, vehicle in self.vehicles.items():
+                if (vehicle['assigned_request'] is None and
+                    vehicle['passenger_onboard'] is None and
+                    vehicle['charging_station'] is None):
+                    vehicles_to_rebalance.append(vehicle_id)
+
+            if vehicles_to_rebalance:
+                # Use Gurobi optimization for rebalancing
+                rebalancing_assignments = self._optimize_vehicle_rebalancing(vehicles_to_rebalance)
+
+                # Apply the rebalancing assignments
+                for vehicle_id, target_request in rebalancing_assignments.items():
+                    if target_request:
+                        # Assign the vehicle to the target request
+                        self._assign_request_to_vehicle(vehicle_id, target_request.request_id)
+
+        # Update recent requests list if provided
+        if current_requests:
+            self.update_recent_requests(current_requests)
+
+    def _optimize_vehicle_rebalancing(self, vehicle_ids: List[int]) -> Dict[int, Request]:
+        """Use Gurobi optimization to assign vehicles to available requests"""
+        assignments = {}
+
+        if not self.active_requests:
+            return assignments
+
+        # Convert active requests to list
+        available_requests = list(self.active_requests.values())
+
+        if not available_requests:
+            return assignments
+
+        # Create Gurobi model for vehicle-to-request assignment
+        import gurobipy as gp
+        from gurobipy import GRB
+
+        model = gp.Model("vehicle_rebalancing")
+        model.setParam('OutputFlag', 0)  # Suppress output
+
+        # Decision variables: x[i,j] = 1 if vehicle i is assigned to request j
+        x = {}
+        for i, vehicle_id in enumerate(vehicle_ids):
+            for j, request in enumerate(available_requests):
+                x[i, j] = model.addVar(vtype=GRB.BINARY,
+                                     name=f'vehicle_{vehicle_id}_request_{request.request_id}')
+
+        # Constraint 1: Each vehicle can be assigned to at most one request
+        for i in range(len(vehicle_ids)):
+            model.addConstr(gp.quicksum(x[i, j] for j in range(len(available_requests))) <= 1)
+
+        # Constraint 2: Each request can be assigned to at most one vehicle
+        for j in range(len(available_requests)):
+            model.addConstr(gp.quicksum(x[i, j] for i in range(len(vehicle_ids))) <= 1)
+
+        # Objective: Maximize total value (considering distance and Q-value)
+        objective_terms = []
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.vehicles[vehicle_id]
+            vehicle_pos = vehicle['coordinates']
+
+            for j, request in enumerate(available_requests):
+                # Calculate distance cost
+                pickup_pos = (request.pickup // self.grid_size, request.pickup % self.grid_size)
+                distance = abs(vehicle_pos[0] - pickup_pos[0]) + abs(vehicle_pos[1] - pickup_pos[1])
+                distance_cost = distance * 0.1  # Distance penalty
+
+                # Get Q-value benefit
+                q_value = self.get_assignment_q_value(vehicle_id, request.request_id,
+                                                    vehicle['location'], request.pickup)
+
+                # Combined objective: request value - distance cost + Q-value benefit
+                total_value = request.value - distance_cost + q_value * 0.3
+                objective_terms.append(total_value * x[i, j])
+
+        model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
+
+        # Solve the optimization problem
+        model.optimize()
+
+        # Extract assignments
+        if model.status == GRB.OPTIMAL:
+            for i, vehicle_id in enumerate(vehicle_ids):
+                for j, request in enumerate(available_requests):
+                    if x[i, j].x > 0.5:  # Binary variable threshold
+                        assignments[vehicle_id] = request
+                        break
+
+        return assignments
+
+    def _update_q_learning(self, actions, rewards, next_states):
+        """Update Q-learning based on actions taken and rewards received"""
+        for vehicle_id in actions.keys():
+            if vehicle_id in self.vehicles:
+                # Get current state representation
+                current_state = self.get_state_representation(
+                    self.vehicles[vehicle_id]['location'],
+                    0,  # Default target location
+                    self.current_time
+                )
+
+                # Get action taken
+                action = actions[vehicle_id]
+
+                # Determine action representation for Q-learning
+                if hasattr(action, 'request_id') and action.request_id is not None:
+                    action_str = f"accept_request_{action.request_id}"
+                elif hasattr(action, 'charging_station_id'):
+                    action_str = f"charge_station_{action.charging_station_id}"
+                else:
+                    action_str = "move"
+
+                # Get reward
+                reward = rewards[vehicle_id]
+
+                # Get next state representation
+                next_state = self.get_state_representation(
+                    self.vehicles[vehicle_id]['location'],
+                    0,  # Default target location
+                    self.current_time + 1
+                )
+
+                # Update Q-value
+                self.update_q_value(current_state, action_str, reward, next_state)
+
+    def _execute_action(self, vehicle_id, action):
+        """执行车辆动作"""
+        vehicle = self.vehicles[vehicle_id]
+        reward = 0
+        
+        if isinstance(action, ChargingAction):
+            # Charging action
+            if vehicle['charging_station'] is None:
+                # Get the charging station and try to start charging
+                station_id = action.charging_station_id
+                if station_id in self.charging_manager.stations:
+                    station = self.charging_manager.stations[station_id]
+                    success = station.start_charging(str(vehicle_id))
+                    if success:
+                        vehicle['charging_station'] = station_id
+                        vehicle['charging_time_left'] = action.charging_duration
+                        vehicle['charging_count'] += 1
+                        # Charging should have negative reward as it prevents service
+                        # But slightly positive for low battery situations
+                        if vehicle['battery'] < 0.2:
+                            reward += 0.5  # Small bonus for critical charging
+                        elif vehicle['battery'] < 0.3:
+                            reward += 0.2  # Small bonus for low battery charging
+                        else:
+                            reward -= 0.5  # Penalty for unnecessary charging
+                    else:
+                        reward -= 1.0  # Charging failed penalty
+                else:
+                    reward -= 1.0  # Invalid station penalty
+            else:
+                reward -= 0.5  # Already charging penalty
+        
+        elif isinstance(action, ServiceAction):
+            # Service action - try to accept or progress with a request
+            if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
+                # Try to assign the request
+                if self._assign_request_to_vehicle(vehicle_id, action.request_id):
+                    reward += 1.0  # Reward for accepting a request
+                else:
+                    reward -= 0.5  # Penalty for invalid request
+            elif vehicle['assigned_request'] is not None:
+                # Try to pickup passenger
+                if self._pickup_passenger(vehicle_id):
+                    reward += 3.0  # Reward for successful pickup
+            elif vehicle['passenger_onboard'] is not None:
+                # Try to dropoff passenger
+                earnings = self._dropoff_passenger(vehicle_id)
+                if earnings > 0:
+                    reward += earnings + 5.0  # Fare earnings + completion bonus
+        
+        else:
+            # Movement action (simplified as random movement)
+            if vehicle['charging_station'] is None:
+                # Only vehicles not charging can move
+                old_coords = vehicle['coordinates']
+                new_x = max(0, min(self.grid_size-1, 
+                                 old_coords[0] + random.randint(-1, 1)))
+                new_y = max(0, min(self.grid_size-1, 
+                                 old_coords[1] + random.randint(-1, 1)))
+                
+                distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
+                new_location_index = new_y * self.grid_size + new_x
+                
+                vehicle['coordinates'] = (new_x, new_y)
+                vehicle['location'] = new_location_index
+                vehicle['total_distance'] += distance
+                
+                # Movement consumes battery (reduced consumption)
+                vehicle['battery'] -= distance * 0.01  # Reduced from 0.02 to 0.01
+                vehicle['battery'] = max(0, vehicle['battery'])
+                
+                reward += 0.1  # Basic movement reward
+                
+                # Progressive low battery penalty
+                if vehicle['battery'] < 0.1:
+                    reward -= 5.0  # Critical battery
+                elif vehicle['battery'] < 0.2:
+                    reward -= 1.0  # Low battery warning
+                elif vehicle['battery'] < 0.3:
+                    reward -= 0.5  # Moderate battery warning
+        
+        return reward
+    
+    def _update_environment(self):
+        """Update environment state"""
+        self.current_time += 1
+        
+        # Generate new requests
+        new_request = self._generate_requests()
+        
+        # Update charging status
+        for vehicle_id, vehicle in self.vehicles.items():
+            if vehicle['charging_station'] is not None:
+                vehicle['charging_time_left'] -= 1
+                
+                # Charging increases battery (reduced rate for more realistic charging)
+                vehicle['battery'] += 0.05  # Reduced from 0.15 to 0.05 for slower charging
+                vehicle['battery'] = min(1.0, vehicle['battery'])
+                
+                # Charging complete
+                if vehicle['charging_time_left'] <= 0:
+                    station_id = vehicle['charging_station']
+                    if station_id in self.charging_manager.stations:
+                        station = self.charging_manager.stations[station_id]
+                        station.stop_charging(str(vehicle_id))
+                    vehicle['charging_station'] = None
+        
+        # Remove expired requests
+        current_time = self.current_time
+        expired_requests = []
+        for request_id, request in self.active_requests.items():
+            if current_time > request.pickup_deadline:
+                expired_requests.append(request_id)
+        
+        for request_id in expired_requests:
+            del self.active_requests[request_id]
+    
+    def reset(self):
+        """重置环境"""
+        self.current_time = 0
+        # Reset request system
+        self.active_requests = {}
+        self.completed_requests = []
+        self.rejected_requests = []
+        self.request_counter = 0
+        self._setup_vehicles()
+        return self.get_initial_states()
+    
+    def get_episode_stats(self):
+        """Get detailed statistics for current episode"""
+        # Calculate average battery level
+        total_battery = sum(v['battery'] for v in self.vehicles.values())
+        avg_battery = total_battery / len(self.vehicles) if self.vehicles else 0
+        
+        # Calculate total rejected requests (unique orders that were rejected)
+        total_rejected = len(self.rejected_requests)
+        
+        # Calculate average charging station utilization
+        total_capacity = sum(station.max_capacity for station in self.charging_manager.stations.values())
+        total_occupied = sum(len(station.current_vehicles) for station in self.charging_manager.stations.values())
+        avg_station_utilization = total_occupied / max(1, total_capacity)
+        avg_vehicles_per_station = total_occupied / max(1, len(self.charging_manager.stations))
+        
+        # Count active and completed requests
+        active_orders = len(self.active_requests)
+        completed_orders = len(self.completed_requests)
+        total_orders = active_orders + completed_orders + total_rejected
+        accepted_orders = active_orders + completed_orders
+        
+        # Vehicle type breakdown
+        ev_vehicles = [v for v in self.vehicles.values() if v['type'] == 'EV']
+        aev_vehicles = [v for v in self.vehicles.values() if v['type'] == 'AEV']
+        
+        ev_rejected = sum(v['rejected_requests'] for v in ev_vehicles)
+        aev_rejected = sum(v['rejected_requests'] for v in aev_vehicles)
+        
+        return {
+            'episode_time': self.current_time,
+            'total_orders': total_orders,
+            'accepted_orders': accepted_orders,
+            'rejected_orders': total_rejected,
+            'active_orders': active_orders,
+            'completed_orders': completed_orders,
+            'avg_battery_level': avg_battery,
+            'avg_vehicles_per_station': avg_vehicles_per_station,
+            'station_utilization_rate': avg_station_utilization,
+            'total_vehicles': len(self.vehicles),
+            'ev_count': len(ev_vehicles),
+            'aev_count': len(aev_vehicles),
+            'ev_rejected': ev_rejected,
+            'aev_rejected': aev_rejected,
+            'total_stations': len(self.charging_manager.stations),
+            'vehicles_charging': len([v for v in self.vehicles.values() if v['charging_station'] is not None]),
+            'total_earnings': sum(v['service_earnings'] for v in self.vehicles.values())
+        }
+
+    def get_stats(self):
+        """Get environment statistics including request fulfillment and vehicle types"""
+        total_battery = sum(v['battery'] for v in self.vehicles.values())
+        avg_battery = total_battery / len(self.vehicles)
+        
+        total_charging = sum(v['charging_count'] for v in self.vehicles.values())
+        total_earnings = sum(v['service_earnings'] for v in self.vehicles.values())
+        total_rejected = sum(v['rejected_requests'] for v in self.vehicles.values())
+        
+        # Vehicle type statistics
+        ev_vehicles = [v for v in self.vehicles.values() if v['type'] == 'EV']
+        aev_vehicles = [v for v in self.vehicles.values() if v['type'] == 'AEV']
+        
+        ev_rejected = sum(v['rejected_requests'] for v in ev_vehicles)
+        aev_rejected = sum(v['rejected_requests'] for v in aev_vehicles)
+        
+        vehicles_with_requests = len([v for v in self.vehicles.values() 
+                                    if v['assigned_request'] is not None or v['passenger_onboard'] is not None])
+        
+        return {
+            'average_battery': avg_battery,
+            'total_charging_events': total_charging,
+            'vehicles_charging': len([v for v in self.vehicles.values() 
+                                    if v['charging_station'] is not None]),
+            'active_requests': len(self.active_requests),
+            'completed_requests': len(self.completed_requests),
+            'total_earnings': total_earnings,
+            'vehicles_with_requests': vehicles_with_requests,
+            'request_fulfillment_rate': len(self.completed_requests) / max(1, len(self.completed_requests) + len(self.active_requests)),
+            'total_rejected_requests': total_rejected,
+            'ev_count': len(ev_vehicles),
+            'aev_count': len(aev_vehicles),
+            'ev_rejected': ev_rejected,
+            'aev_rejected': aev_rejected,
+            'ev_rejection_rate': ev_rejected / max(1, ev_rejected + len(self.completed_requests)) if ev_vehicles else 0,
+            'aev_rejection_rate': aev_rejected / max(1, aev_rejected + len(self.completed_requests)) if aev_vehicles else 0
+        }
