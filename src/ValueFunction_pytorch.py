@@ -171,6 +171,81 @@ class PyTorchRewardPlusDelay(PyTorchValueFunction):
         
         return scored_actions_all_agents
     
+    def get_q_value(self, vehicle_id: int, action_type: str, vehicle_location: int, 
+                   target_location: int, current_time: float = 0.0) -> float:
+        """
+        Simple Q-value calculation for ChargingIntegratedEnvironment
+        
+        Args:
+            vehicle_id: ID of the vehicle
+            action_type: Type of action ('assign', 'charge', 'move', 'idle')
+            vehicle_location: Current location of vehicle
+            target_location: Target location (request pickup or charging station)
+            current_time: Current simulation time
+            
+        Returns:
+            Q-value for the state-action pair
+        """
+        # Base reward calculation
+        base_reward = 0.0
+        
+        # Distance penalty
+        if hasattr(self, '_calculate_distance'):
+            distance = self._calculate_distance(vehicle_location, target_location)
+        else:
+            # Simple Manhattan distance approximation
+            distance = abs(vehicle_location - target_location)
+        
+        distance_penalty = distance * 0.1
+        
+        # Action-specific rewards
+        if action_type.startswith('assign'):
+            # Passenger service reward
+            base_reward = 10.0  # Base reward for serving passenger
+            # Add urgency bonus based on delay
+            urgency_bonus = self.delay_coefficient * max(0, 300 - current_time)  # 300 is max delay
+            base_reward += urgency_bonus
+            
+        elif action_type.startswith('charge'):
+            # Charging reward - depends on battery level (if available)
+            base_reward = 5.0  # Base charging benefit
+            # Negative delay penalty for charging (opportunity cost)
+            charging_delay_penalty = self.delay_coefficient * 30  # Assume 30 time units charging
+            base_reward -= charging_delay_penalty
+            
+        elif action_type == 'move':
+            # Movement has small cost
+            base_reward = -1.0
+            
+        elif action_type == 'idle':
+            # Idle has minimal cost
+            base_reward = -0.5
+        
+        # Final Q-value calculation
+        q_value = base_reward - distance_penalty
+        
+        return float(q_value)
+    
+    def _calculate_distance(self, loc1: int, loc2: int, grid_size: int = 10) -> float:
+        """Calculate Manhattan distance between two locations"""
+        x1, y1 = loc1 // grid_size, loc1 % grid_size
+        x2, y2 = loc2 // grid_size, loc2 % grid_size
+        return abs(x1 - x2) + abs(y1 - y2)
+    
+    def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
+                              vehicle_location: int, target_location: int, 
+                              current_time: float = 0.0) -> float:
+        """Get Q-value for vehicle assignment to request"""
+        return self.get_q_value(vehicle_id, f"assign_{target_id}", 
+                               vehicle_location, target_location, current_time)
+    
+    def get_charging_q_value(self, vehicle_id: int, station_id: int,
+                           vehicle_location: int, station_location: int,
+                           current_time: float = 0.0) -> float:
+        """Get Q-value for vehicle charging decision"""
+        return self.get_q_value(vehicle_id, f"charge_{station_id}",
+                               vehicle_location, station_location, current_time)
+
     def update(self, *args, **kwargs):
         """No learning required for this value function"""
         pass
@@ -178,6 +253,396 @@ class PyTorchRewardPlusDelay(PyTorchValueFunction):
     def remember(self, *args, **kwargs):
         """No experience storage required"""
         pass
+
+
+class PyTorchChargingValueFunction(PyTorchValueFunction):
+    """Neural network-based value function for ChargingIntegratedEnvironment using PyTorchPathBasedNetwork"""
+    
+    def __init__(self, grid_size: int = 10, num_vehicles: int = 8, 
+                 log_dir: str = "logs/charging_nn", device: str = 'cpu'):
+        super().__init__(log_dir=log_dir, device=device)
+        
+        self.grid_size = grid_size
+        self.num_vehicles = num_vehicles
+        self.num_locations = grid_size * grid_size
+        
+        # Initialize the neural network with increased capacity for complex environment
+        self.network = PyTorchPathBasedNetwork(
+            num_locations=self.num_locations,
+            max_capacity=6,  # Increased capacity for longer paths
+            embedding_dim=128,  # Larger embedding for complex environment
+            lstm_hidden=256,   # Larger LSTM for complex patterns
+            dense_hidden=512,   # Larger dense layer
+            pretrained_embeddings=None  # Explicitly set to None to ensure gradients
+        ).to(self.device)
+        
+        # Target network for stable DQN training
+        self.target_network = PyTorchPathBasedNetwork(
+            num_locations=self.num_locations,
+            max_capacity=6,
+            embedding_dim=128,
+            lstm_hidden=256,
+            dense_hidden=512,
+            pretrained_embeddings=None
+        ).to(self.device)
+        
+        # Copy weights from main network to target network
+        self.target_network.load_state_dict(self.network.state_dict())
+        self.target_update_frequency = 100  # Update target network every 100 steps
+        
+        # Ensure all parameters require gradients
+        total_params = 0
+        grad_params = 0
+        for name, param in self.network.named_parameters():
+            param.requires_grad = True
+            total_params += 1
+            if param.requires_grad:
+                grad_params += 1
+        
+        print(f"   Parameters requiring gradients: {grad_params}/{total_params}")
+        
+        # Optimizer for training - reduced learning rate for stable learning
+        self.optimizer = optim.Adam(self.network.parameters(), lr=2e-4, weight_decay=1e-5)
+        self.loss_fn = nn.MSELoss()
+        
+        # Learning rate scheduler for adaptive learning - more conservative
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.7, patience=50, 
+            min_lr=1e-6, verbose=True
+        )
+        
+        # Training data buffer - increased size for more diverse experiences
+        self.experience_buffer = deque(maxlen=20000)  # Doubled buffer size
+        
+        # Training metrics tracking
+        self.training_losses = []
+        self.q_values_history = []
+        self.training_step = 0
+        
+        print(f"✓ PyTorchChargingValueFunction initialized with neural network")
+        print(f"   - Grid size: {grid_size}x{grid_size}")
+        print(f"   - Network parameters: {sum(p.numel() for p in self.network.parameters())}")
+    
+    def get_q_value(self, vehicle_id: int, action_type: str, vehicle_location: int, 
+                   target_location: int, current_time: float = 0.0, 
+                   other_vehicles: int = 0, num_requests: int = 0) -> float:
+        """
+        Neural network-based Q-value calculation using PyTorchPathBasedNetwork
+        """
+        # Prepare input for neural network
+        path_locations, path_delays, time_tensor, others_tensor, requests_tensor = self._prepare_network_input(
+            vehicle_location, target_location, current_time, other_vehicles, num_requests, action_type
+        )
+        
+        # Forward pass through network
+        self.network.eval()
+        with torch.no_grad():
+            q_value = self.network(
+                path_locations=path_locations,
+                path_delays=path_delays,
+                current_time=time_tensor,
+                other_agents=others_tensor,
+                num_requests=requests_tensor
+            )
+        
+        return float(q_value.item())
+    
+    def _prepare_network_input(self, vehicle_location: int, target_location: int, 
+                              current_time: float, other_vehicles: int, num_requests: int,
+                              action_type: str):
+        """Prepare input tensors for the neural network"""
+        # Create path sequence: current location -> target location
+        path_locations = torch.zeros(1, 3, dtype=torch.long)  # batch_size=1, seq_len=3
+        path_delays = torch.zeros(1, 3, 1, dtype=torch.float32)
+        
+        # Set path: current -> target -> end
+        path_locations[0, 0] = vehicle_location + 1  # +1 because 0 is padding
+        path_locations[0, 1] = target_location + 1
+        path_locations[0, 2] = 0  # End token
+        
+        # Set delays based on action type
+        if action_type.startswith('assign'):
+            # Passenger service - delays based on urgency
+            path_delays[0, 0, 0] = 0.0  # No delay at current location
+            path_delays[0, 1, 0] = max(0.0, (300 - current_time) / 300)  # Normalized urgency
+        elif action_type.startswith('charge'):
+            # Charging action - charging time penalty
+            path_delays[0, 0, 0] = 0.0
+            path_delays[0, 1, 0] = 0.8  # High delay for charging (opportunity cost)
+        else:
+            # Movement or idle
+            path_delays[0, 0, 0] = 0.0
+            path_delays[0, 1, 0] = 0.1  # Small delay for movement
+        
+        # Normalize time (0-1 range)
+        time_tensor = torch.tensor([[current_time / 100.0]], dtype=torch.float32)  # Assume episode_length=100
+        
+        # Normalize other metrics
+        others_tensor = torch.tensor([[other_vehicles / self.num_vehicles]], dtype=torch.float32)
+        requests_tensor = torch.tensor([[num_requests / 10.0]], dtype=torch.float32)  # Assume max 10 requests
+        
+        # Move to device
+        return (path_locations.to(self.device), 
+                path_delays.to(self.device),
+                time_tensor.to(self.device),
+                others_tensor.to(self.device),
+                requests_tensor.to(self.device))
+    
+    def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
+                              vehicle_location: int, target_location: int, 
+                              current_time: float = 0.0, other_vehicles: int = 0, 
+                              num_requests: int = 0) -> float:
+        """Get Q-value for vehicle assignment to request using neural network"""
+        return self.get_q_value(vehicle_id, f"assign_{target_id}", 
+                               vehicle_location, target_location, current_time, 
+                               other_vehicles, num_requests)
+    
+    def get_charging_q_value(self, vehicle_id: int, station_id: int,
+                           vehicle_location: int, station_location: int,
+                           current_time: float = 0.0, other_vehicles: int = 0,
+                           num_requests: int = 0) -> float:
+        """Get Q-value for vehicle charging decision using neural network"""
+        return self.get_q_value(vehicle_id, f"charge_{station_id}",
+                               vehicle_location, station_location, current_time,
+                               other_vehicles, num_requests)
+    
+    def store_experience(self, vehicle_id: int, action_type: str, vehicle_location: int,
+                        target_location: int, current_time: float, reward: float,
+                        next_vehicle_location: int, other_vehicles: int = 0, num_requests: int = 0):
+        """Store experience for training"""
+        experience = {
+            'vehicle_id': vehicle_id,
+            'action_type': action_type,
+            'vehicle_location': vehicle_location,
+            'target_location': target_location,
+            'current_time': current_time,
+            'reward': reward,
+            'next_vehicle_location': next_vehicle_location,
+            'other_vehicles': other_vehicles,
+            'num_requests': num_requests
+        }
+        self.experience_buffer.append(experience)
+    
+    def train_step(self, batch_size: int = 64):  # Increased batch size
+        """Perform one training step using stored experiences with proper DQN algorithm"""
+        if len(self.experience_buffer) < batch_size * 2:  # Wait for more experiences
+            return 0.0
+        
+        # Sample random batch (Experience Replay)
+        batch = random.sample(list(self.experience_buffer), batch_size)
+        
+        # Separate current states and next states for batch processing
+        current_states = []
+        next_states = []
+        rewards = []
+        
+        for exp in batch:
+            # Current state
+            current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor = self._prepare_network_input(
+                exp['vehicle_location'], exp['target_location'], exp['current_time'], 
+                exp['other_vehicles'], exp['num_requests'], exp['action_type']
+            )
+            
+            current_states.append({
+                'path_locations': current_path_locations.squeeze(0),
+                'path_delays': current_path_delays.squeeze(0),
+                'current_time': current_time_tensor.squeeze(0),
+                'other_agents': current_others_tensor.squeeze(0),
+                'num_requests': current_requests_tensor.squeeze(0)
+            })
+            
+            # Next state (for target calculation)
+            next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor = self._prepare_network_input(
+                exp['next_vehicle_location'], exp['target_location'], 
+                exp['current_time'] + 1, exp['other_vehicles'], exp['num_requests'], exp['action_type']
+            )
+            
+            next_states.append({
+                'path_locations': next_path_locations.squeeze(0),
+                'path_delays': next_path_delays.squeeze(0),
+                'current_time': next_time_tensor.squeeze(0),
+                'other_agents': next_others_tensor.squeeze(0),
+                'num_requests': next_requests_tensor.squeeze(0)
+            })
+            
+            rewards.append(exp['reward'])
+        
+        # Stack batch inputs for current states
+        current_batch_path_locations = torch.stack([state['path_locations'] for state in current_states])
+        current_batch_path_delays = torch.stack([state['path_delays'] for state in current_states])
+        current_batch_current_time = torch.stack([state['current_time'] for state in current_states])
+        current_batch_other_agents = torch.stack([state['other_agents'] for state in current_states])
+        current_batch_num_requests = torch.stack([state['num_requests'] for state in current_states])
+        
+        # Stack batch inputs for next states
+        next_batch_path_locations = torch.stack([state['path_locations'] for state in next_states])
+        next_batch_path_delays = torch.stack([state['path_delays'] for state in next_states])
+        next_batch_current_time = torch.stack([state['current_time'] for state in next_states])
+        next_batch_other_agents = torch.stack([state['other_agents'] for state in next_states])
+        next_batch_num_requests = torch.stack([state['num_requests'] for state in next_states])
+        
+        # Current Q-values (with gradients)
+        self.network.train()
+        current_q_values = self.network(
+            path_locations=current_batch_path_locations,
+            path_delays=current_batch_path_delays,
+            current_time=current_batch_current_time,
+            other_agents=current_batch_other_agents,
+            num_requests=current_batch_num_requests
+        )
+        
+        # Next Q-values using target network (without gradients)
+        with torch.no_grad():
+            self.target_network.eval()
+            next_q_values = self.target_network(
+                path_locations=next_batch_path_locations,
+                path_delays=next_batch_path_delays,
+                current_time=next_batch_current_time,
+                other_agents=next_batch_other_agents,
+                num_requests=next_batch_num_requests
+            )
+        
+        # Calculate TD targets with improved stability
+        gamma = 0.95  # Slightly lower discount factor for stability
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(self.device).unsqueeze(1)
+        
+        # Apply reward clipping to prevent extreme targets
+        rewards_tensor = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
+        
+        # Calculate target Q-values with stability improvements
+        with torch.no_grad():
+            # Clip next Q-values to prevent instability
+            next_q_values = torch.clamp(next_q_values, min=-20.0, max=20.0)
+            target_q_values = rewards_tensor + gamma * next_q_values
+            
+        # Apply target clipping for additional stability
+        target_q_values = torch.clamp(target_q_values, min=-15.0, max=15.0)
+        
+        # Compute loss
+        loss = self.loss_fn(current_q_values, target_q_values)
+        loss_value = loss.item()  # Define loss_value immediately after loss computation
+        
+        # Additional safety check
+        if not loss.requires_grad:
+            print("WARNING: Loss does not require gradients!")
+            return 0.0
+        
+        # Backpropagation with gradient monitoring
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # Monitor gradients for debugging
+        total_grad_norm = 0.0
+        for name, param in self.network.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_grad_norm += param_norm.item() ** 2
+        total_grad_norm = total_grad_norm ** (1. / 2)
+        
+        # Clip gradients more aggressively
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=0.5)
+        self.optimizer.step()
+        
+        # Update learning rate scheduler based on loss
+        self.scheduler.step(loss_value)
+        
+        # Update target network periodically (key DQN component)
+        if self.training_step % self.target_update_frequency == 0:
+            self.target_network.load_state_dict(self.network.state_dict())
+            print(f"🔄 Target network updated at step {self.training_step}")
+        
+        # Record training metrics
+        self.training_losses.append(loss_value)
+        
+        # Record Q-values statistics
+        with torch.no_grad():
+            q_mean = current_q_values.mean().item()
+            q_std = current_q_values.std().item()
+            q_max = current_q_values.max().item()
+            q_min = current_q_values.min().item()
+            self.q_values_history.append({
+                'mean': q_mean, 'std': q_std, 'max': q_max, 'min': q_min
+            })
+        
+        self.training_step += 1
+        
+        # Print training progress occasionally with more details
+        if self.training_step % 50 == 0:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"Training step {self.training_step}: Loss={loss_value:.4f}, Q_mean={q_mean:.4f}, Q_std={q_std:.4f}, Q_range=[{q_min:.4f}, {q_max:.4f}], LR={current_lr:.6f}")
+        
+        return loss_value
+    
+    def get_value(self, experiences: List[Experience]) -> List[List[Tuple[Action, float]]]:
+        """Compatibility method for Experience-based interface"""
+        # This is a simplified implementation for compatibility
+        return []
+    
+    def update(self, *args, **kwargs):
+        """Update the neural network"""
+        if len(self.experience_buffer) > 100:
+            loss = self.train_step()
+            self.add_to_logs('training_loss', loss, self.training_step)
+            self.training_step += 1
+    
+    def remember(self, experience: Experience):
+        """Store experience (compatibility method)"""
+        # Convert Experience to our format if needed
+        pass
+    
+    def plot_training_metrics(self, save_path: str = None):
+        """Plot training losses and Q-values over time"""
+        import matplotlib.pyplot as plt
+        
+        if not self.training_losses:
+            print("No training data to plot")
+            return
+        
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
+        
+        # Plot training loss
+        ax1.plot(self.training_losses, label='Training Loss', color='red', alpha=0.7)
+        ax1.set_title('Neural Network Training Loss')
+        ax1.set_xlabel('Training Steps')
+        ax1.set_ylabel('MSE Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot Q-values mean
+        if self.q_values_history:
+            q_means = [q['mean'] for q in self.q_values_history]
+            q_stds = [q['std'] for q in self.q_values_history]
+            
+            ax2.plot(q_means, label='Q-value Mean', color='blue', alpha=0.7)
+            ax2.fill_between(range(len(q_means)), 
+                           [m - s for m, s in zip(q_means, q_stds)],
+                           [m + s for m, s in zip(q_means, q_stds)],
+                           alpha=0.2, color='blue', label='±1 Std')
+            ax2.set_title('Q-Values Statistics')
+            ax2.set_xlabel('Training Steps')
+            ax2.set_ylabel('Q-Value')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            # Plot Q-values standard deviation
+            ax3.plot(q_stds, label='Q-value Std Dev', color='green', alpha=0.7)
+            ax3.set_title('Q-Values Standard Deviation')
+            ax3.set_xlabel('Training Steps')
+            ax3.set_ylabel('Standard Deviation')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Training metrics plot saved to: {save_path}")
+        else:
+            plt.savefig('results/training_metrics.png', dpi=300, bbox_inches='tight')
+            print("Training metrics plot saved to: results/training_metrics.png")
+        
+        plt.show()
+        return fig
 
 
 class PyTorchPathBasedNetwork(nn.Module):

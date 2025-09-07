@@ -32,11 +32,13 @@ class Environment(metaclass=ABCMeta):
         self.START_EPOCH = START_EPOCH
         self.STOP_EPOCH = STOP_EPOCH
         self.DATA_DIR = DATA_DIR
-
+        self.adp_value = 0.5
         self.num_days_trained = 0
         self.recent_request_history: Deque[Request] = deque(maxlen=self.REQUEST_HISTORY_SIZE)
         self.current_time: float = 0.0
-        
+        self.idle_vehicle_requirement = 3
+        self.idle_penalty = 0.5
+        self.charging_penalty = 0.2
         # Q-learning components for ADP integration
         self.q_table = {}  # Q-table for state-action values
         self.learning_rate = 0.1
@@ -423,7 +425,7 @@ class ChargingIntegratedEnvironment(Environment):
     Integrated charging environment class, inheriting from src.Environment
     """
     
-    def __init__(self, num_vehicles=5, num_stations=3, grid_size=10):
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -439,6 +441,10 @@ class ChargingIntegratedEnvironment(Environment):
         self.num_stations = num_stations
         self.grid_size = grid_size
         
+        # Parameters for reward alignment with Gurobi optimization
+        self.charging_penalty = 10.0  # Penalty for charging action
+        self.adp_value = 1.0  # Weight for Q-value contribution
+        
         # Initialize charging station manager
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
@@ -449,16 +455,76 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Environment state
         self.current_time = 0
-        self.episode_length = 100
+        self.episode_length = 300  # Increased episode length for more complex scenarios
         
         # Request system
         self.active_requests = {}  # Active passenger requests
         self.completed_requests = []  # Completed requests for analysis
         self.rejected_requests = []  # Rejected requests for analysis
         self.request_counter = 0
-        self.request_generation_rate = 0.3  # Probability of generating a request each step
+        self.request_generation_rate = 0.6  # Increased to 60% for more active environment
+        
+        # Initialize ValueFunction for Q-value calculation (will be set externally)
+        self.value_function = None
         
         print(f"✓ Initialized integrated environment: {num_vehicles} vehicles, {num_stations} charging stations")
+    
+    def set_value_function(self, value_function):
+        """Set the value function for Q-value calculation"""
+        self.value_function = value_function
+        print(f"✓ Value function set: {type(value_function).__name__}")
+    
+    def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
+                              vehicle_location: int, target_location: int) -> float:
+        """Get Q-value for vehicle assignment using ValueFunction if available"""
+        if self.value_function and hasattr(self.value_function, 'get_assignment_q_value'):
+            # Provide additional context for neural network
+            other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
+            num_requests = len(self.active_requests)
+            
+            return self.value_function.get_assignment_q_value(
+                vehicle_id, target_id, vehicle_location, target_location, 
+                self.current_time, other_vehicles, num_requests)
+        else:
+            # Fallback to parent class method
+            return super().get_assignment_q_value(vehicle_id, target_id, vehicle_location, target_location)
+    
+    def get_charging_q_value(self, vehicle_id: int, station_id: int,
+                           vehicle_location: int, station_location: int) -> float:
+        """Get Q-value for vehicle charging decision"""
+        if self.value_function and hasattr(self.value_function, 'get_charging_q_value'):
+            # Provide additional context for neural network
+            other_vehicles = len([v for v in self.vehicles.values() if v['charging_station'] is not None])
+            num_requests = len(self.active_requests)
+            
+            return self.value_function.get_charging_q_value(
+                vehicle_id, station_id, vehicle_location, station_location, 
+                self.current_time, other_vehicles, num_requests)
+        else:
+            # Fallback calculation
+            distance = abs(vehicle_location - station_location)
+            return 5.0 - distance * 0.1  # Simple heuristic
+    
+    def store_q_learning_experience(self, vehicle_id: int, action_type: str, 
+                                   vehicle_location: int, target_location: int,
+                                   reward: float, next_vehicle_location: int):
+        """Store experience for Q-learning training"""
+        if (self.value_function and 
+            hasattr(self.value_function, 'store_experience')):
+            other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
+            num_requests = len(self.active_requests)
+            
+            self.value_function.store_experience(
+                vehicle_id=vehicle_id,
+                action_type=action_type,
+                vehicle_location=vehicle_location,
+                target_location=target_location,
+                current_time=self.current_time,
+                reward=reward,
+                next_vehicle_location=next_vehicle_location,
+                other_vehicles=other_vehicles,
+                num_requests=num_requests
+            )
     
     def _setup_charging_stations(self):
         """Setup charging stations dynamically based on num_stations"""
@@ -584,7 +650,7 @@ class ChargingIntegratedEnvironment(Environment):
             )
             
             self.active_requests[self.request_counter] = request
-            print(f"Generated request {self.request_counter}: {request.pickup} -> {request.dropoff}")
+            # print(f"Generated request {self.request_counter}: {request.pickup} -> {request.dropoff}")
             return request
         return None
     
@@ -606,6 +672,34 @@ class ChargingIntegratedEnvironment(Environment):
                 # Request accepted
                 vehicle['assigned_request'] = request_id
                 return True
+        return False
+    
+    def _move_vehicle_to_charging_station(self, vehicle_id, station_id):
+        """Move a vehicle to a charging station for rebalancing"""
+        if vehicle_id in self.vehicles and hasattr(self, 'charging_manager'):
+            vehicle = self.vehicles[vehicle_id]
+            
+            # Check if vehicle is available for charging assignment
+            if (vehicle['assigned_request'] is None and 
+                vehicle['passenger_onboard'] is None and
+                vehicle['charging_station'] is None and
+                vehicle['charging_time_left'] == 0):
+                
+                # Check if station exists and has available slots
+                if (station_id in self.charging_manager.stations and 
+                    self.charging_manager.stations[station_id].available_slots > 0):
+                    
+                    station = self.charging_manager.stations[station_id]
+                    # Convert station location to coordinates
+                    station_x = station.location // self.grid_size
+                    station_y = station.location % self.grid_size
+                    station_coords = (station_x, station_y)
+                    
+                    # Set vehicle destination to charging station
+                    vehicle['target_location'] = station_coords
+                    vehicle['charging_target'] = station_id
+                    
+                    return True
         return False
     
     def _pickup_passenger(self, vehicle_id):
@@ -799,88 +893,29 @@ class ChargingIntegratedEnvironment(Environment):
                     vehicles_to_rebalance.append(vehicle_id)
 
             if vehicles_to_rebalance:
-                # Use Gurobi optimization for rebalancing
-                rebalancing_assignments = self._optimize_vehicle_rebalancing(vehicles_to_rebalance)
+                # Use GurobiOptimizer for rebalancing
+                if not hasattr(self, 'gurobi_optimizer'):
+                    self.gurobi_optimizer = GurobiOptimizer(self)
+                
+                rebalancing_assignments = self.gurobi_optimizer.optimize_vehicle_rebalancing_reject(vehicles_to_rebalance)
 
                 # Apply the rebalancing assignments
                 for vehicle_id, target_request in rebalancing_assignments.items():
                     if target_request:
-                        # Assign the vehicle to the target request
-                        self._assign_request_to_vehicle(vehicle_id, target_request.request_id)
+                        # Check if it's a charging assignment (string) or request assignment (object)
+                        if isinstance(target_request, str) and target_request.startswith("charge_"):
+                            # Handle charging assignment
+                            station_id = target_request.replace("charge_", "")
+                            self._move_vehicle_to_charging_station(vehicle_id, station_id)
+                        elif hasattr(target_request, 'request_id'):
+                            # Handle regular request assignment  
+                            self._assign_request_to_vehicle(vehicle_id, target_request.request_id)
+                        else:
+                            print(f"Warning: Unknown assignment type for vehicle {vehicle_id}: {target_request}")
 
         # Update recent requests list if provided
         if current_requests:
             self.update_recent_requests(current_requests)
-
-    def _optimize_vehicle_rebalancing(self, vehicle_ids: List[int]) -> Dict[int, Request]:
-        """Use Gurobi optimization to assign vehicles to available requests"""
-        assignments = {}
-
-        if not self.active_requests:
-            return assignments
-
-        # Convert active requests to list
-        available_requests = list(self.active_requests.values())
-
-        if not available_requests:
-            return assignments
-
-        # Create Gurobi model for vehicle-to-request assignment
-        import gurobipy as gp
-        from gurobipy import GRB
-
-        model = gp.Model("vehicle_rebalancing")
-        model.setParam('OutputFlag', 0)  # Suppress output
-
-        # Decision variables: x[i,j] = 1 if vehicle i is assigned to request j
-        x = {}
-        for i, vehicle_id in enumerate(vehicle_ids):
-            for j, request in enumerate(available_requests):
-                x[i, j] = model.addVar(vtype=GRB.BINARY,
-                                     name=f'vehicle_{vehicle_id}_request_{request.request_id}')
-
-        # Constraint 1: Each vehicle can be assigned to at most one request
-        for i in range(len(vehicle_ids)):
-            model.addConstr(gp.quicksum(x[i, j] for j in range(len(available_requests))) <= 1)
-
-        # Constraint 2: Each request can be assigned to at most one vehicle
-        for j in range(len(available_requests)):
-            model.addConstr(gp.quicksum(x[i, j] for i in range(len(vehicle_ids))) <= 1)
-
-        # Objective: Maximize total value (considering distance and Q-value)
-        objective_terms = []
-        for i, vehicle_id in enumerate(vehicle_ids):
-            vehicle = self.vehicles[vehicle_id]
-            vehicle_pos = vehicle['coordinates']
-
-            for j, request in enumerate(available_requests):
-                # Calculate distance cost
-                pickup_pos = (request.pickup // self.grid_size, request.pickup % self.grid_size)
-                distance = abs(vehicle_pos[0] - pickup_pos[0]) + abs(vehicle_pos[1] - pickup_pos[1])
-                distance_cost = distance * 0.1  # Distance penalty
-
-                # Get Q-value benefit
-                q_value = self.get_assignment_q_value(vehicle_id, request.request_id,
-                                                    vehicle['location'], request.pickup)
-
-                # Combined objective: request value - distance cost + Q-value benefit
-                total_value = request.value - distance_cost + q_value * 0.3
-                objective_terms.append(total_value * x[i, j])
-
-        model.setObjective(gp.quicksum(objective_terms), GRB.MAXIMIZE)
-
-        # Solve the optimization problem
-        model.optimize()
-
-        # Extract assignments
-        if model.status == GRB.OPTIMAL:
-            for i, vehicle_id in enumerate(vehicle_ids):
-                for j, request in enumerate(available_requests):
-                    if x[i, j].x > 0.5:  # Binary variable threshold
-                        assignments[vehicle_id] = request
-                        break
-
-        return assignments
 
     def _update_q_learning(self, actions, rewards, next_states):
         """Update Q-learning based on actions taken and rewards received"""
@@ -918,12 +953,15 @@ class ChargingIntegratedEnvironment(Environment):
                 self.update_q_value(current_state, action_str, reward, next_state)
 
     def _execute_action(self, vehicle_id, action):
-        """执行车辆动作"""
+        """Execute vehicle action with immediate reward aligned to Gurobi optimization objective"""
         vehicle = self.vehicles[vehicle_id]
         reward = 0
         
+        # Get parameters for consistency with Gurobi
+        charging_penalty = getattr(self, 'charging_penalty', 10.0)
+        
         if isinstance(action, ChargingAction):
-            # Charging action
+            # Charging action - immediate reward is -charging_penalty (same as Gurobi)
             if vehicle['charging_station'] is None:
                 # Get the charging station and try to start charging
                 station_id = action.charging_station_id
@@ -934,41 +972,54 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['charging_station'] = station_id
                         vehicle['charging_time_left'] = action.charging_duration
                         vehicle['charging_count'] += 1
-                        # Charging should have negative reward as it prevents service
-                        # But slightly positive for low battery situations
-                        if vehicle['battery'] < 0.2:
-                            reward += 0.5  # Small bonus for critical charging
-                        elif vehicle['battery'] < 0.3:
-                            reward += 0.2  # Small bonus for low battery charging
-                        else:
-                            reward -= 0.5  # Penalty for unnecessary charging
+                        
+                        # Immediate reward matches Gurobi: -charging_penalty
+                        reward = -charging_penalty
+                        
                     else:
-                        reward -= 1.0  # Charging failed penalty
+                        reward = -charging_penalty * 2  # Failed charging penalty
                 else:
-                    reward -= 1.0  # Invalid station penalty
+                    reward = -charging_penalty * 2  # Invalid station penalty
             else:
-                reward -= 0.5  # Already charging penalty
+                reward = -charging_penalty  # Already charging penalty
         
         elif isinstance(action, ServiceAction):
-            # Service action - try to accept or progress with a request
+            # Service action - immediate reward is request.value (same as Gurobi)
             if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
                 # Try to assign the request
                 if self._assign_request_to_vehicle(vehicle_id, action.request_id):
-                    reward += 1.0  # Reward for accepting a request
+                    if action.request_id in self.active_requests:
+                        request = self.active_requests[action.request_id]
+                        
+                        # Immediate reward matches Gurobi: request.value
+                        reward = request.value
+                    else:
+                        reward = 0  # Request not found
                 else:
-                    reward -= 0.5  # Penalty for invalid request
+                    reward = -1.0  # Failed assignment penalty
+                    
             elif vehicle['assigned_request'] is not None:
-                # Try to pickup passenger
+                # Progress towards pickup - give partial request value
                 if self._pickup_passenger(vehicle_id):
-                    reward += 3.0  # Reward for successful pickup
+                    # Successful pickup - award partial value
+                    if vehicle['passenger_onboard'] in self.active_requests:
+                        request = self.active_requests[vehicle['passenger_onboard']]
+                        reward = request.value * 0.5  # 50% of request value for pickup
+                    else:
+                        reward = 1.0  # Base pickup reward
+                else:
+                    reward = 0  # Moving towards pickup
+                    
             elif vehicle['passenger_onboard'] is not None:
-                # Try to dropoff passenger
+                # Complete dropoff
                 earnings = self._dropoff_passenger(vehicle_id)
                 if earnings > 0:
-                    reward += earnings + 5.0  # Fare earnings + completion bonus
+                    reward = earnings  # Direct earnings from completed trip
+                else:
+                    reward = 0  # Moving towards dropoff
         
         else:
-            # Movement action (simplified as random movement)
+            # Movement action - minimal reward/penalty
             if vehicle['charging_station'] is None:
                 # Only vehicles not charging can move
                 old_coords = vehicle['coordinates']
@@ -984,19 +1035,16 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle['location'] = new_location_index
                 vehicle['total_distance'] += distance
                 
-                # Movement consumes battery (reduced consumption)
-                vehicle['battery'] -= distance * 0.01  # Reduced from 0.02 to 0.01
+                # Movement consumes battery
+                vehicle['battery'] -= distance * 0.01
                 vehicle['battery'] = max(0, vehicle['battery'])
                 
-                reward += 0.1  # Basic movement reward
+                # Small time penalty for idle movement
+                reward = -0.1
                 
-                # Progressive low battery penalty
-                if vehicle['battery'] < 0.1:
-                    reward -= 5.0  # Critical battery
-                elif vehicle['battery'] < 0.2:
-                    reward -= 1.0  # Low battery warning
-                elif vehicle['battery'] < 0.3:
-                    reward -= 0.5  # Moderate battery warning
+                # Critical battery penalty
+                if vehicle['battery'] < 0.05:
+                    reward -= 2.0
         
         return reward
     

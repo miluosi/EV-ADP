@@ -22,7 +22,7 @@ from src.Action import Action, ChargingAction, ServiceAction
 from src.Request import Request
 from src.charging_station import ChargingStationManager, ChargingStation
 from src.CentralAgent import CentralAgent
-from src.ValueFunction_pytorch import ValueFunction
+from src.ValueFunction_pytorch import PyTorchChargingValueFunction
 from src.Environment import ChargingIntegratedEnvironment
 import torch
 import torch.nn as nn
@@ -35,22 +35,44 @@ USE_SRC_COMPONENTS = True
 
 
 
+
+
 def run_charging_integration_test(num_episodes):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
-    # Create environment with more stations for better coverage
-    num_vehicles = 8  # Increased for better EV/AEV distribution
-    num_stations = 6   # Balanced number of stations
+    # Create environment with significantly more complexity for better learning
+    num_vehicles = 30  # Doubled vehicles for more interaction
+    num_stations = 10  # More stations for complex charging decisions
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
-    # Initialize ValueFunction for decision making
-    # Use a simple reward-based value function
-    from src.ValueFunction_pytorch import PyTorchRewardPlusDelay
-    value_function = PyTorchRewardPlusDelay(delay_coefficient=0.1)
+    # Initialize neural network-based ValueFunction for decision making
+    # Use PyTorchChargingValueFunction with neural network
+    value_function = PyTorchChargingValueFunction(
+        grid_size=env.grid_size, 
+        num_vehicles=num_vehicles,
+        device='cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
+    )
+    
+    # Set the value function in the environment for Q-value calculation
+    env.set_value_function(value_function)
+    
+    # Exploration parameters for enhanced learning with complex environment
+    exploration_episodes = max(1, num_episodes // 2)  # Half episodes for exploration  
+    epsilon_start = 0.4  # Higher exploration for complex environment
+    epsilon_end = 0.1   # End with 10% random actions
+    epsilon_decay = (epsilon_start - epsilon_end) / exploration_episodes
+    
+    # Enhanced training parameters for complex environment
+    training_frequency = 2  # Train every 2 steps for much more frequent learning
+    warmup_steps = 100     # Increased warmup for complex environment
     
     print(f"✓ Initialized environment with {num_vehicles} vehicles and {num_stations} charging stations")
-    print(f"✓ Initialized PyTorchRewardPlusDelay ValueFunction")
+    print(f"✓ Initialized PyTorchChargingValueFunction with neural network")
+    print(f"   - Network parameters: {sum(p.numel() for p in value_function.network.parameters())}")
+    print(f"✓ Enhanced exploration strategy: {exploration_episodes} episodes with epsilon {epsilon_start:.2f} → {epsilon_end:.2f}")
+    print(f"   - Training frequency: every {training_frequency} steps after {warmup_steps} warmup steps")
+    print(f"   - Using device: {value_function.device}")
     
     # Display vehicle type distribution
     ev_count = sum(1 for v in env.vehicles.values() if v['type'] == 'EV')
@@ -65,11 +87,15 @@ def run_charging_integration_test(num_episodes):
         'episode_detailed_stats': [],  # New: detailed stats for each episode
         'battery_levels': [],
         'environment_stats': [],
-        'value_function_losses': []
+        'value_function_losses': [],
+        'qvalue_losses': []  # Added: to store all training losses
     }
     
     for episode in range(num_episodes):
-        print(f"\n--- Episode {episode + 1}/{num_episodes} ---")
+
+        current_epsilon = max(epsilon_end, epsilon_start - episode * epsilon_decay)
+        use_exploration = episode < exploration_episodes and random.random() < current_epsilon
+            
         
         # Reset environment
         states = env.reset()
@@ -88,7 +114,41 @@ def run_charging_integration_test(num_episodes):
                 vehicle = env.vehicles[vehicle_id]
                 current_state = env._get_vehicle_state(vehicle_id)
                 
-                # Enhanced strategy: prioritize passenger requests, then charging, then movement
+                # # Apply exploration: randomly choose actions during exploration phase
+                # if use_exploration:
+                #     # Random action selection for exploration
+                #     action_type = random.choice(['move', 'service', 'charge'])
+                    
+                #     if action_type == 'service' and env.active_requests:
+                #         # Random service assignment
+                #         available_requests = list(env.active_requests.values())
+                #         random_request = random.choice(available_requests)
+                #         actions[vehicle_id] = ServiceAction([], random_request.request_id)
+                #         action_idx = 5
+                #         print(f"🎲 Vehicle {vehicle_id} exploring: random service {random_request.request_id}")
+                #     elif action_type == 'charge' and hasattr(env, 'charging_manager'):
+                #         # Random charging assignment
+                #         available_stations = [s for s in env.charging_manager.stations.values() 
+                #                             if len(s.current_vehicles) < s.max_capacity]
+                #         if available_stations:
+                #             random_station = random.choice(available_stations)
+                #             charge_duration = random.randint(2, 5)
+                #             actions[vehicle_id] = ChargingAction([], random_station.id, charge_duration)
+                #             action_idx = 4
+                #             print(f"🎲 Vehicle {vehicle_id} exploring: random charging at station {random_station.id}")
+                #         else:
+                #             actions[vehicle_id] = Action([])
+                #             action_idx = random.randint(0, 3)
+                #     else:
+                #         # Random movement
+                #         actions[vehicle_id] = Action([])
+                #         action_idx = random.randint(0, 3)
+                #         print(f"🎲 Vehicle {vehicle_id} exploring: random movement")
+                    
+                #     action_chosen = True
+                # else:
+                #     # Normal decision logic
+                #     # Enhanced strategy: prioritize passenger requests, then charging, then movement
                 action_chosen = False
                 
                 # 1. First priority: Check for passenger requests if vehicle is available
@@ -164,8 +224,53 @@ def run_charging_integration_test(num_episodes):
             # Execute actions
             next_states, rewards, done, info = env.step(actions)
             
-            # No training needed for PyTorchRewardPlusDelay
-            # Just record the episode progress
+            # Store experiences for neural network training
+            for vehicle_id, action in actions.items():
+                if vehicle_id in rewards:
+                    current_location = env.vehicles[vehicle_id]['location']
+                    next_location = current_location  # Simplified
+                    
+                    if isinstance(action, ServiceAction):
+                        action_type = f"assign_{action.request_id}"
+                        target_location = action.request_id % env.grid_size**2  # Simplified
+                    elif isinstance(action, ChargingAction):
+                        action_type = f"charge_{action.charging_station_id}"
+                        target_location = action.charging_station_id * 10  # Simplified
+                    else:
+                        action_type = "move"
+                        target_location = current_location
+                    
+                    # Store experience for training
+                    env.store_q_learning_experience(
+                        vehicle_id=int(vehicle_id.split('_')[-1]) if '_' in str(vehicle_id) else vehicle_id,
+                        action_type=action_type,
+                        vehicle_location=current_location,
+                        target_location=target_location,
+                        reward=rewards[vehicle_id],
+                        next_vehicle_location=next_location
+                    )
+            
+            # Enhanced training: much more frequent training for better learning
+            if len(value_function.experience_buffer) >= warmup_steps:
+                # Train more frequently based on our new parameters
+                if step % training_frequency == 0:
+                    training_loss = value_function.train_step(batch_size=64)  # Larger batch
+                    if training_loss > 0:
+                        episode_losses.append(training_loss)
+                
+                # Additional mid-episode training for exploration episodes
+                if use_exploration and step % (training_frequency * 2) == 0:
+                    training_loss = value_function.train_step(batch_size=32)
+                    if training_loss > 0:
+                        episode_losses.append(training_loss)
+            
+            # Intensive training at episode end
+            if step == env.episode_length - 1 and len(value_function.experience_buffer) >= warmup_steps:
+                # Multiple training steps at episode end
+                for _ in range(5):  # More training steps
+                    training_loss = value_function.train_step(batch_size=64)
+                    if training_loss > 0:
+                        episode_losses.append(training_loss)
             
             # Update results
             episode_reward += sum(rewards.values())
@@ -177,8 +282,8 @@ def run_charging_integration_test(num_episodes):
         # Record episode results
         results['episode_rewards'].append(episode_reward)
         results['charging_events'].extend(episode_charging_events)
-        results['value_function_losses'].append(0)  # No losses for this value function
-        
+        results['value_function_losses'].append(np.mean(episode_losses) if episode_losses else 0.0)
+        results['qvalue_losses'].extend(episode_losses)  # Fixed: extend instead of assign
         # Record environment statistics
         stats = env.get_stats()
         results['environment_stats'].append(stats)
@@ -189,6 +294,9 @@ def run_charging_integration_test(num_episodes):
         episode_stats['episode_number'] = episode + 1
         episode_stats['episode_reward'] = episode_reward
         episode_stats['charging_events_count'] = len(episode_charging_events)
+        episode_stats['neural_network_loss'] = np.mean(episode_losses) if episode_losses else 0.0
+        episode_stats['neural_network_loss_std'] = np.std(episode_losses) if episode_losses else 0.0
+        episode_stats['training_steps_in_episode'] = len(episode_losses)
         results['episode_detailed_stats'].append(episode_stats)
         
         print(f"Episode {episode + 1} Completed:")
@@ -198,8 +306,9 @@ def run_charging_integration_test(num_episodes):
         print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
     
     print("\n=== Integration Test Complete ===")
-    print(f"✓ ValueFunction trained over {num_episodes} episodes")
-    print(f"✓ Final average loss: {np.mean(results['value_function_losses']):.4f}")
+    print(f"✓ Neural Network ValueFunction trained over {num_episodes} episodes")
+    print(f"✓ Final average training loss: {np.mean(results['value_function_losses']):.4f}")
+    print(f"✓ Neural network has {sum(p.numel() for p in value_function.network.parameters())} parameters")
     
     # Create results directory for analysis
     results_dir = Path("results/integrated_tests")
@@ -247,7 +356,10 @@ def save_episode_stats_to_excel(episode_stats, results_dir):
                     'Total AEV Vehicles',
                     'EV Rejection Rate (%)',
                     'AEV Rejection Rate (%)',
-                    'Total Earnings'
+                    'Total Earnings',
+                    'Average Neural Network Loss',
+                    'Neural Network Loss Std Dev',
+                    'Average Training Steps per Episode'
                 ],
                 'Value': [
                     len(df),
@@ -262,7 +374,10 @@ def save_episode_stats_to_excel(episode_stats, results_dir):
                     df['aev_count'].iloc[0] if not df.empty else 0,
                     (df['ev_rejected'].sum() / (df['accepted_orders'].sum() + df['ev_rejected'].sum()) * 100) if (df['accepted_orders'].sum() + df['ev_rejected'].sum()) > 0 else 0,
                     (df['aev_rejected'].sum() / (df['accepted_orders'].sum() + df['aev_rejected'].sum()) * 100) if (df['accepted_orders'].sum() + df['aev_rejected'].sum()) > 0 else 0,
-                    df['total_earnings'].sum()
+                    df['total_earnings'].sum(),
+                    df['neural_network_loss'].mean() if 'neural_network_loss' in df.columns else 0,
+                    df['neural_network_loss_std'].mean() if 'neural_network_loss_std' in df.columns else 0,
+                    df['training_steps_in_episode'].mean() if 'training_steps_in_episode' in df.columns else 0
                 ]
             }
             
@@ -507,7 +622,7 @@ def main():
     try:
         
         
-        num_episodes = 250
+        num_episodes = 50
         results = run_charging_integration_test(num_episodes=num_episodes)
 
         # 分析结果
