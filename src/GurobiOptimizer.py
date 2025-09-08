@@ -158,7 +158,7 @@ class GurobiOptimizer:
                 
                 # Charging penalty offset by Q-value benefit
                 charging_penalty = getattr(self.env, 'charging_penalty', 2.0)
-                charging_value = -charging_penalty - charging_q_value * self.env.adp_value
+                charging_value = -charging_penalty + charging_q_value * self.env.adp_value
                 objective_terms += charging_value * charge_decision[i, j]
         objective_terms -= getattr(self.env, 'unserved_penalty', 1.5) * (request_count - servedrequest)
         
