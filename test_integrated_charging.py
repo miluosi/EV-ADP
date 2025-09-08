@@ -24,6 +24,7 @@ from src.charging_station import ChargingStationManager, ChargingStation
 from src.CentralAgent import CentralAgent
 from src.ValueFunction_pytorch import PyTorchChargingValueFunction
 from src.Environment import ChargingIntegratedEnvironment
+from src.SpatialVisualization import SpatialVisualization
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -34,16 +35,13 @@ USE_SRC_COMPONENTS = True
 
 
 
-
-
-
-def run_charging_integration_test(num_episodes):
+def run_charging_integration_test(adpvalue,num_episodes):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 30  # Doubled vehicles for more interaction
-    num_stations = 10  # More stations for complex charging decisions
+    num_vehicles = 40  # Doubled vehicles for more interaction
+    num_stations = 12  # More stations for complex charging decisions
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
     # Initialize neural network-based ValueFunction for decision making
@@ -56,7 +54,8 @@ def run_charging_integration_test(num_episodes):
     
     # Set the value function in the environment for Q-value calculation
     env.set_value_function(value_function)
-    
+    env.adp_value = adpvalue
+    # env.use_intense_requests = False
     # Exploration parameters for enhanced learning with complex environment
     exploration_episodes = max(1, num_episodes // 2)  # Half episodes for exploration  
     epsilon_start = 0.4  # Higher exploration for complex environment
@@ -85,6 +84,7 @@ def run_charging_integration_test(num_episodes):
         'episode_rewards': [],
         'charging_events': [],
         'episode_detailed_stats': [],  # New: detailed stats for each episode
+        'vehicle_visit_stats': [],     # New: vehicle visit patterns for each episode
         'battery_levels': [],
         'environment_stats': [],
         'value_function_losses': [],
@@ -299,6 +299,10 @@ def run_charging_integration_test(num_episodes):
         episode_stats['training_steps_in_episode'] = len(episode_losses)
         results['episode_detailed_stats'].append(episode_stats)
         
+        # Analyze vehicle visit patterns for this episode
+        vehicle_visit_stats = analyze_vehicle_visit_patterns(env)
+        results['vehicle_visit_stats'].append(vehicle_visit_stats)
+        
         print(f"Episode {episode + 1} Completed:")
         print(f"  Reward: {episode_reward:.2f}")
         print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Rejected={episode_stats['rejected_orders']}")
@@ -315,14 +319,193 @@ def run_charging_integration_test(num_episodes):
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"✓ Results will be saved to: {results_dir}")
     
-    # Save detailed episode statistics to Excel
-    save_episode_stats_to_excel(results['episode_detailed_stats'], results_dir)
+    # Save detailed episode statistics to Excel including vehicle visit patterns
+    excel_path, spatial_path = save_episode_stats_to_excel(env, results['episode_detailed_stats'], results_dir, results.get('vehicle_visit_stats'))
     
-    return results
+    # Store file paths in results for reference
+    results['excel_path'] = excel_path
+    results['spatial_image_path'] = spatial_path
+    
+    return results, env
 
 
-def save_episode_stats_to_excel(episode_stats, results_dir):
-    """Save detailed episode statistics to Excel file"""
+def analyze_vehicle_visit_patterns(env):
+    """Analyze vehicle visit patterns and identify most frequently visited locations"""
+    vehicle_visit_stats = {}
+    
+    # Define hotspot locations for reference
+    hotspots = [
+        (env.grid_size // 4, env.grid_size // 4),           # Bottom-left hotspot
+        (3 * env.grid_size // 4, env.grid_size // 4),       # Bottom-right hotspot
+        (env.grid_size // 2, 3 * env.grid_size // 4)        # Top-center hotspot
+    ]
+    
+    for vehicle_id, vehicle in env.vehicles.items():
+        # Get position history for this vehicle
+        position_history = env.vehicle_position_history.get(vehicle_id, [])
+        
+        if not position_history:
+            # If no history, use current position
+            current_coords = vehicle['coordinates']
+            location_counts = {str(current_coords): 1}
+        else:
+            # Count visits to each location
+            location_counts = {}
+            for entry in position_history:
+                coords_str = str(entry['coords'])
+                location_counts[coords_str] = location_counts.get(coords_str, 0) + 1
+        
+        # Find most visited location
+        if location_counts:
+            most_visited_location = max(location_counts, key=location_counts.get)
+            most_visited_coords = eval(most_visited_location)
+            visit_count = location_counts[most_visited_location]
+            
+            # Calculate location diversity (number of unique locations visited)
+            unique_locations = len(location_counts)
+            total_visits = sum(location_counts.values())
+            diversity_score = unique_locations / total_visits if total_visits > 0 else 0
+            
+            # Calculate average distance from hotspots
+            avg_distance_from_hotspots = 0
+            hotspot_visits = 0
+            for location_str, count in location_counts.items():
+                coords = eval(location_str)
+                min_distance_to_hotspot = min(
+                    abs(coords[0] - hx) + abs(coords[1] - hy) 
+                    for hx, hy in hotspots
+                )
+                avg_distance_from_hotspots += min_distance_to_hotspot * count
+                
+                # Check if in hotspot area (within 2 grid units)
+                if min_distance_to_hotspot <= 2:
+                    hotspot_visits += count
+            
+            avg_distance_from_hotspots = avg_distance_from_hotspots / total_visits if total_visits > 0 else 0
+            hotspot_time_percentage = (hotspot_visits / total_visits * 100) if total_visits > 0 else 0
+            
+            # Get top 3 most visited locations
+            sorted_locations = sorted(location_counts.items(), key=lambda x: x[1], reverse=True)
+            top_3_locations = [f"{loc}({count})" for loc, count in sorted_locations[:3]]
+            
+            vehicle_visit_stats[vehicle_id] = {
+                'vehicle_type': vehicle['type'],
+                'most_visited_location': most_visited_location,
+                'most_visited_coords': most_visited_coords,
+                'visit_count': visit_count,
+                'unique_locations': unique_locations,
+                'diversity_score': round(diversity_score, 3),
+                'avg_distance_from_hotspots': round(avg_distance_from_hotspots, 2),
+                'hotspot_time_percentage': round(hotspot_time_percentage, 1),
+                'top_3_locations': ', '.join(top_3_locations),
+                'location_counts': location_counts
+            }
+        else:
+            # Fallback for vehicles with no data
+            vehicle_visit_stats[vehicle_id] = {
+                'vehicle_type': vehicle['type'],
+                'most_visited_location': 'N/A',
+                'most_visited_coords': vehicle['coordinates'],
+                'visit_count': 0,
+                'unique_locations': 0,
+                'diversity_score': 0.0,
+                'avg_distance_from_hotspots': 0.0,
+                'hotspot_time_percentage': 0.0,
+                'top_3_locations': 'N/A',
+                'location_counts': {}
+            }
+    
+    return vehicle_visit_stats
+
+
+def print_vehicle_visit_summary(vehicle_visit_stats_list):
+    """Print summary of vehicle visit patterns across all episodes"""
+    if not vehicle_visit_stats_list:
+        print("⚠ No vehicle visit data available")
+        return
+    
+    print("\n" + "="*60)
+    print("🚗 车辆访问模式总结")
+    print("="*60)
+    
+    # Aggregate statistics across all episodes
+    all_vehicles_data = {}
+    location_popularity = {}
+    
+    for episode_visits in vehicle_visit_stats_list:
+        for vehicle_id, visit_info in episode_visits.items():
+            if vehicle_id not in all_vehicles_data:
+                all_vehicles_data[vehicle_id] = {
+                    'vehicle_type': visit_info['vehicle_type'],
+                    'total_visits': 0,
+                    'total_unique_locations': 0,
+                    'total_hotspot_time': 0,
+                    'episodes_count': 0
+                }
+            
+            data = all_vehicles_data[vehicle_id]
+            data['total_visits'] += visit_info['visit_count']
+            data['total_unique_locations'] += visit_info['unique_locations']
+            data['total_hotspot_time'] += visit_info['hotspot_time_percentage']
+            data['episodes_count'] += 1
+            
+            # Track location popularity
+            for location, count in visit_info.get('location_counts', {}).items():
+                if location not in location_popularity:
+                    location_popularity[location] = 0
+                location_popularity[location] += count
+    
+    # Vehicle type analysis
+    ev_vehicles = {vid: data for vid, data in all_vehicles_data.items() if data['vehicle_type'] == 'EV'}
+    aev_vehicles = {vid: data for vid, data in all_vehicles_data.items() if data['vehicle_type'] == 'AEV'}
+    
+    print(f"📈 车辆类型统计:")
+    print(f"   EV车辆数量: {len(ev_vehicles)}")
+    print(f"   AEV车辆数量: {len(aev_vehicles)}")
+    
+    # Calculate averages
+    if ev_vehicles:
+        avg_ev_hotspot_time = np.mean([data['total_hotspot_time'] / data['episodes_count'] 
+                                      for data in ev_vehicles.values()])
+        print(f"   EV平均热点区域时间: {avg_ev_hotspot_time:.1f}%")
+    
+    if aev_vehicles:
+        avg_aev_hotspot_time = np.mean([data['total_hotspot_time'] / data['episodes_count'] 
+                                       for data in aev_vehicles.values()])
+        print(f"   AEV平均热点区域时间: {avg_aev_hotspot_time:.1f}%")
+    
+    # Most popular locations
+    if location_popularity:
+        print(f"\n📍 最受欢迎的位置 (前10名):")
+        sorted_locations = sorted(location_popularity.items(), key=lambda x: x[1], reverse=True)
+        for i, (location, visits) in enumerate(sorted_locations[:10], 1):
+            coords = eval(location) if isinstance(location, str) and '(' in location else location
+            print(f"   {i:2d}. {coords}: {visits} 次访问")
+    
+    # Vehicle mobility analysis
+    print(f"\n🚛 车辆移动性分析:")
+    if all_vehicles_data:
+        avg_unique_locations = np.mean([data['total_unique_locations'] / data['episodes_count'] 
+                                       for data in all_vehicles_data.values()])
+        avg_visits_per_episode = np.mean([data['total_visits'] / data['episodes_count'] 
+                                         for data in all_vehicles_data.values()])
+        
+        print(f"   平均每episode访问的不同位置数: {avg_unique_locations:.1f}")
+        print(f"   平均每episode总访问次数: {avg_visits_per_episode:.1f}")
+        
+        # Identify most and least mobile vehicles
+        mobility_scores = {vid: data['total_unique_locations'] / data['episodes_count'] 
+                          for vid, data in all_vehicles_data.items()}
+        
+        most_mobile = max(mobility_scores, key=mobility_scores.get)
+        least_mobile = min(mobility_scores, key=mobility_scores.get)
+        
+        print(f"   最活跃车辆: Vehicle {most_mobile} ({mobility_scores[most_mobile]:.1f} 个不同位置/episode)")
+        print(f"   最不活跃车辆: Vehicle {least_mobile} ({mobility_scores[least_mobile]:.1f} 个不同位置/episode)")
+
+
+def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_stats=None):
+    """Save detailed episode statistics to Excel file including vehicle visit patterns, ADP values, and spatial analysis"""
     if not episode_stats:
         print("⚠ No episode statistics to save")
         return
@@ -330,16 +513,157 @@ def save_episode_stats_to_excel(episode_stats, results_dir):
     # Create DataFrame from episode statistics
     df = pd.DataFrame(episode_stats)
     
+    # Extract ADP value and demand pattern information
+    adpvalue = getattr(env, 'adp_value', 1.0)
+    demand_pattern = "intense" if getattr(env, 'use_intense_requests', True) else "random"
+    charging_penalty = getattr(env, 'charging_penalty', 2.0)
+    unserved_penalty = getattr(env, 'unserved_penalty', 1.5)
+    
     # Add timestamp to filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_filename = f"episode_statistics_{timestamp}.xlsx"
+    excel_filename = f"episode_statistics_adp{adpvalue}_demand{demand_pattern}_{timestamp}.xlsx"
     excel_path = results_dir / excel_filename
+    
+    # Generate spatial visualization
+    spatial_image_path = results_dir / f"spatial_analysis_adp{adpvalue}_demand{demand_pattern}_{timestamp}.png"
     
     try:
         # Create Excel writer with multiple sheets
         with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
             # Main statistics sheet
             df.to_excel(writer, sheet_name='Episode_Statistics', index=False)
+            
+            # ADP Configuration sheet
+            adp_config_data = {
+                'Parameter': [
+                    'ADP_Value',
+                    'Demand_Pattern',
+                    'Charging_Penalty',
+                    'Unserved_Penalty',
+                    'Grid_Size',
+                    'Number_of_Vehicles',
+                    'Number_of_Stations',
+                    'Episode_Length',
+                    'Request_Generation_Rate',
+                    'Vehicle_Types',
+                    'Hotspot_Configuration'
+                ],
+                'Value': [
+                    adpvalue,
+                    demand_pattern,
+                    charging_penalty,
+                    unserved_penalty,
+                    env.grid_size,
+                    env.num_vehicles,
+                    env.num_stations,
+                    env.episode_length,
+                    env.request_generation_rate,
+                    f"EV: {sum(1 for v in env.vehicles.values() if v['type'] == 'EV')}, AEV: {sum(1 for v in env.vehicles.values() if v['type'] == 'AEV')}",
+                    "3 hotspots with weights [0.6, 0.3, 0.1]" if demand_pattern == "intense" else "Random distribution"
+                ],
+                'Description': [
+                    'Weight for Q-value contribution in optimization',
+                    'Request generation pattern (intense=hotspots, random=uniform)',
+                    'Penalty coefficient for charging actions',
+                    'Penalty coefficient for unserved requests',
+                    'Size of the simulation grid',
+                    'Total number of vehicles in simulation',
+                    'Total number of charging stations',
+                    'Length of each episode in time steps',
+                    'Probability of generating new request each step',
+                    'Distribution of vehicle types',
+                    'Spatial distribution pattern for request generation'
+                ]
+            }
+            
+            adp_config_df = pd.DataFrame(adp_config_data)
+            adp_config_df.to_excel(writer, sheet_name='ADP_Configuration', index=False)
+            
+            # Demand Pattern Analysis sheet
+            if hasattr(env, 'request_generation_history') and env.request_generation_history:
+                demand_data = []
+                hotspot_counts = {0: 0, 1: 0, 2: 0}  # Track requests per hotspot
+                
+                for req_info in env.request_generation_history:
+                    hotspot_idx = req_info.get('hotspot_idx', -1)
+                    if hotspot_idx in hotspot_counts:
+                        hotspot_counts[hotspot_idx] += 1
+                    
+                    demand_data.append({
+                        'Pickup_X': req_info['pickup_coords'][0],
+                        'Pickup_Y': req_info['pickup_coords'][1],
+                        'Dropoff_X': req_info['dropoff_coords'][0],
+                        'Dropoff_Y': req_info['dropoff_coords'][1],
+                        'Hotspot_Index': hotspot_idx,
+                        'Generation_Time': req_info['time']
+                    })
+                
+                if demand_data:
+                    demand_df = pd.DataFrame(demand_data)
+                    demand_df.to_excel(writer, sheet_name='Demand_Pattern', index=False)
+                    
+                    # Hotspot statistics
+                    total_requests = len(demand_data)
+                    hotspot_stats = []
+                    for hotspot_id, count in hotspot_counts.items():
+                        percentage = (count / total_requests * 100) if total_requests > 0 else 0
+                        hotspot_stats.append({
+                            'Hotspot_ID': hotspot_id,
+                            'Request_Count': count,
+                            'Percentage': f"{percentage:.1f}%",
+                            'Expected_Percentage': ['60%', '30%', '10%'][hotspot_id] if hotspot_id < 3 else 'N/A'
+                        })
+                    
+                    hotspot_stats_df = pd.DataFrame(hotspot_stats)
+                    hotspot_stats_df.to_excel(writer, sheet_name='Hotspot_Statistics', index=False)
+            
+            # Vehicle Visit Patterns sheet
+            if vehicle_visit_stats:
+                visit_data = []
+                for episode_idx, episode_visits in enumerate(vehicle_visit_stats):
+                    for vehicle_id, visit_info in episode_visits.items():
+                        visit_data.append({
+                            'Episode': episode_idx + 1,
+                            'Vehicle_ID': vehicle_id,
+                            'Vehicle_Type': visit_info.get('vehicle_type', 'Unknown'),
+                            'Most_Visited_Location': visit_info.get('most_visited_location', 'N/A'),
+                            'Most_Visited_Coords': visit_info.get('most_visited_coords', 'N/A'),
+                            'Visit_Count': visit_info.get('visit_count', 0),
+                            'Total_Unique_Locations': visit_info.get('unique_locations', 0),
+                            'Location_Diversity_Score': visit_info.get('diversity_score', 0.0),
+                            'Average_Distance_from_Hotspots': visit_info.get('avg_distance_from_hotspots', 0.0),
+                            'Time_in_Hotspot_Areas_%': visit_info.get('hotspot_time_percentage', 0.0),
+                            'Top_3_Visited_Locations': visit_info.get('top_3_locations', 'N/A')
+                        })
+                
+                if visit_data:
+                    visit_df = pd.DataFrame(visit_data)
+                    visit_df.to_excel(writer, sheet_name='Vehicle_Visit_Patterns', index=False)
+                
+                # Location Heatmap Summary
+                location_summary = {}
+                for episode_visits in vehicle_visit_stats:
+                    for vehicle_id, visit_info in episode_visits.items():
+                        for location, count in visit_info.get('location_counts', {}).items():
+                            if location not in location_summary:
+                                location_summary[location] = {'total_visits': 0, 'vehicles_visited': set()}
+                            location_summary[location]['total_visits'] += count
+                            location_summary[location]['vehicles_visited'].add(vehicle_id)
+                
+                if location_summary:
+                    heatmap_data = []
+                    for location, info in location_summary.items():
+                        coords = eval(location) if isinstance(location, str) and '(' in location else location
+                        heatmap_data.append({
+                            'Location_Coords': coords,
+                            'Total_Visits': info['total_visits'],
+                            'Unique_Vehicles_Visited': len(info['vehicles_visited']),
+                            'Average_Visits_per_Vehicle': info['total_visits'] / len(info['vehicles_visited']) if info['vehicles_visited'] else 0
+                        })
+                    
+                    heatmap_df = pd.DataFrame(heatmap_data)
+                    heatmap_df = heatmap_df.sort_values('Total_Visits', ascending=False)
+                    heatmap_df.to_excel(writer, sheet_name='Location_Heatmap', index=False)
             
             # Summary statistics sheet
             summary_stats = {
@@ -397,8 +721,108 @@ def save_episode_stats_to_excel(episode_stats, results_dir):
                 })
                 vehicle_comparison.to_excel(writer, sheet_name='Vehicle_Comparison', index=False)
         
+        # Generate and save spatial visualization
+        try:
+            print(f"🗺️ Generating spatial visualization...")
+            spatial_viz = SpatialVisualization(env.grid_size)
+            
+            # Create comprehensive spatial plot
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+            
+            # Plot 1: Request generation heatmap
+            if hasattr(env, 'request_generation_history') and env.request_generation_history:
+                pickup_coords = [req['pickup_coords'] for req in env.request_generation_history]
+                pickup_x = [coord[0] for coord in pickup_coords]
+                pickup_y = [coord[1] for coord in pickup_coords]
+                
+                ax1.hist2d(pickup_x, pickup_y, bins=env.grid_size//2, alpha=0.7, cmap='Reds')
+                ax1.set_title(f'Request Generation Heatmap\n(Pattern: {demand_pattern})')
+                ax1.set_xlabel('X Coordinate')
+                ax1.set_ylabel('Y Coordinate')
+                ax1.grid(True, alpha=0.3)
+            
+            # Plot 2: Vehicle position distribution
+            vehicle_positions = [v['coordinates'] for v in env.vehicles.values()]
+            if vehicle_positions:
+                veh_x = [pos[0] for pos in vehicle_positions]
+                veh_y = [pos[1] for pos in vehicle_positions]
+                
+                # Color by vehicle type
+                ev_x = [pos[0] for v_id, v in env.vehicles.items() if v['type'] == 'EV' for pos in [v['coordinates']]]
+                ev_y = [pos[1] for v_id, v in env.vehicles.items() if v['type'] == 'EV' for pos in [v['coordinates']]]
+                aev_x = [pos[0] for v_id, v in env.vehicles.items() if v['type'] == 'AEV' for pos in [v['coordinates']]]
+                aev_y = [pos[1] for v_id, v in env.vehicles.items() if v['type'] == 'AEV' for pos in [v['coordinates']]]
+                
+                ax2.scatter(ev_x, ev_y, c='blue', alpha=0.6, label='EV', s=50)
+                ax2.scatter(aev_x, aev_y, c='green', alpha=0.6, label='AEV', s=50)
+                ax2.set_title('Final Vehicle Distribution')
+                ax2.set_xlabel('X Coordinate')
+                ax2.set_ylabel('Y Coordinate')
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+            
+            # Plot 3: Charging station utilization
+            if hasattr(env, 'charging_manager') and env.charging_manager.stations:
+                station_data = []
+                for station_id, station in env.charging_manager.stations.items():
+                    station_x = station.location % env.grid_size
+                    station_y = station.location // env.grid_size
+                    utilization = len(station.current_vehicles) / station.max_capacity
+                    station_data.append((station_x, station_y, utilization))
+                
+                if station_data:
+                    station_x, station_y, utilizations = zip(*station_data)
+                    scatter = ax3.scatter(station_x, station_y, c=utilizations, s=200, 
+                                        cmap='YlOrRd', alpha=0.8, edgecolor='black')
+                    plt.colorbar(scatter, ax=ax3, label='Utilization Rate')
+                    ax3.set_title('Charging Station Utilization')
+                    ax3.set_xlabel('X Coordinate')
+                    ax3.set_ylabel('Y Coordinate')
+                    ax3.grid(True, alpha=0.3)
+            
+            # Plot 4: Performance summary
+            ax4.axis('off')
+            performance_text = f"""
+Performance Summary
+ADP Value: {adpvalue}
+Demand Pattern: {demand_pattern}
+Charging Penalty: {charging_penalty}
+Unserved Penalty: {unserved_penalty}
+
+Episodes: {len(df)}
+Avg Battery Level: {df['avg_battery_level'].mean():.2f}
+Total Orders: {df['total_orders'].sum()}
+Accepted Orders: {df['accepted_orders'].sum()}
+Rejection Rate: {((df['rejected_orders'].sum() / df['total_orders'].sum()) * 100) if df['total_orders'].sum() > 0 else 0:.1f}%
+
+EV Vehicles: {df['ev_count'].iloc[0] if not df.empty else 0}
+AEV Vehicles: {df['aev_count'].iloc[0] if not df.empty else 0}
+            """
+            ax4.text(0.1, 0.9, performance_text, transform=ax4.transAxes, 
+                    fontsize=11, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+            
+            plt.tight_layout()
+            plt.savefig(spatial_image_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            print(f"✓ Spatial visualization saved: {spatial_image_path}")
+            
+        except Exception as e:
+            print(f"⚠ Error generating spatial visualization: {e}")
+        
         print(f"✓ Episode statistics saved to Excel: {excel_path}")
         print(f"  - Episode_Statistics: Detailed data for each episode")
+        print(f"  - ADP_Configuration: System parameters and settings")
+        print(f"  - Demand_Pattern: Request generation analysis")
+        print(f"  - Hotspot_Statistics: Hotspot performance metrics")
+        print(f"  - Summary: Overall performance metrics")
+        print(f"  - Vehicle_Comparison: EV vs AEV performance comparison")
+        if vehicle_visit_stats:
+            print(f"  - Vehicle_Visit_Patterns: Individual vehicle movement analysis")
+            print(f"  - Location_Heatmap: Aggregated location popularity")
+        
+        return excel_path, spatial_image_path
         print(f"  - Summary: Overall performance metrics")
         print(f"  - Vehicle_Comparison: EV vs AEV performance comparison")
         
@@ -622,32 +1046,46 @@ def main():
     try:
         
         
-        num_episodes = 50
-        results = run_charging_integration_test(num_episodes=num_episodes)
+        num_episodes = 100
+        adplist = [0, 0.5, 1]
+        for adpvalue in adplist:
+            print(f"\n⚡ 开始集成测试 (ADP={adpvalue})")
+            results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes)
 
-        # 分析结果
-        analysis = analyze_results(results)
-        
-        # 生成可视化
-        success = visualize_integrated_results(results)
-        
-        # 生成报告
-        generate_integration_report(results, analysis)
-        
-        print("\n" + "="*60)
-        print("🎉 集成测试完成!")
-        print("📊 结果摘要:")
-        print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-        print(f"   - 充电次数: {analysis['total_charging']}")
-        print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-        print(f"   - 奖励改进: {analysis['improvement']:.2f}")
-        
-        if success:
-            print("📈 可视化图表生成成功")
-        
-        print("📁 请检查 results/integrated_tests/ 文件夹中的详细结果")
-        print("="*60)
-        
+            # 分析结果
+            analysis = analyze_results(results)
+            
+            # 生成可视化
+            success = visualize_integrated_results(results)
+            
+            # 空间分布可视化已在Excel导出中生成
+            print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
+            
+            # 生成传统的空间分布分析（用于兼容性）
+            spatial_viz = SpatialVisualization(env.grid_size)
+            spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+            spatial_viz.print_spatial_analysis(spatial_analysis)
+            
+            # 生成报告
+            generate_integration_report(results, analysis)
+            
+            # 输出车辆访问模式总结
+            print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
+            
+            print("\n" + "="*60)
+            print("🎉 集成测试完成!")
+            print("📊 结果摘要:")
+            print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
+            print(f"   - 充电次数: {analysis['total_charging']}")
+            print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
+            print(f"   - 奖励改进: {analysis['improvement']:.2f}")
+            
+            if success:
+                print("📈 可视化图表生成成功")
+            
+            print("📁 请检查 results/integrated_tests/ 文件夹中的详细结果")
+            print("="*60)
+            
     except Exception as e:
         print(f"\n❌ 测试失败: {e}")
         import traceback

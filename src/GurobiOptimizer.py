@@ -68,7 +68,7 @@ class GurobiOptimizer:
 
         # Convert active requests to list
         available_requests = list(self.env.active_requests.values())
-        
+        request_count = len(available_requests)
         # Get available charging stations
         charging_stations = []
         if hasattr(self.env, 'charging_manager') and self.env.charging_manager.stations:
@@ -116,7 +116,10 @@ class GurobiOptimizer:
         for i in range(len(vehicle_ids)):
             idlevehicle += idle_vehicle[i]
         model.addConstr(idlevehicle >= getattr(self.env, 'idle_vehicle_requirement', 0)) 
-                     
+        servedrequest = self.gp.LinExpr()
+        for j in range(len(available_requests)):
+            for i in range(len(vehicle_ids)):
+                servedrequest += request_decision[i, j]     
         # Constraint 2: Each request can be assigned to at most one vehicle
         for j in range(len(available_requests)):
             model.addConstr(self.gp.quicksum(request_decision[i, j] for i in range(len(vehicle_ids))) <= 1)
@@ -136,7 +139,7 @@ class GurobiOptimizer:
                                                         vehicle['location'], request.pickup)
 
                 # Combined objective: request value + Q-value benefit
-                total_value = request.value + q_value * getattr(self.env, 'adp_value', 1.0)
+                total_value = request.value + q_value * self.env.adp_value
                 objective_terms += total_value * request_decision[i, j]
             
             # Process charging assignments  
@@ -154,9 +157,11 @@ class GurobiOptimizer:
                                                                      station.location)
                 
                 # Charging penalty offset by Q-value benefit
-                charging_penalty = getattr(self.env, 'charging_penalty', 10.0)
-                charging_value = -charging_penalty + charging_q_value * getattr(self.env, 'adp_value', 1.0)
+                charging_penalty = getattr(self.env, 'charging_penalty', 2.0)
+                charging_value = -charging_penalty - charging_q_value * self.env.adp_value
                 objective_terms += charging_value * charge_decision[i, j]
+        objective_terms -= getattr(self.env, 'unserved_penalty', 1.5) * (request_count - servedrequest)
+        
         model.setObjective(objective_terms, self.GRB.MAXIMIZE)
 
         # Solve the optimization problem
@@ -477,8 +482,9 @@ class GurobiOptimizer:
 
     def _gurobi_vehicle_rebalancing_knownreject(self, vehicle_ids, available_requests, charging_stations=None):
         """
-        Gurobi optimization with known reject behavior for EVs
+        Gurobi optimization with known reject behavior for EVs and charging level constraints
         EVs won't be assigned to requests they would reject
+        Includes t-1 to t charging level progression with minimum battery requirements
         """
         if not self.available:
             return {}
@@ -490,8 +496,14 @@ class GurobiOptimizer:
         
         try:
             # Create optimization model
-            model = self.gp.Model("vehicle_assignment_with_reject")
+            model = self.gp.Model("vehicle_assignment_with_reject_and_charging")
             model.setParam('OutputFlag', 0)  # Suppress output
+            
+            # Parameters
+            min_battery_level = 0.1  # Minimum battery level (10%)
+            charging_rate = 0.15     # Battery increase per charging period
+            travel_consumption = 0.02 # Battery consumption per unit distance
+            service_consumption = 0.05 # Battery consumption per service
             
             # Filter out rejected requests for each EV
             valid_assignments = {}  # (vehicle_id, request_idx) -> is_valid
@@ -509,15 +521,16 @@ class GurobiOptimizer:
                         # AEV never rejects
                         valid_assignments[(i, j)] = True
             
-            # Decision variables for request assignments (only for valid combinations)
-            request_decision = {}
-            for i, vehicle_id in enumerate(vehicle_ids):
-                for j, request in enumerate(available_requests):
-                    if valid_assignments.get((i, j), False):
-                        request_decision[i, j] = model.addVar(
-                            vtype=self.GRB.BINARY,
-                            name=f'request_{vehicle_id}_{request.request_id}'
-                        )
+            # Decision variables for request assignments
+            request_decision =[[model.addVar(vtype=self.GRB.BINARY,
+                                     name=f'request_{vehicle_id}_{request.request_id}') for request in available_requests] for i, vehicle_id in enumerate(vehicle_ids)]
+            
+            # Constraint invalid assignments to 0
+            for i in range(len(vehicle_ids)):
+                for j in range(len(available_requests)):
+                    if not valid_assignments.get((i, j), False):
+                        model.addConstr(request_decision[i][j] == 0)
+            
             
             # Decision variables for charging assignments
             charge_decision = {}
@@ -529,6 +542,24 @@ class GurobiOptimizer:
                             name=f'charge_{vehicle_id}_{station.id}'
                         )
             
+            # Battery level variables (t-1 and t)
+            battery_t_minus_1 = {}  # Battery level at t-1 (current)
+            battery_t = {}          # Battery level at t (after actions)
+            
+            for i, vehicle_id in enumerate(vehicle_ids):
+                vehicle = self.env.vehicles[vehicle_id]
+                
+                # t-1 battery level (current battery level)
+                battery_t_minus_1[i] = vehicle['battery']
+                
+                # t battery level (decision variable)
+                battery_t[i] = model.addVar(
+                    vtype=self.GRB.CONTINUOUS,
+                    lb=min_battery_level,  # Minimum battery constraint
+                    ub=1.0,                # Maximum battery is 100%
+                    name=f'battery_t_{vehicle_id}'
+                )
+            
             # Idle vehicle variables
             idle_vehicle = {}
             for i in range(len(vehicle_ids)):
@@ -537,13 +568,32 @@ class GurobiOptimizer:
                     name=f'vehicle_{vehicle_ids[i]}_idle'
                 )
             
+            # Battery level transition constraints (t-1 to t relationship)
+            for i, vehicle_id in enumerate(vehicle_ids):
+                vehicle = self.env.vehicles[vehicle_id]
+                battery_change = self.gp.LinExpr()
+                
+                # Base battery consumption for staying idle
+                base_consumption = 0.01  # 1% per time step
+                battery_change += -base_consumption
+                
+                # Battery gain from charging
+                if charging_stations:
+                    for j, station in enumerate(charging_stations):
+                        battery_change += self.env.chargeincrease_per_epoch * charge_decision[i, j]
+                
+                
+                model.addConstr(battery_t[i] == battery_t_minus_1[i] + battery_change)
+                model.addConstr(battery_t[i] >= self.env.min_battery_level)
+
+            
+            
             # Constraint 1: Each vehicle can only take one action
             for i in range(len(vehicle_ids)):
                 actionv = self.gp.LinExpr()
                 # Add valid request assignments
                 for j in range(len(available_requests)):
-                    if (i, j) in request_decision:
-                        actionv += request_decision[i, j]
+                    actionv += request_decision[i][j]
                 # Add charging assignments
                 if charging_stations:
                     for j in range(len(charging_stations)):
@@ -551,12 +601,17 @@ class GurobiOptimizer:
                 model.addConstr(actionv <= 1)
                 model.addConstr(idle_vehicle[i] + actionv == 1)
             
+            # Minimum idle vehicles constraint
+            idle_vehicles = self.gp.LinExpr()
+            for i in range(len(vehicle_ids)):
+                idle_vehicles += idle_vehicle[i]
+            model.addConstr(idle_vehicles >= self.env.idle_vehicle_requirement)
+            
             # Constraint 2: Each request can be assigned to at most one vehicle
             for j in range(len(available_requests)):
                 valid_vehicles = self.gp.LinExpr()
                 for i in range(len(vehicle_ids)):
-                    if (i, j) in request_decision:
-                        valid_vehicles += request_decision[i, j]
+                    valid_vehicles += request_decision[i][j]
                 model.addConstr(valid_vehicles <= 1)
             
             # Constraint 3: Each charging station capacity
@@ -605,9 +660,25 @@ class GurobiOptimizer:
                             )
                         
                         # Charging penalty offset by Q-value benefit
-                        charging_penalty = getattr(self.env, 'charging_penalty', 10.0)
+                        charging_penalty = getattr(self.env, 'charging_penalty', 2.0)
                         charging_value = -charging_penalty + charging_q_value * getattr(self.env, 'adp_value', 1.0)
                         objective_terms += charging_value * charge_decision[i, j]
+            
+
+            
+            # Add penalty for unserved requests (considering reject behavior)
+            served_requests = self.gp.LinExpr()
+            for j in range(len(available_requests)):
+                for i in range(len(vehicle_ids)):
+                    served_requests += request_decision[i][j]
+            
+            
+            
+
+
+            # Penalty for unserved requests
+            unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)
+            objective_terms -= unserved_penalty * (len(available_requests) - served_requests)
             
             model.setObjective(objective_terms, self.GRB.MAXIMIZE)
             
@@ -616,10 +687,13 @@ class GurobiOptimizer:
             
             # Extract assignments
             if model.status == self.GRB.OPTIMAL:
+                # Print battery level optimization results for debugging
+
+                
                 for i, vehicle_id in enumerate(vehicle_ids):
                     # Check request assignments
                     for j, request in enumerate(available_requests):
-                        if (i, j) in request_decision and request_decision[i, j].x > 0.5:
+                        if request_decision[i][j].x > 0.5:
                             assignments[vehicle_id] = request
                             break
                     
@@ -629,11 +703,27 @@ class GurobiOptimizer:
                             if charge_decision[i, j].x > 0.5:
                                 assignments[vehicle_id] = f"charge_{station.id}"
                                 break
+                                
+                # Update vehicle battery levels based on optimization results
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):
+                        self.env.vehicles[vehicle_id]['predicted_battery_t'] = battery_t[i].x
+                        
             else:
                 print(f"Optimization status: {model.status}")
+                # Print constraint violations for debugging
+                if model.status == self.GRB.INFEASIBLE:
+                    print("Model is infeasible. Computing IIS...")
+                    model.computeIIS()
+                    print("Infeasible constraints:")
+                    for c in model.getConstrs():
+                        if c.IISConstr:
+                            print(f"  {c.constrName}")
         
         except Exception as e:
-            print(f"Gurobi optimization with reject failed: {e}")
+            print(f"Gurobi optimization with reject and charging levels failed: {e}")
+            import traceback
+            traceback.print_exc()
             # Fallback to heuristic with reject consideration
             assignments = self._heuristic_assignment_with_reject(vehicle_ids, available_requests, charging_stations)
         

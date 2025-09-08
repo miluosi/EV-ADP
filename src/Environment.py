@@ -36,15 +36,16 @@ class Environment(metaclass=ABCMeta):
         self.num_days_trained = 0
         self.recent_request_history: Deque[Request] = deque(maxlen=self.REQUEST_HISTORY_SIZE)
         self.current_time: float = 0.0
-        self.idle_vehicle_requirement = 3
+        self.idle_vehicle_requirement = 1
         self.idle_penalty = 0.5
         self.charging_penalty = 0.2
+        self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
+        self.min_battery_level = 0.2
         # Q-learning components for ADP integration
         self.q_table = {}  # Q-table for state-action values
         self.learning_rate = 0.1
         self.discount_factor = 0.9
         self.epsilon = 0.1  # Exploration rate
-
     @abstractmethod
     def initialise_environment(self):
         raise NotImplementedError
@@ -425,7 +426,7 @@ class ChargingIntegratedEnvironment(Environment):
     Integrated charging environment class, inheriting from src.Environment
     """
     
-    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15):  # Increased grid size
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -440,11 +441,14 @@ class ChargingIntegratedEnvironment(Environment):
         self.num_vehicles = num_vehicles
         self.num_stations = num_stations
         self.grid_size = grid_size
-        
+        self.minimum_charging_level = 0.2  # Minimum battery level before needing to charge
         # Parameters for reward alignment with Gurobi optimization
-        self.charging_penalty = 10.0  # Penalty for charging action
+        self.charging_penalty = 2.0  # Penalty for charging action (reduced from 10.0)
         self.adp_value = 1.0  # Weight for Q-value contribution
-        
+        self.unserved_penalty = 1.5  # Penalty for unserved requests (reduced from 5.0)
+        self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
+        self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
+        self.min_battery_level = 0.2
         # Initialize charging station manager
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
@@ -463,6 +467,11 @@ class ChargingIntegratedEnvironment(Environment):
         self.rejected_requests = []  # Rejected requests for analysis
         self.request_counter = 0
         self.request_generation_rate = 0.6  # Increased to 60% for more active environment
+        self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
+        
+        # Tracking for visualization
+        self.request_generation_history = []  # Track where requests are generated
+        self.vehicle_position_history = {}  # Track vehicle movement patterns
         
         # Initialize ValueFunction for Q-value calculation (will be set externally)
         self.value_function = None
@@ -586,7 +595,8 @@ class ChargingIntegratedEnvironment(Environment):
                 'assigned_request': None,  # Currently assigned passenger request
                 'passenger_onboard': None,  # Passenger being transported
                 'service_earnings': 0,  # Total earnings from completed requests
-                'rejected_requests': 0  # Track rejected requests for analysis
+                'rejected_requests': 0,  # Track rejected requests for analysis
+                'unserved_penalty': 0  # Accumulated penalty for unserved requests
             }
     
     def _calculate_rejection_probability(self, vehicle_id, request):
@@ -605,7 +615,7 @@ class ChargingIntegratedEnvironment(Environment):
         # Exponential distribution for rejection probability
         # Base rejection rate increases exponentially with distance
         base_rate = 0.1  # 10% base rejection rate for distance 0
-        distance_factor = 0.3  # Exponential growth factor
+        distance_factor = 0.5  # Exponential growth factor
         
         rejection_prob = base_rate * np.exp(distance * distance_factor)
         # Cap at 90% maximum rejection probability
@@ -616,7 +626,8 @@ class ChargingIntegratedEnvironment(Environment):
         rejection_prob = self._calculate_rejection_probability(vehicle_id, request)
         return random.random() < rejection_prob
     
-    def _generate_requests(self):
+
+    def _generate_random_requests(self):
         """Generate new passenger requests"""
         if random.random() < self.request_generation_rate:
             self.request_counter += 1
@@ -651,6 +662,110 @@ class ChargingIntegratedEnvironment(Environment):
             
             self.active_requests[self.request_counter] = request
             # print(f"Generated request {self.request_counter}: {request.pickup} -> {request.dropoff}")
+            return request
+        return None
+    
+    def _generate_intense_requests(self):
+        """Generate requests concentrated in 3 hotspots with probability weights"""
+        if random.random() < self.request_generation_rate:
+            self.request_counter += 1
+            
+            # Define 3 hotspot centers in the grid
+            hotspots = [
+                (self.grid_size // 4, self.grid_size // 4),           # Bottom-left hotspot
+                (3 * self.grid_size // 4, self.grid_size // 4),       # Bottom-right hotspot
+                (self.grid_size // 2, 3 * self.grid_size // 4)        # Top-center hotspot
+            ]
+            
+            # Probability weights for each hotspot (should sum to 1.0)
+            probability_weights = [0.7, 0.2, 0.1]  # 70%, 20%, 10%
+
+            # Select hotspot based on probability weights
+            rand_val = random.random()
+            cumulative_prob = 0
+            selected_hotspot_idx = 0
+            for i, weight in enumerate(probability_weights):
+                cumulative_prob += weight
+                if rand_val <= cumulative_prob:
+                    selected_hotspot_idx = i
+                    break
+            
+            hotspot_center = hotspots[selected_hotspot_idx]
+            
+            # Generate pickup location near selected hotspot (with some randomness)
+            hotspot_radius = max(2, self.grid_size // 8)  # Radius around hotspot
+            pickup_x = max(0, min(self.grid_size - 1, 
+                                hotspot_center[0] + random.randint(-hotspot_radius, hotspot_radius)))
+            pickup_y = max(0, min(self.grid_size - 1, 
+                                hotspot_center[1] + random.randint(-hotspot_radius, hotspot_radius)))
+            pickup_location = pickup_y * self.grid_size + pickup_x
+            
+            # Generate dropoff location (can be anywhere or biased toward other hotspots)
+            if random.random() < 0.8:  # 80% chance dropoff is near another hotspot
+                # Choose a different hotspot for dropoff based on probability weights
+                available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
+                if available_hotspot_indices:
+                    # Get weights for available hotspots and normalize them
+                    available_weights = [probability_weights[i] for i in available_hotspot_indices]
+                    total_weight = sum(available_weights)
+                    normalized_weights = [w / total_weight for w in available_weights]
+                    
+                    # Select dropoff hotspot based on normalized weights
+                    rand_val = random.random()
+                    cumulative_prob = 0
+                    selected_dropoff_idx = 0
+                    for i, weight in enumerate(normalized_weights):
+                        cumulative_prob += weight
+                        if rand_val <= cumulative_prob:
+                            selected_dropoff_idx = available_hotspot_indices[i]
+                            break
+                    
+                    dropoff_hotspot = hotspots[selected_dropoff_idx]
+                    dropoff_x = max(0, min(self.grid_size - 1, 
+                                        dropoff_hotspot[0] + random.randint(-hotspot_radius, hotspot_radius)))
+                    dropoff_y = max(0, min(self.grid_size - 1, 
+                                        dropoff_hotspot[1] + random.randint(-hotspot_radius, hotspot_radius)))
+                else:
+                    # Fallback to random location
+                    dropoff_x = random.randint(0, self.grid_size - 1)
+                    dropoff_y = random.randint(0, self.grid_size - 1)
+            else:  # 30% chance dropoff is completely random
+                dropoff_x = random.randint(0, self.grid_size - 1)
+                dropoff_y = random.randint(0, self.grid_size - 1)
+            
+            dropoff_location = dropoff_y * self.grid_size + dropoff_x
+            
+            # Ensure pickup and dropoff are different
+            while dropoff_location == pickup_location:
+                dropoff_x = random.randint(0, self.grid_size - 1)
+                dropoff_y = random.randint(0, self.grid_size - 1)
+                dropoff_location = dropoff_y * self.grid_size + dropoff_x
+            
+            # Calculate travel time (Manhattan distance)
+            travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+            
+            # Create request
+            request = Request(
+                request_id=self.request_counter,
+                source=pickup_location,
+                destination=dropoff_location,
+                current_time=self.current_time,
+                travel_time=travel_time,
+                value=3.0 + travel_time * 0.1  # Base fare + distance fare
+            )
+            
+            self.active_requests[self.request_counter] = request
+            
+            # Track request generation for visualization
+            if not hasattr(self, 'request_generation_history'):
+                self.request_generation_history = []
+            self.request_generation_history.append({
+                'pickup_coords': (pickup_x, pickup_y),
+                'dropoff_coords': (dropoff_x, dropoff_y),
+                'hotspot_idx': selected_hotspot_idx,
+                'time': self.current_time
+            })
+            
             return request
         return None
     
@@ -958,7 +1073,7 @@ class ChargingIntegratedEnvironment(Environment):
         reward = 0
         
         # Get parameters for consistency with Gurobi
-        charging_penalty = getattr(self, 'charging_penalty', 10.0)
+        charging_penalty = getattr(self, 'charging_penalty', 2.0)
         
         if isinstance(action, ChargingAction):
             # Charging action - immediate reward is -charging_penalty (same as Gurobi)
@@ -977,9 +1092,9 @@ class ChargingIntegratedEnvironment(Environment):
                         reward = -charging_penalty
                         
                     else:
-                        reward = -charging_penalty * 2  # Failed charging penalty
+                        reward = -charging_penalty
                 else:
-                    reward = -charging_penalty * 2  # Invalid station penalty
+                    reward = -charging_penalty
             else:
                 reward = -charging_penalty  # Already charging penalty
         
@@ -996,7 +1111,7 @@ class ChargingIntegratedEnvironment(Environment):
                     else:
                         reward = 0  # Request not found
                 else:
-                    reward = -1.0  # Failed assignment penalty
+                    reward = 0
                     
             elif vehicle['assigned_request'] is not None:
                 # Progress towards pickup - give partial request value
@@ -1019,14 +1134,66 @@ class ChargingIntegratedEnvironment(Environment):
                     reward = 0  # Moving towards dropoff
         
         else:
-            # Movement action - minimal reward/penalty
+            # Movement action - intelligent target-oriented movement
             if vehicle['charging_station'] is None:
-                # Only vehicles not charging can move
                 old_coords = vehicle['coordinates']
-                new_x = max(0, min(self.grid_size-1, 
-                                 old_coords[0] + random.randint(-1, 1)))
-                new_y = max(0, min(self.grid_size-1, 
-                                 old_coords[1] + random.randint(-1, 1)))
+                target_coords = None
+                movement_purpose = "idle"
+                
+                # 1. Priority 1: Move towards dropoff if passenger onboard
+                if vehicle['passenger_onboard'] is not None:
+                    if vehicle['passenger_onboard'] in self.active_requests:
+                        request = self.active_requests[vehicle['passenger_onboard']]
+                        target_coords = (request.dropoff % self.grid_size, request.dropoff // self.grid_size)
+                        movement_purpose = "dropoff"
+                
+                # 2. Priority 2: Move towards pickup if request assigned
+                elif vehicle['assigned_request'] is not None:
+                    if vehicle['assigned_request'] in self.active_requests:
+                        request = self.active_requests[vehicle['assigned_request']]
+                        target_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
+                        movement_purpose = "pickup"
+                
+                # 3. Priority 3: Move towards charging station if low battery
+                elif vehicle['battery'] < self.min_battery_level and hasattr(vehicle, 'charging_target'):
+                    if vehicle['charging_target'] in self.charging_manager.stations:
+                        station = self.charging_manager.stations[vehicle['charging_target']]
+                        target_coords = (station.location % self.grid_size, station.location // self.grid_size)
+                        movement_purpose = "charging"
+                
+                # 4. Priority 4: Move towards charging station if target_location set
+                elif 'target_location' in vehicle and vehicle['target_location'] is not None:
+                    target_coords = vehicle['target_location']
+                    movement_purpose = "rebalance_charging"
+                
+                # Calculate intelligent movement towards target
+                if target_coords:
+                    current_x, current_y = old_coords
+                    target_x, target_y = target_coords
+                    
+                    # Move one step towards target (Manhattan distance)
+                    if current_x < target_x:
+                        new_x = current_x + 1
+                        new_y = current_y
+                    elif current_x > target_x:
+                        new_x = current_x - 1
+                        new_y = current_y
+                    elif current_y < target_y:
+                        new_x = current_x
+                        new_y = current_y + 1
+                    elif current_y > target_y:
+                        new_x = current_x
+                        new_y = current_y - 1
+                    else:
+                        # Already at target
+                        new_x, new_y = current_x, current_y
+                else:
+                    # No specific target - random movement (exploration)
+                    new_x = max(0, min(self.grid_size-1, 
+                                     old_coords[0] + random.randint(-1, 1)))
+                    new_y = max(0, min(self.grid_size-1, 
+                                     old_coords[1] + random.randint(-1, 1)))
+                    movement_purpose = "exploration"
                 
                 distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
                 new_location_index = new_y * self.grid_size + new_x
@@ -1035,16 +1202,24 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle['location'] = new_location_index
                 vehicle['total_distance'] += distance
                 
+                # Track vehicle position for visualization
+                if vehicle_id not in self.vehicle_position_history:
+                    self.vehicle_position_history[vehicle_id] = []
+                self.vehicle_position_history[vehicle_id].append({
+                    'coords': (new_x, new_y),
+                    'time': self.current_time,
+                    'action_type': movement_purpose
+                })
+                
                 # Movement consumes battery
                 vehicle['battery'] -= distance * 0.01
                 vehicle['battery'] = max(0, vehicle['battery'])
                 
                 # Small time penalty for idle movement
                 reward = -0.1
-                
-                # Critical battery penalty
-                if vehicle['battery'] < 0.05:
-                    reward -= 2.0
+            else:
+                # Charging penalty for idle movement
+                reward = -0.2  
         
         return reward
     
@@ -1052,8 +1227,11 @@ class ChargingIntegratedEnvironment(Environment):
         """Update environment state"""
         self.current_time += 1
         
-        # Generate new requests
-        new_request = self._generate_requests()
+        # Generate new requests using selected method
+        if self.use_intense_requests:
+            new_request = self._generate_intense_requests()
+        else:
+            new_request = self._generate_random_requests()
         
         # Update charging status
         for vehicle_id, vehicle in self.vehicles.items():
@@ -1072,15 +1250,28 @@ class ChargingIntegratedEnvironment(Environment):
                         station.stop_charging(str(vehicle_id))
                     vehicle['charging_station'] = None
         
-        # Remove expired requests
+        # Remove expired requests and apply unserved penalty
         current_time = self.current_time
         expired_requests = []
+        unserved_penalty_total = 0
+        
         for request_id, request in self.active_requests.items():
             if current_time > request.pickup_deadline:
                 expired_requests.append(request_id)
+                # Apply penalty for unserved request
+                unserved_penalty_total += self.unserved_penalty
         
+        # Move expired requests to rejected list
         for request_id in expired_requests:
+            request = self.active_requests[request_id]
+            self.rejected_requests.append(request)
             del self.active_requests[request_id]
+        
+        # Distribute unserved penalty among all vehicles
+        if unserved_penalty_total > 0 and self.vehicles:
+            penalty_per_vehicle = unserved_penalty_total / len(self.vehicles)
+            for vehicle in self.vehicles.values():
+                vehicle['unserved_penalty'] = vehicle.get('unserved_penalty', 0) + penalty_per_vehicle
     
     def reset(self):
         """重置环境"""
