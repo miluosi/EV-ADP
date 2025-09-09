@@ -226,7 +226,9 @@ class SpatialVisualization:
                 print(f"   Hotspot distribution:")
                 for hotspot_idx, count in req_patterns['hotspot_distribution'].items():
                     percentage = (count / req_patterns['total_requests']) * 100
-                    print(f"     Hotspot {hotspot_idx + 1}: {count} requests ({percentage:.1f}%)")
+                    # Handle None hotspot_idx
+                    hotspot_display = "Unknown" if hotspot_idx is None else f"{hotspot_idx + 1}"
+                    print(f"     Hotspot {hotspot_display}: {count} requests ({percentage:.1f}%)")
         
         # Vehicle patterns
         if analysis['vehicle_patterns']:

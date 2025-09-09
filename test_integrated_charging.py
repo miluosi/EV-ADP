@@ -1,7 +1,8 @@
 """
 Integrated Test: Vehicle Charging Behavior Integration Test using src folder components
 """
-
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -126,8 +127,31 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                 
                 action_chosen = False
                 
-                # 1. First priority: Check for passenger requests if vehicle is available
-                if (vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None and 
+                # 1. First priority: Charging if battery is critically low (override passenger service)
+                if not action_chosen and vehicle['battery'] < 0.3 and vehicle['charging_station'] is None:
+                    # Find nearest available charging station
+                    best_station = None
+                    min_distance = float('inf')
+                    
+                    for station_id, station in env.charging_manager.stations.items():
+                        if len(station.current_vehicles) < station.max_capacity:
+                            # Calculate distance using coordinates
+                            coords = vehicle['coordinates']
+                            station_coords = ((station.location // env.grid_size), (station.location % env.grid_size))
+                            distance = abs(coords[0] - station_coords[0]) + abs(coords[1] - station_coords[1])
+                            if distance < min_distance:
+                                min_distance = distance
+                                best_station = station_id
+                    
+                    if best_station:
+                        charge_duration = 6  # Longer charge for critical battery
+                        actions[vehicle_id] = ChargingAction([], best_station, charge_duration)
+                        action_idx = 4  # Charging action index
+                        action_chosen = True
+                        #print(f"DEBUG: Vehicle {vehicle_id} with battery {vehicle['battery']:.2f} assigned to charge at station {best_station}")
+                
+                # 2. Second priority: Check for passenger requests if vehicle is available
+                if not action_chosen and (vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None and 
                     vehicle['charging_station'] is None and vehicle['battery'] > 0.2):
                     # Look for nearby passenger requests
                     available_requests = [req for req in env.active_requests.values()]
@@ -150,7 +174,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                             action_chosen = True
                             #print(f"Vehicle {vehicle_id} accepting request {best_request.request_id} (distance: {min_distance})")
                 
-                # 2. Second priority: Continue with assigned passenger service
+                # 3. Third priority: Continue with assigned passenger service
                 if not action_chosen and (vehicle['assigned_request'] is not None or vehicle['passenger_onboard'] is not None):
                     # Use the actual assigned request ID, not 0
                     request_id = vehicle['assigned_request'] if vehicle['assigned_request'] is not None else vehicle['passenger_onboard']
@@ -158,8 +182,8 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                     action_idx = 5
                     action_chosen = True
                 
-                # 3. Third priority: Charging if battery is low
-                if not action_chosen and vehicle['battery'] < 0.4 and vehicle['charging_station'] is None:
+                # 4. Fourth priority: Charging if battery is moderate (for proactive charging)
+                if not action_chosen and vehicle['battery'] < 0.6 and vehicle['charging_station'] is None:
                     # Find nearest available charging station
                     best_station = None
                     min_distance = float('inf')
@@ -185,8 +209,9 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                         actions[vehicle_id] = ChargingAction([], best_station, charge_duration)
                         action_idx = 4  # Charging action index
                         action_chosen = True
+                        #print(f"DEBUG: Vehicle {vehicle_id} with battery {vehicle['battery']:.2f} assigned to charge at station {best_station} for {charge_duration} steps")
                 
-                # 4. Default: Movement action
+                # 5. Default: Movement action
                 if not action_chosen:
                     if vehicle['charging_station'] is None:
                         actions[vehicle_id] = Action([])  # Move when no other priority
@@ -262,6 +287,14 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             episode_stats['neural_network_loss_std'] = 0.0
             episode_stats['training_steps_in_episode'] = 0
         results['episode_detailed_stats'].append(episode_stats)
+        
+        # Analyze charging usage history for this episode
+        if 'charging_usage_history' in episode_stats and episode_stats['charging_usage_history']:
+            charging_history = episode_stats['charging_usage_history']
+            avg_usage = sum(h['vehicles_per_station'] for h in charging_history) / len(charging_history)
+            max_usage = max(h['vehicles_per_station'] for h in charging_history)
+            min_usage = min(h['vehicles_per_station'] for h in charging_history)
+            print(f"  Charging History: {len(charging_history)} time steps, Avg: {avg_usage:.2f}, Max: {max_usage:.2f}, Min: {min_usage:.2f} vehicles/station")
         
         # Analyze vehicle visit patterns for this episode
         vehicle_visit_stats = analyze_vehicle_visit_patterns(env)
@@ -872,6 +905,24 @@ def analyze_results(results):
         print(f"Max charging duration: {max(duration_stats)}")
         print(f"Min charging duration: {min(duration_stats)}")
     
+    # Analyze charging usage history across all episodes
+    if 'episode_detailed_stats' in results:
+        all_usage_data = []
+        for episode_stats in results['episode_detailed_stats']:
+            if 'charging_usage_history' in episode_stats and episode_stats['charging_usage_history']:
+                for usage_point in episode_stats['charging_usage_history']:
+                    all_usage_data.append(usage_point['vehicles_per_station'])
+        
+        if all_usage_data:
+            print(f"\nOverall Charging Station Usage Analysis:")
+            print(f"  Total time steps recorded: {len(all_usage_data)}")
+            print(f"  Average vehicles per station: {np.mean(all_usage_data):.3f}")
+            print(f"  Maximum vehicles per station: {max(all_usage_data):.3f}")
+            print(f"  Minimum vehicles per station: {min(all_usage_data):.3f}")
+            print(f"  Standard deviation: {np.std(all_usage_data):.3f}")
+        else:
+            print(f"\nNo charging usage history data found across episodes")
+    
     # Learning curve analysis
     improvement = 0
     if len(results['episode_rewards']) > 10:
@@ -1020,14 +1071,14 @@ def main():
     print("🚗⚡ 充电行为集成测试程序")
     print("使用src文件夹中的Environment和充电组件")
     print("-" * 60)
-    
+    use_intense_requests = False  # 切换为True以使用热点请求模式
 
     try:
 
-        num_episodes = 10
+        num_episodes = 100
         adpvalue = 0
         assignmentgurobi =False
-        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=True, assignmentgurobi=assignmentgurobi)
+        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
 
             # 分析结果
         analysis = analyze_results(results)
@@ -1070,7 +1121,7 @@ def main():
             assignmentgurobi =True
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
-            results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=True, assignmentgurobi=assignmentgurobi)
+            results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
 
             # 分析结果
             analysis = analyze_results(results)

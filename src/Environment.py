@@ -473,6 +473,9 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_generation_history = []  # Track where requests are generated
         self.vehicle_position_history = {}  # Track vehicle movement patterns
         
+        # Charging station usage tracking for episode-wide statistics
+        self.charging_usage_history = []  # Track charging station usage over time
+        
         # Initialize ValueFunction for Q-value calculation (will be set externally)
         self.value_function = None
         
@@ -619,11 +622,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.5:
-                num_requests = random.randint(1, 3)
+                num_requests = random.randint(5, 10)
             elif rand_val < 0.8:
-                num_requests = random.randint(4, 6)
+                num_requests = random.randint(10, 15)
             else:
-                num_requests = random.randint(7, 10)
+                num_requests = random.randint(15, 20)
             
             for _ in range(num_requests):
                 self.request_counter += 1
@@ -1031,11 +1034,32 @@ class ChargingIntegratedEnvironment(Environment):
 
         # 执行Q-learning更新
         self._update_q_learning(actions, rewards, next_states)
+        
+        # Record charging station usage for this time step
+        self._record_charging_usage()
 
         # 检查是否结束
         done = self.current_time >= self.episode_length
 
         return next_states, rewards, done, {'charging_events': charging_events}
+    
+    def _record_charging_usage(self):
+        """Record charging station usage for current time step"""
+        if hasattr(self, 'charging_manager') and self.charging_manager.stations:
+            total_occupied = sum(len(station.current_vehicles) for station in self.charging_manager.stations.values())
+            total_stations = len(self.charging_manager.stations)
+            
+            usage_stats = {
+                'time': self.current_time,
+                'total_occupied': total_occupied,
+                'total_stations': total_stations,
+                'vehicles_per_station': total_occupied / max(1, total_stations),
+                'station_details': {
+                    station_id: len(station.current_vehicles) 
+                    for station_id, station in self.charging_manager.stations.items()
+                }
+            }
+            self.charging_usage_history.append(usage_stats)
 
     def simulate_motion(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True) -> None:
         """Override simulate_motion to integrate Gurobi optimization with Q-learning for charging environment"""
@@ -1149,10 +1173,12 @@ class ChargingIntegratedEnvironment(Environment):
                     if current_location == station_location:
                         # Vehicle is at station - can start charging
                         success = station.start_charging(str(vehicle_id))
+                        #print(f"DEBUG: Vehicle {vehicle_id} trying to start charging at station {station_id}: success={success}")
                         if success:
                             vehicle['charging_station'] = station_id
                             vehicle['charging_time_left'] = action.charging_duration
                             vehicle['charging_count'] += 1
+                            #print(f"DEBUG: Vehicle {vehicle_id} started charging at station {station_id}, time_left={action.charging_duration}")
                             
                             # Immediate reward matches Gurobi: -charging_penalty
                             reward = -charging_penalty
@@ -1278,8 +1304,8 @@ class ChargingIntegratedEnvironment(Environment):
                     'action_type': movement_purpose
                 })
                 
-                # Movement consumes battery
-                vehicle['battery'] -= distance * 0.01
+                # Movement consumes battery (increased for more realistic charging needs)
+                vehicle['battery'] -= distance * 0.03  # Increased from 0.01 to 0.03
                 vehicle['battery'] = max(0, vehicle['battery'])
                 
                 # Small time penalty for idle movement
@@ -1377,7 +1403,7 @@ class ChargingIntegratedEnvironment(Environment):
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # Small time penalty for movement
-        return -0.1
+        return -0.1*distance
     
     def _execute_movement_towards_charging_station(self, vehicle_id, station_id):
         """Execute movement towards charging station"""
@@ -1413,11 +1439,13 @@ class ChargingIntegratedEnvironment(Environment):
         else:
             # Already at charging station - try to start charging
             success = station.start_charging(str(vehicle_id))
+            print(f"DEBUG: Vehicle {vehicle_id} at charging station {station_id}, trying to start: success={success}")
             if success:
                 vehicle['charging_station'] = station_id
                 vehicle['charging_time_left'] = getattr(self, 'default_charging_duration', 10)
                 vehicle['charging_count'] += 1
                 vehicle.pop('target_charging_station', None)  # Remove target
+                #print(f"DEBUG: Vehicle {vehicle_id} started charging at station {station_id}")
                 
                 # Return charging penalty (same as Gurobi)
                 charging_penalty = getattr(self, 'charging_penalty', 2.0)
@@ -1434,11 +1462,11 @@ class ChargingIntegratedEnvironment(Environment):
         distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
         
         # Movement consumes battery
-        vehicle['battery'] -= distance * 0.01
+        vehicle['battery'] -= distance * 0.03  # Increased battery consumption for charging station movement
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # Small time penalty for movement
-        return -0.1
+        return -0.1*distance
     
     def _update_environment(self):
         """Update environment state"""
@@ -1512,6 +1540,10 @@ class ChargingIntegratedEnvironment(Environment):
         self.completed_requests = []
         self.rejected_requests = []
         self.request_counter = 0
+        
+        # Reset tracking histories
+        self.charging_usage_history = []
+        
         self._setup_vehicles()
         return self.get_initial_states()
     
@@ -1525,31 +1557,60 @@ class ChargingIntegratedEnvironment(Environment):
         total_rejected = len(self.rejected_requests)
         
         # Calculate average charging station utilization
-        total_capacity = sum(station.max_capacity for station in self.charging_manager.stations.values())
-        total_occupied = sum(len(station.current_vehicles) for station in self.charging_manager.stations.values())
-        
-        # Debug: Check vehicle charging status consistency
-        vehicles_with_charging_station = [v for v in self.vehicles.values() if v['charging_station'] is not None]
-        station_vehicle_count = sum(len(station.current_vehicles) for station in self.charging_manager.stations.values())
-        
-        # Debug output for inconsistency detection
-        if len(vehicles_with_charging_station) != station_vehicle_count:
-            print(f"DEBUG: Charging status inconsistency!")
-            print(f"  Vehicles with charging_station set: {len(vehicles_with_charging_station)}")
-            print(f"  Vehicles recorded in stations: {station_vehicle_count}")
+        if not hasattr(self, 'charging_manager') or not self.charging_manager.stations:
+            print("DEBUG: No charging manager or stations found!")
+            total_capacity = 0
+            total_occupied = 0
+            avg_station_utilization = 0
+            avg_vehicles_per_station = 0
+        else:
+            total_capacity = sum(station.max_capacity for station in self.charging_manager.stations.values())
+            total_occupied = sum(len(station.current_vehicles) for station in self.charging_manager.stations.values())
             
-            # Show individual station states
-            for station_id, station in self.charging_manager.stations.items():
-                if len(station.current_vehicles) > 0:
-                    print(f"  Station {station_id}: {len(station.current_vehicles)} vehicles: {station.current_vehicles}")
-                    
-            # Show vehicle charging states
-            for vid, vehicle in self.vehicles.items():
-                if vehicle['charging_station'] is not None:
-                    print(f"  Vehicle {vid}: charging at station {vehicle['charging_station']}")
-        
-        avg_station_utilization = total_occupied / max(1, total_capacity)
-        avg_vehicles_per_station = total_occupied / max(1, len(self.charging_manager.stations))
+            # Debug: Check vehicle charging status consistency
+            vehicles_with_charging_station = [v for v in self.vehicles.values() if v['charging_station'] is not None]
+            station_vehicle_count = sum(len(station.current_vehicles) for station in self.charging_manager.stations.values())
+            
+            # Debug output for inconsistency detection
+            # if len(vehicles_with_charging_station) != station_vehicle_count:
+            #     print(f"DEBUG: Charging status inconsistency!")
+            #     print(f"  Vehicles with charging_station set: {len(vehicles_with_charging_station)}")
+            #     print(f"  Vehicles recorded in stations: {station_vehicle_count}")
+                
+            #     # Show individual station states
+            #     for station_id, station in self.charging_manager.stations.items():
+            #         if len(station.current_vehicles) > 0:
+            #             print(f"  Station {station_id}: {len(station.current_vehicles)} vehicles: {station.current_vehicles}")
+                        
+            #     # Show vehicle charging states
+            #     for vid, vehicle in self.vehicles.items():
+            #         if vehicle['charging_station'] is not None:
+            #             print(f"  Vehicle {vid}: charging at station {vehicle['charging_station']}")
+            
+            # Calculate charging station utilization using episode history
+            if self.charging_usage_history:
+                # Calculate average over entire episode
+                avg_vehicles_per_station = sum(usage['vehicles_per_station'] for usage in self.charging_usage_history) / len(self.charging_usage_history)
+                avg_total_occupied = sum(usage['total_occupied'] for usage in self.charging_usage_history) / len(self.charging_usage_history)
+                avg_station_utilization = avg_total_occupied / max(1, total_capacity)
+                
+                print(f"DEBUG: Episode charging stats - History points: {len(self.charging_usage_history)}, Avg occupied: {avg_total_occupied:.1f}, Avg per station: {avg_vehicles_per_station:.2f}")
+            else:
+                # Fallback to current state if no history
+                avg_station_utilization = total_occupied / max(1, total_capacity)
+                avg_vehicles_per_station = total_occupied / max(1, len(self.charging_manager.stations))
+                print(f"DEBUG: No charging history - using current state: {avg_vehicles_per_station:.2f}")
+            
+            # Additional debug info for station usage
+            #print(f"DEBUG: Station stats - Total stations: {len(self.charging_manager.stations)}, Total occupied: {total_occupied}, Avg per station: {avg_vehicles_per_station}")
+            
+            # Debug: Show detailed station status
+            # for station_id, station in self.charging_manager.stations.items():
+            #     print(f"  Station {station_id}: current_vehicles={station.current_vehicles}, capacity={station.max_capacity}")
+            
+            # Debug: Show vehicles that think they're charging
+            charging_vehicles = [vid for vid, v in self.vehicles.items() if v['charging_station'] is not None]
+            #print(f"  Vehicles with charging_station set: {charging_vehicles}")
         
         # Count active and completed requests
         active_orders = len(self.active_requests)
@@ -1581,7 +1642,8 @@ class ChargingIntegratedEnvironment(Environment):
             'aev_rejected': aev_rejected,
             'total_stations': len(self.charging_manager.stations),
             'vehicles_charging': len([v for v in self.vehicles.values() if v['charging_station'] is not None]),
-            'total_earnings': sum(v['service_earnings'] for v in self.vehicles.values())
+            'total_earnings': sum(v['service_earnings'] for v in self.vehicles.values()),
+            'charging_usage_history': self.charging_usage_history.copy()  # Add charging usage history
         }
 
     def get_stats(self):
