@@ -500,7 +500,7 @@ class GurobiOptimizer:
             model.setParam('OutputFlag', 0)  # Suppress output
             
             # Parameters
-            min_battery_level = 0.1  # Minimum battery level (10%)
+            min_battery_level = self.env.min_battery_level if hasattr(self.env, 'min_battery_level') else 0.2
             charging_rate = 0.15     # Battery increase per charging period
             travel_consumption = 0.02 # Battery consumption per unit distance
             service_consumption = 0.05 # Battery consumption per service
@@ -555,11 +555,15 @@ class GurobiOptimizer:
                 # t battery level (decision variable)
                 battery_t[i] = model.addVar(
                     vtype=self.GRB.CONTINUOUS,
-                    lb=min_battery_level,  # Minimum battery constraint
+                    lb=0,  # Minimum battery constraint
                     ub=1.0,                # Maximum battery is 100%
                     name=f'battery_t_{vehicle_id}'
                 )
             
+            
+            
+            # for i in range(len(vehicle_ids)):
+            #     model.addConstr(battery_t[i] >= min_battery_level)
             # Idle vehicle variables
             idle_vehicle = {}
             for i in range(len(vehicle_ids)):
@@ -584,7 +588,7 @@ class GurobiOptimizer:
                 
                 
                 model.addConstr(battery_t[i] == battery_t_minus_1[i] + battery_change)
-                model.addConstr(battery_t[i] >= self.env.min_battery_level)
+                # model.addConstr(battery_t[i] >= self.env.min_battery_level)
 
             
             
@@ -605,7 +609,7 @@ class GurobiOptimizer:
             idle_vehicles = self.gp.LinExpr()
             for i in range(len(vehicle_ids)):
                 idle_vehicles += idle_vehicle[i]
-            model.addConstr(idle_vehicles >= self.env.idle_vehicle_requirement)
+            #model.addConstr(idle_vehicles >= self.env.idle_vehicle_requirement)
             
             # Constraint 2: Each request can be assigned to at most one vehicle
             for j in range(len(available_requests)):

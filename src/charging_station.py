@@ -3,7 +3,7 @@ import time
 
 
 class ChargingStation:
-    def __init__(self, id: int, location: int, max_capacity: int = 4):
+    def __init__(self, id: int, location: int, max_capacity: int = 8):
         self.id = id
         self.location = location
         self.max_capacity = max_capacity
