@@ -15,7 +15,7 @@ import re
 import random
 import numpy as np
 from .charging_station import ChargingStationManager, ChargingStation
-from .Action import Action, ChargingAction, ServiceAction
+from .Action import Action, ChargingAction, ServiceAction, IdleAction
 from src.GurobiOptimizer import GurobiOptimizer
 
 class Environment(metaclass=ABCMeta):
@@ -469,6 +469,10 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
         
+        # Assignment tracking for rebalancing analysis
+        self.rebalancing_assignments_per_step = []  # Store assignments count per step
+        self.total_rebalancing_calls = 0
+        
         # Tracking for visualization
         self.request_generation_history = []  # Track where requests are generated
         self.vehicle_position_history = {}  # Track vehicle movement patterns
@@ -652,7 +656,7 @@ class ChargingIntegratedEnvironment(Environment):
                 travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
                 
                 # Create request with dynamic pricing based on demand
-                base_value = 2.0 + travel_time * 0.1  # Base fare + distance fare
+                base_value = 5 
                 # Add surge pricing during high demand periods
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
                 final_value = base_value * surge_factor
@@ -694,11 +698,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.5:
-                num_requests = random.randint(5, 10)
-            elif rand_val < 0.8:
                 num_requests = random.randint(10, 15)
-            else:
+            elif rand_val < 0.8:
                 num_requests = random.randint(15, 20)
+            else:
+                num_requests = random.randint(20, 25)
 
             # Define 3 hotspot centers in the grid
             hotspots = [
@@ -734,7 +738,7 @@ class ChargingIntegratedEnvironment(Environment):
                 pickup_location = pickup_y * self.grid_size + pickup_x
                 
                 # Generate dropoff location (can be anywhere or biased toward other hotspots)
-                if random.random() < 0.9:  # 90% chance dropoff is near another hotspot
+                if random.random() < 0.5:  # 90% chance dropoff is near another hotspot
                     # Choose a different hotspot for dropoff based on probability weights
                     available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
                     if available_hotspot_indices:
@@ -780,7 +784,7 @@ class ChargingIntegratedEnvironment(Environment):
                 travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
                 
                 # Create request with dynamic pricing based on demand
-                base_value = 2.0 + travel_time * 0.1  # Base fare + distance fare
+                base_value = 10
                 # Add surge pricing during high demand periods
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
                 final_value = base_value * surge_factor
@@ -832,10 +836,12 @@ class ChargingIntegratedEnvironment(Environment):
                     # Record rejected request if not already recorded
                     if request not in self.rejected_requests:
                         self.rejected_requests.append(request)
+                    #print(f"DEBUG: Vehicle {vehicle_id} REJECTED request {request_id} at step {self.current_time}")
                     return False  # Request rejected
                 
                 # Request accepted
                 vehicle['assigned_request'] = request_id
+                #print(f"DEBUG: Vehicle {vehicle_id} ASSIGNED to request {request_id} at step {self.current_time}")
                 return True
         return False
     
@@ -909,7 +915,7 @@ class ChargingIntegratedEnvironment(Environment):
                 self.completed_requests.append(completed_request)
                 
                 # Calculate earnings
-                earnings = completed_request.value
+                earnings = completed_request.value/2
                 vehicle['passenger_onboard'] = None
                 
                 return earnings
@@ -1009,6 +1015,10 @@ class ChargingIntegratedEnvironment(Environment):
         rewards = {}
         next_states = {}
         charging_events = []
+        
+        # Initialize step counters
+        self.step_assignments = 0
+        self.step_rejections = 0
 
         # 处理每个车辆的动作
         for vehicle_id, action in actions.items():
@@ -1029,8 +1039,8 @@ class ChargingIntegratedEnvironment(Environment):
         self._update_environment()
 
         # 集成Gurobi优化和Q-learning更新
-        current_requests = list(self.active_requests.values())
-        self.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+        # current_requests = list(self.active_requests.values())
+        # self.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
 
         # 执行Q-learning更新
         self._update_q_learning(actions, rewards, next_states)
@@ -1061,11 +1071,14 @@ class ChargingIntegratedEnvironment(Environment):
             }
             self.charging_usage_history.append(usage_stats)
 
-    def simulate_motion(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True) -> None:
+    def simulate_motion(self, agents: List[LearningAgent] = None, current_requests: List[Request] = None, rebalance: bool = True):
         """Override simulate_motion to integrate Gurobi optimization with Q-learning for charging environment"""
         if agents is None:
             agents = []
 
+        # Initialize actions dictionary for all vehicles
+        actions = {}
+        
         # For ChargingIntegratedEnvironment, we handle rebalancing differently
         # Convert our vehicle states to a format compatible with Gurobi optimization
 
@@ -1081,7 +1094,13 @@ class ChargingIntegratedEnvironment(Environment):
             if vehicles_to_rebalance:
                 # Use GurobiOptimizer for rebalancing
                 if not hasattr(self, 'gurobi_optimizer'):
+                    from src.GurobiOptimizer import GurobiOptimizer
                     self.gurobi_optimizer = GurobiOptimizer(self)
+                
+                # Debug: Count available requests before assignment
+                available_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                #print(f"DEBUG Assignment: Step {self.current_time}, Idle vehicles: {len(vehicles_to_rebalance)}, Available requests: {available_requests_count}")
+                
                 if self.assignmentgurobi:
                     rebalancing_assignments = self.gurobi_optimizer.optimize_vehicle_rebalancing_reject(vehicles_to_rebalance)
                 else:
@@ -1089,23 +1108,90 @@ class ChargingIntegratedEnvironment(Environment):
                     if hasattr(self, 'active_requests') and self.active_requests:
                         available_requests = list(self.active_requests.values())
                     rebalancing_assignments = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests)
-                # Apply the rebalancing assignments
+                
+                # Debug: Count assignments made
+                new_assignments = 0
+                charging_assignments = 0
+                self.total_rebalancing_calls += 1
+                
+                # Apply the rebalancing assignments and generate corresponding actions
                 for vehicle_id, target_request in rebalancing_assignments.items():
                     if target_request:
                         # Check if it's a charging assignment (string) or request assignment (object)
                         if isinstance(target_request, str) and target_request.startswith("charge_"):
                             # Handle charging assignment
-                            station_id = target_request.replace("charge_", "")
+                            station_id = int(target_request.replace("charge_", ""))
                             self._move_vehicle_to_charging_station(vehicle_id, station_id)
+                            charging_assignments += 1
+                            # Generate charging action
+                            from src.Action import ChargingAction
+                            actions[vehicle_id] = ChargingAction([], station_id, 4)
                         elif hasattr(target_request, 'request_id'):
                             # Handle regular request assignment  
                             self._assign_request_to_vehicle(vehicle_id, target_request.request_id)
+                            new_assignments += 1
+                            # Generate service action
+                            from src.Action import ServiceAction
+                            actions[vehicle_id] = ServiceAction([], target_request.request_id)
                         else:
+                            self._assign_idle_vehicle(vehicle_id)
+                            # Generate idle action using the target set by _assign_idle_vehicle
+                            from src.Action import IdleAction
+                            vehicle = self.vehicles[vehicle_id]
+                            current_coords = vehicle['coordinates']
+                            target_coords = vehicle.get('idle_target', current_coords)  # Use assigned target
+                            actions[vehicle_id] = IdleAction([], current_coords, target_coords)
                             print(f"Warning: Unknown assignment type for vehicle {vehicle_id}: {target_request}")
+                    else:
+                        # No assignment for this vehicle - generate idle action
+                        from src.Action import IdleAction
+                        vehicle = self.vehicles[vehicle_id]
+                        current_coords = vehicle['coordinates']
+                        # Generate random target for unassigned vehicles
+                        target_x = max(0, min(self.grid_size-1, 
+                                            current_coords[0] + random.randint(-2, 2)))
+                        target_y = max(0, min(self.grid_size-1, 
+                                            current_coords[1] + random.randint(-2, 2)))
+                        target_coords = (target_x, target_y)
+                        actions[vehicle_id] = IdleAction([], current_coords, target_coords)
+                
+                # Store the count of request assignments for this rebalancing call
+                self.rebalancing_assignments_per_step.append(new_assignments)
+                
+                #print(f"DEBUG Assignment Result: New request assignments: {new_assignments}, Charging assignments: {charging_assignments}, Idle: {len(vehicles_to_rebalance) - new_assignments - charging_assignments}")
+
+        # Generate actions for vehicles not involved in rebalancing
+        from src.Action import Action, ChargingAction, ServiceAction, IdleAction
+        for vehicle_id, vehicle in self.vehicles.items():
+            if vehicle_id not in actions:
+                # Generate action based on current vehicle state
+                if vehicle['charging_station'] is not None:
+                    # Vehicle is charging - continue charging action
+                    station_id = vehicle['charging_station']
+                    charge_duration = vehicle.get('charging_time_left', 4)  # Use remaining time or default
+                    actions[vehicle_id] = ChargingAction([], station_id, charge_duration)
+                elif vehicle['assigned_request'] is not None:
+                    # Vehicle has assigned request - continue service
+                    actions[vehicle_id] = ServiceAction([], vehicle['assigned_request'])
+                elif vehicle['passenger_onboard'] is not None:
+                    # Vehicle has passenger - continue service
+                    actions[vehicle_id] = ServiceAction([], vehicle['passenger_onboard'])
+                else:
+                    # Generate idle action with random target coordinates
+                    current_coords = vehicle['coordinates']
+                    # Generate random target coordinates within grid bounds
+                    target_x = max(0, min(self.grid_size-1, 
+                                        current_coords[0] + random.randint(-2, 2)))  # Random move within 2 steps
+                    target_y = max(0, min(self.grid_size-1, 
+                                        current_coords[1] + random.randint(-2, 2)))
+                    target_coords = (target_x, target_y)
+                    actions[vehicle_id] = IdleAction([], current_coords, target_coords)
 
         # Update recent requests list if provided
         if current_requests:
             self.update_recent_requests(current_requests)
+            
+        return actions
 
     def _update_q_learning(self, actions, rewards, next_states):
         """Update Q-learning based on actions taken and rewards received - unified with neural network training"""
@@ -1153,6 +1239,8 @@ class ChargingIntegratedEnvironment(Environment):
 
     def _execute_action(self, vehicle_id, action):
         """Execute vehicle action with immediate reward aligned to Gurobi optimization objective"""
+        from src.Action import ChargingAction, ServiceAction, IdleAction
+        
         vehicle = self.vehicles[vehicle_id]
         reward = 0
         
@@ -1202,7 +1290,7 @@ class ChargingIntegratedEnvironment(Environment):
                         request = self.active_requests[action.request_id]
                         
                         # Immediate reward matches Gurobi: request.value (only given once at assignment)
-                        reward = request.value
+                        reward = request.value/2
                     else:
                         reward = 0  # Request not found
                 else:
@@ -1221,10 +1309,64 @@ class ChargingIntegratedEnvironment(Environment):
                 # Complete dropoff or move towards dropoff
                 earnings = self._dropoff_passenger(vehicle_id)
                 if earnings > 0:
-                    reward = 0  # Changed: no additional reward for completion
+                    reward = earnings
                 else:
                     # Need to move towards dropoff - execute movement logic
                     reward = self._execute_movement_towards_target(vehicle_id)
+        
+        elif isinstance(action, IdleAction):
+            # Idle action - move towards specified target coordinates
+            if vehicle['charging_station'] is None:  # Only move if not charging
+                current_coords = vehicle['coordinates']
+                target_coords = action.target_coords
+                
+                # Move one step towards target coordinates
+                current_x, current_y = current_coords
+                target_x, target_y = target_coords
+                
+                # Calculate next position (one step towards target)
+                if current_x < target_x:
+                    new_x = current_x + 1
+                    new_y = current_y
+                elif current_x > target_x:
+                    new_x = current_x - 1
+                    new_y = current_y
+                elif current_y < target_y:
+                    new_x = current_x
+                    new_y = current_y + 1
+                elif current_y > target_y:
+                    new_x = current_x
+                    new_y = current_y - 1
+                else:
+                    # Already at target, stay in place
+                    new_x, new_y = current_x, current_y
+                
+                # Update vehicle position
+                distance = abs(new_x - current_x) + abs(new_y - current_y)
+                new_location_index = new_y * self.grid_size + new_x
+                
+                vehicle['coordinates'] = (new_x, new_y)
+                vehicle['location'] = new_location_index
+                vehicle['total_distance'] += distance
+                
+                # Track vehicle position for visualization
+                if vehicle_id not in self.vehicle_position_history:
+                    self.vehicle_position_history[vehicle_id] = []
+                self.vehicle_position_history[vehicle_id].append({
+                    'coords': (new_x, new_y),
+                    'time': self.current_time,
+                    'action_type': 'idle_movement'
+                })
+                
+                # Movement consumes battery
+                vehicle['battery'] -= distance * 0.03
+                vehicle['battery'] = max(0, vehicle['battery'])
+                
+                # Small penalty for idle movement
+                reward = -0.1 * distance if distance > 0 else -0.05
+            else:
+                # Vehicle is charging, can't move
+                reward = -0.2
         
         else:
             # Movement action - intelligent target-oriented movement
@@ -1403,8 +1545,33 @@ class ChargingIntegratedEnvironment(Environment):
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # Small time penalty for movement
-        return -0.1*distance
+        return -0.2*distance
     
+
+
+
+    def _assign_idle_vehicle(self, vehicle_id):
+        """Assign idle vehicle a target for random movement (without actually moving)"""
+        if vehicle_id in self.vehicles:
+            vehicle = self.vehicles[vehicle_id]
+            
+            # Only assign if vehicle is truly idle
+            if (vehicle['assigned_request'] is None and 
+                vehicle['passenger_onboard'] is None and
+                vehicle['charging_station'] is None):
+                
+                # Set a random target for the vehicle (don't move yet, just set target)
+                current_coords = vehicle['coordinates']
+                target_x = max(0, min(self.grid_size-1, 
+                                    current_coords[0] + random.randint(-2, 2)))
+                target_y = max(0, min(self.grid_size-1, 
+                                    current_coords[1] + random.randint(-2, 2)))
+                
+                # Store target for later use in action execution
+                vehicle['idle_target'] = (target_x, target_y)
+                
+                return True
+        return False
     def _execute_movement_towards_charging_station(self, vehicle_id, station_id):
         """Execute movement towards charging station"""
         vehicle = self.vehicles[vehicle_id]
@@ -1466,7 +1633,7 @@ class ChargingIntegratedEnvironment(Environment):
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # Small time penalty for movement
-        return -0.1*distance
+        return -0.2*distance
     
     def _update_environment(self):
         """Update environment state"""
@@ -1543,6 +1710,10 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Reset tracking histories
         self.charging_usage_history = []
+        
+        # Reset rebalancing assignment tracking
+        self.rebalancing_assignments_per_step = []
+        self.total_rebalancing_calls = 0
         
         self._setup_vehicles()
         return self.get_initial_states()
@@ -1625,6 +1796,13 @@ class ChargingIntegratedEnvironment(Environment):
         ev_rejected = sum(v['rejected_requests'] for v in ev_vehicles)
         aev_rejected = sum(v['rejected_requests'] for v in aev_vehicles)
         
+        # Calculate rebalancing assignment statistics
+        avg_rebalancing_assignments = 0
+        total_rebalancing_assignments = 0
+        if self.rebalancing_assignments_per_step:
+            total_rebalancing_assignments = sum(self.rebalancing_assignments_per_step)
+            avg_rebalancing_assignments = total_rebalancing_assignments / len(self.rebalancing_assignments_per_step)
+        
         return {
             'episode_time': self.current_time,
             'total_orders': total_orders,
@@ -1643,7 +1821,12 @@ class ChargingIntegratedEnvironment(Environment):
             'total_stations': len(self.charging_manager.stations),
             'vehicles_charging': len([v for v in self.vehicles.values() if v['charging_station'] is not None]),
             'total_earnings': sum(v['service_earnings'] for v in self.vehicles.values()),
-            'charging_usage_history': self.charging_usage_history.copy()  # Add charging usage history
+            'charging_usage_history': self.charging_usage_history.copy(),  # Add charging usage history
+            # Rebalancing assignment statistics
+            'total_rebalancing_calls': self.total_rebalancing_calls,
+            'total_rebalancing_assignments': total_rebalancing_assignments,
+            'avg_rebalancing_assignments_per_call': avg_rebalancing_assignments,
+            'rebalancing_assignments_per_step': self.rebalancing_assignments_per_step.copy()
         }
 
     def get_stats(self):

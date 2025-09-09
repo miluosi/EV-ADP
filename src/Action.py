@@ -79,3 +79,36 @@ class ServiceAction(Action):
             'request_id': self.request_id,
             'action_type': self.action_type
         }
+
+
+class IdleAction(Action):
+    """
+    An IdleAction represents a vehicle moving randomly while idle.
+    
+    This action allows vehicles to move from current coordinates to
+    randomly selected target coordinates when they have no assigned tasks.
+    """
+    
+    def __init__(self, requests: Iterable[Request], current_coords: tuple, target_coords: tuple) -> None:
+        super().__init__(requests)
+        self.current_coords = current_coords  # (x, y) current position
+        self.target_coords = target_coords    # (x, y) target position
+        self.action_type = "idle"
+    
+    def __eq__(self, other):
+        if isinstance(other, IdleAction):
+            return (self.requests == other.requests and 
+                   self.current_coords == other.current_coords and
+                   self.target_coords == other.target_coords)
+        return False
+    
+    def __hash__(self):
+        return hash((self.requests, self.current_coords, self.target_coords))
+    
+    def get_idle_info(self):
+        """Return idle movement information"""
+        return {
+            'current_coords': self.current_coords,
+            'target_coords': self.target_coords,
+            'action_type': self.action_type
+        }

@@ -120,113 +120,22 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             actions = {}
             states_for_training = []
             actions_for_training = []
-            
-            for vehicle_id in env.vehicles:
-                vehicle = env.vehicles[vehicle_id]
-                current_state = env._get_vehicle_state(vehicle_id)
-                
-                action_chosen = False
-                
-                # 1. First priority: Charging if battery is critically low (override passenger service)
-                if not action_chosen and vehicle['battery'] < 0.3 and vehicle['charging_station'] is None:
-                    # Find nearest available charging station
-                    best_station = None
-                    min_distance = float('inf')
-                    
-                    for station_id, station in env.charging_manager.stations.items():
-                        if len(station.current_vehicles) < station.max_capacity:
-                            # Calculate distance using coordinates
-                            coords = vehicle['coordinates']
-                            station_coords = ((station.location // env.grid_size), (station.location % env.grid_size))
-                            distance = abs(coords[0] - station_coords[0]) + abs(coords[1] - station_coords[1])
-                            if distance < min_distance:
-                                min_distance = distance
-                                best_station = station_id
-                    
-                    if best_station:
-                        charge_duration = 6  # Longer charge for critical battery
-                        actions[vehicle_id] = ChargingAction([], best_station, charge_duration)
-                        action_idx = 4  # Charging action index
-                        action_chosen = True
-                        #print(f"DEBUG: Vehicle {vehicle_id} with battery {vehicle['battery']:.2f} assigned to charge at station {best_station}")
-                
-                # 2. Second priority: Check for passenger requests if vehicle is available
-                if not action_chosen and (vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None and 
-                    vehicle['charging_station'] is None and vehicle['battery'] > 0.2):
-                    # Look for nearby passenger requests
-                    available_requests = [req for req in env.active_requests.values()]
-                    if available_requests:
-                        # Choose closest request
-                        best_request = None
-                        min_distance = float('inf')
-                        vehicle_coords = vehicle['coordinates']
-                        
-                        for request in available_requests:
-                            pickup_coords = (request.pickup // env.grid_size, request.pickup % env.grid_size)
-                            distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
-                            if distance < min_distance:
-                                min_distance = distance
-                                best_request = request
-                        
-                        if best_request and min_distance <= 5:  # Increased from 3 to 5 for better order acceptance
-                            actions[vehicle_id] = ServiceAction([], best_request.request_id)
-                            action_idx = 5  # Service action index
-                            action_chosen = True
-                            #print(f"Vehicle {vehicle_id} accepting request {best_request.request_id} (distance: {min_distance})")
-                
-                # 3. Third priority: Continue with assigned passenger service
-                if not action_chosen and (vehicle['assigned_request'] is not None or vehicle['passenger_onboard'] is not None):
-                    # Use the actual assigned request ID, not 0
-                    request_id = vehicle['assigned_request'] if vehicle['assigned_request'] is not None else vehicle['passenger_onboard']
-                    actions[vehicle_id] = ServiceAction([], request_id)
-                    action_idx = 5
-                    action_chosen = True
-                
-                # 4. Fourth priority: Charging if battery is moderate (for proactive charging)
-                if not action_chosen and vehicle['battery'] < 0.6 and vehicle['charging_station'] is None:
-                    # Find nearest available charging station
-                    best_station = None
-                    min_distance = float('inf')
-                    
-                    for station_id, station in env.charging_manager.stations.items():
-                        if len(station.current_vehicles) < station.max_capacity:
-                            # Calculate distance using coordinates
-                            coords = vehicle['coordinates']
-                            station_coords = ((station.location // env.grid_size), (station.location % env.grid_size))
-                            distance = abs(coords[0] - station_coords[0]) + abs(coords[1] - station_coords[1])
-                            if distance < min_distance:
-                                min_distance = distance
-                                best_station = station_id
-                    
-                    if best_station:
-                        # Smarter charging duration based on battery level
-                        if vehicle['battery'] < 0.2:
-                            charge_duration = 6  # Longer charge for critical battery
-                        elif vehicle['battery'] < 0.3:
-                            charge_duration = 4  # Medium charge for low battery
-                        else:
-                            charge_duration = 3  # Quick top-up for moderate battery
-                        actions[vehicle_id] = ChargingAction([], best_station, charge_duration)
-                        action_idx = 4  # Charging action index
-                        action_chosen = True
-                        #print(f"DEBUG: Vehicle {vehicle_id} with battery {vehicle['battery']:.2f} assigned to charge at station {best_station} for {charge_duration} steps")
-                
-                # 5. Default: Movement action
-                if not action_chosen:
-                    if vehicle['charging_station'] is None:
-                        actions[vehicle_id] = Action([])  # Move when no other priority
-                        action_idx = random.randint(0, 3)  # Random move action
-                    else:
-                        # Vehicle is charging, continue charging
-                        actions[vehicle_id] = Action([])  # Stay at charging station
-                        action_idx = 4  # Stay charging
-                
-                # Store for training
-                states_for_training.append(current_state)
-                actions_for_training.append(action_idx)
-            
-            # Execute actions
+
+
+            current_requests = list(env.active_requests.values())
+            actions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
             next_states, rewards, done, info = env.step(actions)
+
+            # Debug: Output step statistics every 200 steps
+            if step % 200 == 0:
+                stats = env.get_stats()
+                active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
+                assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
+                charging_vehicles = len([v for v in env.vehicles.values() if v['charging_station'] is not None])
+                idle_vehicles = len([v for v in env.vehicles.values() 
+                                   if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None])
+                step_reward = sum(rewards.values())
+                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Charging: {charging_vehicles}, Idle: {idle_vehicles}, Step reward: {step_reward:.2f}")
             
             # Note: Q-learning experience storage is now handled automatically in env.step()
             # This ensures consistency between traditional Q-table and neural network training
@@ -277,6 +186,18 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         episode_stats['episode_number'] = episode + 1
         episode_stats['episode_reward'] = episode_reward
         episode_stats['charging_events_count'] = len(episode_charging_events)
+        
+        # Output rebalancing assignment statistics
+        rebalancing_calls = episode_stats.get('total_rebalancing_calls', 0)
+        total_assignments = episode_stats.get('total_rebalancing_assignments', 0)
+        avg_assignments = episode_stats.get('avg_rebalancing_assignments_per_call', 0)
+        
+        print(f"Episode {episode + 1} Completed:")
+        print(f"  Reward: {episode_reward:.2f}")
+        print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
+        print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
+        print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
+        print(f"  Rebalancing: {rebalancing_calls} calls, {total_assignments} total assignments, {avg_assignments:.1f} avg assignments/call")
         # Only record neural network metrics if using neural network
         if use_neural_network:
             episode_stats['neural_network_loss'] = np.mean(episode_losses) if episode_losses else 0.0
@@ -300,11 +221,11 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         vehicle_visit_stats = analyze_vehicle_visit_patterns(env)
         results['vehicle_visit_stats'].append(vehicle_visit_stats)
         
-        print(f"Episode {episode + 1} Completed:")
-        print(f"  Reward: {episode_reward:.2f}")
-        print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
-        print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
-        print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
+        # print(f"Episode {episode + 1} Completed:")
+        # print(f"  Reward: {episode_reward:.2f}")
+        # print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
+        # print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
+        # print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
     
     print("\n=== Integration Test Complete ===")
     if use_neural_network:
@@ -1071,7 +992,7 @@ def main():
     print("🚗⚡ 充电行为集成测试程序")
     print("使用src文件夹中的Environment和充电组件")
     print("-" * 60)
-    use_intense_requests = False  # 切换为True以使用热点请求模式
+    use_intense_requests = True  # 使用热点请求模式
 
     try:
 
@@ -1116,12 +1037,12 @@ def main():
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
 
-        adplist = [0, 0.5, 1]
+        adplist = [1]
         for adpvalue in adplist:
             assignmentgurobi =True
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
-            results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
+            results, env = run_charging_integration_test(adpvalue, num_episodes=100, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
 
             # 分析结果
             analysis = analyze_results(results)
