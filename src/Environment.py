@@ -514,26 +514,8 @@ class ChargingIntegratedEnvironment(Environment):
             distance = abs(vehicle_location - station_location)
             return 5.0 - distance * 0.1  # Simple heuristic
     
-    def store_q_learning_experience(self, vehicle_id: int, action_type: str, 
-                                   vehicle_location: int, target_location: int,
-                                   reward: float, next_vehicle_location: int):
-        """Store experience for Q-learning training"""
-        if (self.value_function and 
-            hasattr(self.value_function, 'store_experience')):
-            other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
-            num_requests = len(self.active_requests)
-            
-            self.value_function.store_experience(
-                vehicle_id=vehicle_id,
-                action_type=action_type,
-                vehicle_location=vehicle_location,
-                target_location=target_location,
-                current_time=self.current_time,
-                reward=reward,
-                next_vehicle_location=next_vehicle_location,
-                other_vehicles=other_vehicles,
-                num_requests=num_requests
-            )
+    # Note: store_q_learning_experience is now integrated into _update_q_learning
+    # for better consistency between Q-table and neural network training
     
     def _setup_charging_stations(self):
         """Setup charging stations dynamically based on num_stations"""
@@ -774,6 +756,13 @@ class ChargingIntegratedEnvironment(Environment):
         if request_id in self.active_requests and vehicle_id in self.vehicles:
             vehicle = self.vehicles[vehicle_id]
             request = self.active_requests[request_id]
+            
+            # Check if this request is already assigned to another vehicle
+            for other_vehicle_id, other_vehicle in self.vehicles.items():
+                if (other_vehicle_id != vehicle_id and 
+                    (other_vehicle['assigned_request'] == request_id or 
+                     other_vehicle['passenger_onboard'] == request_id)):
+                    return False  # Request already assigned to another vehicle
             
             if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
                 # Check if the vehicle rejects the request
@@ -1037,39 +1026,47 @@ class ChargingIntegratedEnvironment(Environment):
             self.update_recent_requests(current_requests)
 
     def _update_q_learning(self, actions, rewards, next_states):
-        """Update Q-learning based on actions taken and rewards received"""
+        """Update Q-learning based on actions taken and rewards received - unified with neural network training"""
         for vehicle_id in actions.keys():
-            if vehicle_id in self.vehicles:
-                # Get current state representation
-                current_state = self.get_state_representation(
-                    self.vehicles[vehicle_id]['location'],
-                    0,  # Default target location
-                    self.current_time
-                )
-
-                # Get action taken
+            if vehicle_id in self.vehicles and vehicle_id in rewards:
                 action = actions[vehicle_id]
-
-                # Determine action representation for Q-learning
-                if hasattr(action, 'request_id') and action.request_id is not None:
-                    action_str = f"accept_request_{action.request_id}"
-                elif hasattr(action, 'charging_station_id'):
-                    action_str = f"charge_station_{action.charging_station_id}"
-                else:
-                    action_str = "move"
-
-                # Get reward
                 reward = rewards[vehicle_id]
-
-                # Get next state representation
-                next_state = self.get_state_representation(
-                    self.vehicles[vehicle_id]['location'],
-                    0,  # Default target location
-                    self.current_time + 1
-                )
-
-                # Update Q-value
-                self.update_q_value(current_state, action_str, reward, next_state)
+                current_location = self.vehicles[vehicle_id]['location']
+                next_location = next_states[vehicle_id]['location'] if vehicle_id in next_states else current_location
+                
+                # Determine action type and target location for consistency with neural network training
+                if isinstance(action, ServiceAction):
+                    action_type = f"assign_{action.request_id}" if hasattr(action, 'request_id') else "service"
+                    target_location = action.request_id % (self.grid_size**2) if hasattr(action, 'request_id') else current_location
+                elif isinstance(action, ChargingAction):
+                    action_type = f"charge_{action.charging_station_id}" if hasattr(action, 'charging_station_id') else "charge"
+                    target_location = action.charging_station_id * 10 if hasattr(action, 'charging_station_id') else current_location
+                else:
+                    action_type = "move"
+                    target_location = current_location
+                
+                # Store experience for neural network training (if neural network exists)
+                if (self.value_function and 
+                    hasattr(self.value_function, 'store_experience')):
+                    other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
+                    num_requests = len(self.active_requests)
+                    
+                    self.value_function.store_experience(
+                        vehicle_id=vehicle_id,
+                        action_type=action_type,
+                        vehicle_location=current_location,
+                        target_location=target_location,
+                        current_time=self.current_time,
+                        reward=reward,
+                        next_vehicle_location=next_location,
+                        other_vehicles=other_vehicles,
+                        num_requests=num_requests
+                    )
+                
+                # Also update traditional Q-table for consistency
+                current_state = self.get_state_representation(current_location, target_location, self.current_time)
+                next_state = self.get_state_representation(next_location, target_location, self.current_time + 1)
+                self.update_q_value(current_state, action_type, reward, next_state)
 
     def _execute_action(self, vehicle_id, action):
         """Execute vehicle action with immediate reward aligned to Gurobi optimization objective"""

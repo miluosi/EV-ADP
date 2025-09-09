@@ -31,7 +31,7 @@ class ChargingStation:
             if vehicle_id not in self.current_vehicles:
                 self.current_vehicles.append(vehicle_id)
                 self.available_slots -= 1
-                print(f"Vehicle {vehicle_id} started charging at station {self.id}")
+                # print(f"Vehicle {vehicle_id} started charging at station {self.id}")
                 return True
         else:
             # Add to queue if not available
@@ -44,7 +44,7 @@ class ChargingStation:
         if vehicle_id in self.current_vehicles:
             self.current_vehicles.remove(vehicle_id)
             self.available_slots += 1
-            print(f"Vehicle {vehicle_id} finished charging at station {self.id}")
+            # print(f"Vehicle {vehicle_id} finished charging at station {self.id}")
             
             # Start charging next vehicle in queue if available
             if self.charging_queue and self.is_available():

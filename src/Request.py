@@ -14,7 +14,7 @@ class Request(object):
                  destination: int,
                  current_time: float,
                  travel_time: float,
-                 value: float=1,
+                 value: float=10,
                  ):
         self.request_id = request_id
         self.pickup = source

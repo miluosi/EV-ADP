@@ -302,13 +302,13 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         print(f"   Parameters requiring gradients: {grad_params}/{total_params}")
         
         # Optimizer for training - reduced learning rate for stable learning
-        self.optimizer = optim.Adam(self.network.parameters(), lr=2e-4, weight_decay=1e-5)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3, weight_decay=1e-5)
         self.loss_fn = nn.MSELoss()
         
         # Learning rate scheduler for adaptive learning - more conservative
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.7, patience=50, 
-            min_lr=1e-6, verbose=True
+            min_lr=1e-4, verbose=True
         )
         
         # Training data buffer - increased size for more diverse experiences
