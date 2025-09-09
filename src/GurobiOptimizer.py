@@ -730,81 +730,109 @@ class GurobiOptimizer:
         return assignments
     
     def _heuristic_assignment_with_reject(self, vehicle_ids, available_requests, charging_stations=None):
-        """
-        Heuristic assignment that considers EV reject behavior
-        """
+
         assignments = {}
-        available_vehicles = list(vehicle_ids)
-        remaining_requests = list(available_requests)
         
-        # Sort vehicles by battery level (prioritize low battery for charging)
-        vehicle_battery_priority = []
-        for vehicle_id in available_vehicles:
+        if not vehicle_ids:
+            return assignments
+        
+        # 第一步：识别低电量车辆（电池 < 0.5）
+        low_battery_vehicles = []
+        high_battery_vehicles = []
+        
+        for vehicle_id in vehicle_ids:
             vehicle = self.env.vehicles[vehicle_id]
-            vehicle_battery_priority.append((vehicle['battery'], vehicle_id))
-        vehicle_battery_priority.sort()
+            if vehicle['battery'] < 0.5:
+                low_battery_vehicles.append(vehicle_id)
+            else:
+                high_battery_vehicles.append(vehicle_id)
         
-        # First pass: Assign requests to vehicles that won't reject
-        for request in remaining_requests[:]:
-            best_vehicle = None
-            best_distance = float('inf')
+        # 第二步：为低电量车辆分配充电站
+        if charging_stations and low_battery_vehicles:
+            for vehicle_id in low_battery_vehicles:
+                vehicle = self.env.vehicles[vehicle_id]
+                vehicle_coords = vehicle['coordinates']
+                
+                best_station = None
+                best_distance = float('inf')
+                
+                # 找到最近的有容量的充电站
+                for station in charging_stations:
+                    if len(station.current_vehicles) < station.max_capacity:
+                        station_coords = (
+                            station.location // self.env.grid_size,
+                            station.location % self.env.grid_size
+                        )
+                        distance = abs(vehicle_coords[0] - station_coords[0]) + \
+                                  abs(vehicle_coords[1] - station_coords[1])
+                        
+                        if distance < best_distance:
+                            best_distance = distance
+                            best_station = station
+                
+                if best_station:
+                    assignments[vehicle_id] = f"charge_{best_station.id}"
+        
+        # 第三步：按电池容量从高到低排序剩余车辆
+        high_battery_vehicles.sort(
+            key=lambda v_id: self.env.vehicles[v_id]['battery'], 
+            reverse=True
+        )
+        
+        # 第四步：为高电量车辆分配订单（考虑EV拒绝率）
+        if available_requests and high_battery_vehicles:
+            remaining_requests = list(available_requests)
             
-            for _, vehicle_id in vehicle_battery_priority:
-                if vehicle_id not in available_vehicles:
+            for vehicle_id in high_battery_vehicles:
+                if vehicle_id in assignments:  # 已被分配充电
                     continue
                 
                 vehicle = self.env.vehicles[vehicle_id]
-                
-                # Check if this vehicle would reject the request
-                if vehicle['type'] == 'EV':
-                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
-                    if rejection_prob >= 0.5:  # High rejection probability
-                        continue
-                
-                # Calculate distance
                 vehicle_coords = vehicle['coordinates']
-                pickup_coords = (request.pickup // self.env.grid_size, request.pickup % self.env.grid_size)
-                distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
+                battery_level = vehicle['battery']
                 
-                # Prefer closer vehicles with sufficient battery
-                if distance < best_distance and vehicle['battery'] > 0.1:
-                    best_distance = distance
-                    best_vehicle = vehicle_id
-            
-            if best_vehicle:
-                assignments[best_vehicle] = request
-                available_vehicles.remove(best_vehicle)
-                remaining_requests.remove(request)
-                vehicle_battery_priority = [(b, v) for b, v in vehicle_battery_priority if v != best_vehicle]
-        
-        # Second pass: Assign charging to low battery vehicles
-        if charging_stations:
-            for battery_level, vehicle_id in vehicle_battery_priority:
-                if vehicle_id not in available_vehicles or vehicle_id in assignments:
-                    continue
+                best_request = None
+                best_score = -float('inf')
                 
-                # Low battery vehicles should charge
-                if battery_level < 0.3:
-                    # Find closest available charging station
-                    best_station = None
-                    best_distance = float('inf')
+                # 为该车辆寻找最佳订单
+                for request in remaining_requests[:]:  # 使用副本避免修改原列表
+                    # 检查EV拒绝率
+                    if vehicle['type'] == 'EV':
+                        rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                        if rejection_prob >= 0.5:  # 高拒绝概率，跳过
+                            continue
                     
-                    vehicle = self.env.vehicles[vehicle_id]
-                    vehicle_coords = vehicle['coordinates']
+                    # 计算距离
+                    pickup_coords = (
+                        request.pickup // self.env.grid_size,
+                        request.pickup % self.env.grid_size
+                    )
+                    distance = abs(vehicle_coords[0] - pickup_coords[0]) + \
+                              abs(vehicle_coords[1] - pickup_coords[1])
                     
-                    for station in charging_stations:
-                        if len(station.current_vehicles) < station.max_capacity:
-                            station_coords = (station.location // self.env.grid_size, 
-                                            station.location % self.env.grid_size)
-                            distance = abs(vehicle_coords[0] - station_coords[0]) + abs(vehicle_coords[1] - station_coords[1])
-                            
-                            if distance < best_distance:
-                                best_distance = distance
-                                best_station = station
+                    # 距离过远则跳过
+                    if distance > 8:  # 最大服务距离
+                        continue
                     
-                    if best_station:
-                        assignments[vehicle_id] = f"charge_{best_station.id}"
-                        available_vehicles.remove(vehicle_id)
+                    # 计算分配评分
+                    if battery_level > 0.7:
+                        # 高电量：优先选择远距离高价值订单
+                        score = distance * 0.7 + request.value * 0.3
+                    elif battery_level > 0.5:
+                        # 中等电量：平衡距离和价值
+                        score = request.value * 0.5 - distance * 0.5
+                    else:
+                        # 低电量：优先近距离订单
+                        score = -distance
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_request = request
+                
+                # 分配最佳订单
+                if best_request:
+                    assignments[vehicle_id] = best_request
+                    remaining_requests.remove(best_request)
         
         return assignments
 

@@ -425,8 +425,8 @@ class ChargingIntegratedEnvironment(Environment):
     """
     Integrated charging environment class, inheriting from src.Environment
     """
-    
-    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True):  # Increased grid size
+
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True, assignmentgurobi=True):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -437,7 +437,7 @@ class ChargingIntegratedEnvironment(Environment):
         DATA_DIR = "data"  # Data directory (not used in this implementation)
         
         super().__init__(NUM_LOCATIONS, MAX_CAPACITY, EPOCH_LENGTH, NUM_AGENTS, START_EPOCH, STOP_EPOCH, DATA_DIR)
-        
+        self.assignmentgurobi = assignmentgurobi  # Whether to use Gurobi for assignment
         self.num_vehicles = num_vehicles
         self.num_stations = num_stations
         self.grid_size = grid_size
@@ -1011,9 +1011,13 @@ class ChargingIntegratedEnvironment(Environment):
                 # Use GurobiOptimizer for rebalancing
                 if not hasattr(self, 'gurobi_optimizer'):
                     self.gurobi_optimizer = GurobiOptimizer(self)
-                
-                rebalancing_assignments = self.gurobi_optimizer.optimize_vehicle_rebalancing_reject(vehicles_to_rebalance)
-
+                if self.assignmentgurobi:
+                    rebalancing_assignments = self.gurobi_optimizer.optimize_vehicle_rebalancing_reject(vehicles_to_rebalance)
+                else:
+                    available_requests = []
+                    if hasattr(self, 'active_requests') and self.active_requests:
+                        available_requests = list(self.active_requests.values())
+                    rebalancing_assignments = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests)
                 # Apply the rebalancing assignments
                 for vehicle_id, target_request in rebalancing_assignments.items():
                     if target_request:
