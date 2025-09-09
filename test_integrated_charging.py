@@ -243,9 +243,10 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         results['qvalue_losses'].extend(episode_losses)  # Fixed: extend instead of assign
         # Record environment statistics
         stats = env.get_stats()
+        results['active_requests'] = stats['active_requests']
         results['environment_stats'].append(stats)
         results['battery_levels'].append(stats['average_battery'])
-        
+        results['completed_requests'] = stats['completed_requests']
         # Collect detailed episode statistics
         episode_stats = env.get_episode_stats()
         episode_stats['episode_number'] = episode + 1
@@ -1023,46 +1024,46 @@ def main():
 
     try:
 
-        num_episodes = 100
+        num_episodes = 10
         adpvalue = 0
-        # assignmentgurobi =False
-        # results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=True, assignmentgurobi=assignmentgurobi)
+        assignmentgurobi =False
+        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=True, assignmentgurobi=assignmentgurobi)
 
-        #     # 分析结果
-        # analysis = analyze_results(results)
+            # 分析结果
+        analysis = analyze_results(results)
         
-        # # 生成可视化
-        # success = visualize_integrated_results(results, assignmentgurobi=assignmentgurobi)
+        # 生成可视化
+        success = visualize_integrated_results(results, assignmentgurobi=assignmentgurobi)
         
-        # # 空间分布可视化已在Excel导出中生成
-        # print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
+        # 空间分布可视化已在Excel导出中生成
+        print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
         
-        # # 生成传统的空间分布分析（用于兼容性）
-        # spatial_viz = SpatialVisualization(env.grid_size)
-        # spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
-        # spatial_viz.print_spatial_analysis(spatial_analysis)
+        # 生成传统的空间分布分析（用于兼容性）
+        spatial_viz = SpatialVisualization(env.grid_size)
+        spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+        spatial_viz.print_spatial_analysis(spatial_analysis)
         
-        # # 生成报告
-        # generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
+        # 生成报告
+        generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
         
-        # # 输出车辆访问模式总结
-        # print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
+        # 输出车辆访问模式总结
+        print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
         
-        # print("\n" + "="*60)
-        # assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
-        # print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
-        # print("📊 结果摘要:")
-        # print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-        # print(f"   - 充电次数: {analysis['total_charging']}")
-        # print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-        # print(f"   - 奖励改进: {analysis['improvement']:.2f}")
+        print("\n" + "="*60)
+        assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
+        print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
+        print("📊 结果摘要:")
+        print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
+        print(f"   - 充电次数: {analysis['total_charging']}")
+        print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
+        print(f"   - 奖励改进: {analysis['improvement']:.2f}")
         
-        # if success:
-        #     print("📈 可视化图表生成成功")
+        if success:
+            print("📈 可视化图表生成成功")
         
-        # results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
-        # print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
-        # print("="*60)
+        results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
+        print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
+        print("="*60)
 
         adplist = [0, 0.5, 1]
         for adpvalue in adplist:
