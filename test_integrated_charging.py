@@ -40,8 +40,8 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 40  # Doubled vehicles for more interaction
-    num_stations = 12  # More stations for complex charging decisions
+    num_vehicles = 30  # Doubled vehicles for more interaction
+    num_stations = 9  # More stations for complex charging decisions
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
     # Initialize neural network-based ValueFunction for decision making only if needed
@@ -1020,52 +1020,51 @@ def main():
     print("使用src文件夹中的Environment和充电组件")
     print("-" * 60)
     
-  
-            
+
     try:
 
         num_episodes = 100
-        # adpvalue = 0
-        # assignmentgurobi =False
-        # results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=True, assignmentgurobi=assignmentgurobi)
+        adpvalue = 0
+        assignmentgurobi =False
+        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=True, assignmentgurobi=assignmentgurobi)
 
-        #     # 分析结果
-        # analysis = analyze_results(results)
+            # 分析结果
+        analysis = analyze_results(results)
         
-        # # 生成可视化
-        # success = visualize_integrated_results(results, assignmentgurobi=assignmentgurobi)
+        # 生成可视化
+        success = visualize_integrated_results(results, assignmentgurobi=assignmentgurobi)
         
-        # # 空间分布可视化已在Excel导出中生成
-        # print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
+        # 空间分布可视化已在Excel导出中生成
+        print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
         
-        # # 生成传统的空间分布分析（用于兼容性）
-        # spatial_viz = SpatialVisualization(env.grid_size)
-        # spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
-        # spatial_viz.print_spatial_analysis(spatial_analysis)
+        # 生成传统的空间分布分析（用于兼容性）
+        spatial_viz = SpatialVisualization(env.grid_size)
+        spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+        spatial_viz.print_spatial_analysis(spatial_analysis)
         
-        # # 生成报告
-        # generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
+        # 生成报告
+        generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
         
-        # # 输出车辆访问模式总结
-        # print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
+        # 输出车辆访问模式总结
+        print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
         
-        # print("\n" + "="*60)
-        # assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
-        # print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
-        # print("📊 结果摘要:")
-        # print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-        # print(f"   - 充电次数: {analysis['total_charging']}")
-        # print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-        # print(f"   - 奖励改进: {analysis['improvement']:.2f}")
+        print("\n" + "="*60)
+        assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
+        print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
+        print("📊 结果摘要:")
+        print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
+        print(f"   - 充电次数: {analysis['total_charging']}")
+        print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
+        print(f"   - 奖励改进: {analysis['improvement']:.2f}")
         
-        # if success:
-        #     print("📈 可视化图表生成成功")
+        if success:
+            print("📈 可视化图表生成成功")
         
-        # results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
-        # print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
-        # print("="*60)
+        results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
+        print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
+        print("="*60)
 
-        adplist = [ 1, 5, 10]
+        adplist = [0, 1, 5, 10]
         for adpvalue in adplist:
             assignmentgurobi =True
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
@@ -1112,253 +1111,6 @@ def main():
         import traceback
         traceback.print_exc()
 
-
-def run_heuristic_vs_gurobi_test(num_episodes=10):
-    """运行启发式策略与Gurobi优化的对比测试"""
-    print("=== 启发式策略 vs Gurobi优化对比测试 ===")
-    
-    from src.GurobiOptimizer import GurobiOptimizer
-    from src.Heuristic import HeuristicPolicy
-    
-    # 创建环境
-    num_vehicles = 20
-    num_stations = 6
-    env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
-    
-    # 创建优化器和启发式策略
-    gurobi_optimizer = GurobiOptimizer(env)
-    heuristic_policy = HeuristicPolicy(battery_threshold=0.5, max_service_distance=8)
-    
-    # 测试结果
-    gurobi_results = []
-    heuristic_results = []
-    
-    for episode in range(num_episodes):
-        print(f"\n--- Episode {episode + 1}/{num_episodes} ---")
-        
-        # 测试Gurobi优化
-        env.reset()
-        gurobi_reward, gurobi_stats = run_single_episode_with_optimizer(env, gurobi_optimizer, "Gurobi")
-        gurobi_results.append({'reward': gurobi_reward, 'stats': gurobi_stats})
-        
-        # 测试启发式策略
-        env.reset()
-        heuristic_reward, heuristic_stats = run_single_episode_with_heuristic(env, heuristic_policy, "Heuristic")
-        heuristic_results.append({'reward': heuristic_reward, 'stats': heuristic_stats})
-        
-        print(f"Gurobi奖励: {gurobi_reward:.2f}, 启发式奖励: {heuristic_reward:.2f}")
-    
-    # 分析结果
-    analyze_comparison_results(gurobi_results, heuristic_results)
-    
-    return gurobi_results, heuristic_results
-
-
-def run_single_episode_with_optimizer(env, optimizer, strategy_name):
-    """使用Gurobi优化器运行单个episode"""
-    total_reward = 0
-    charging_events = 0
-    served_requests = 0
-    rejected_requests = 0
-    
-    for step in range(200):  # 运行200步
-        # 获取可用车辆和请求
-        available_vehicles = [
-            vehicle_id for vehicle_id, vehicle in env.vehicles.items()
-            if (vehicle['assigned_request'] is None and 
-                vehicle['passenger_onboard'] is None and 
-                vehicle['charging_station'] is None)
-        ]
-        
-        available_requests = [
-            req for req in env.active_requests.values()
-            if not any(v.get('assigned_request') == req.request_id or 
-                      v.get('passenger_onboard') == req.request_id 
-                      for v in env.vehicles.values())
-        ]
-        
-        charging_stations = list(env.charging_manager.stations.values())
-        
-        # 使用Gurobi优化器获取分配
-        if available_vehicles:
-            assignments = optimizer.optimize_vehicle_rebalancing_reject(available_vehicles)
-            
-            # 将分配转换为动作
-            actions = {}
-            for vehicle_id in env.vehicles:
-                if vehicle_id in assignments:
-                    assignment = assignments[vehicle_id]
-                    if isinstance(assignment, str) and assignment.startswith("charge_"):
-                        # 充电分配
-                        station_id = assignment.replace("charge_", "")
-                        actions[vehicle_id] = ChargingAction([], station_id, 4)
-                        charging_events += 1
-                    elif hasattr(assignment, 'request_id'):
-                        # 服务分配
-                        actions[vehicle_id] = ServiceAction([], assignment.request_id)
-                        served_requests += 1
-                    else:
-                        actions[vehicle_id] = Action([])
-                else:
-                    actions[vehicle_id] = Action([])
-            
-            # 执行动作
-            next_states, step_rewards, done, info = env.step(actions)
-            step_reward = sum(step_rewards.values()) if isinstance(step_rewards, dict) else step_rewards
-            total_reward += step_reward
-        else:
-            # 如果没有可用车辆，执行空动作
-            actions = {vehicle_id: Action([]) for vehicle_id in env.vehicles}
-            next_states, step_rewards, done, info = env.step(actions)
-            step_reward = sum(step_rewards.values()) if isinstance(step_rewards, dict) else step_rewards
-            total_reward += step_reward
-    
-    stats = {
-        'charging_events': charging_events,
-        'served_requests': served_requests,
-        'avg_battery': np.mean([v['battery'] for v in env.vehicles.values()]),
-        'strategy': strategy_name
-    }
-    
-    return total_reward, stats
-
-
-def run_single_episode_with_heuristic(env, heuristic_policy, strategy_name):
-    """使用启发式策略运行单个episode"""
-    total_reward = 0
-    charging_events = 0
-    served_requests = 0
-    rejected_requests = 0
-    
-    for step in range(200):  # 运行200步
-        # 获取可用车辆和请求
-        available_vehicles = [
-            vehicle_id for vehicle_id, vehicle in env.vehicles.items()
-            if (vehicle['assigned_request'] is None and 
-                vehicle['passenger_onboard'] is None and 
-                vehicle['charging_station'] is None)
-        ]
-        
-        available_requests = [
-            req for req in env.active_requests.values()
-            if not any(v.get('assigned_request') == req.request_id or 
-                      v.get('passenger_onboard') == req.request_id 
-                      for v in env.vehicles.values())
-        ]
-        
-        charging_stations = list(env.charging_manager.stations.values())
-        
-        # 使用启发式策略获取分配
-        if available_vehicles:
-            assignments = heuristic_policy.get_assignments(
-                env, available_vehicles, available_requests, charging_stations
-            )
-            
-            # 将分配转换为动作
-            actions = {}
-            for vehicle_id in env.vehicles:
-                if vehicle_id in assignments:
-                    assignment = assignments[vehicle_id]
-                    if isinstance(assignment, str) and assignment.startswith("charge_"):
-                        # 充电分配
-                        station_id = assignment.replace("charge_", "")
-                        actions[vehicle_id] = ChargingAction([], station_id, 4)
-                        charging_events += 1
-                    elif hasattr(assignment, 'request_id'):
-                        # 服务分配
-                        actions[vehicle_id] = ServiceAction([], assignment.request_id)
-                        served_requests += 1
-                    else:
-                        actions[vehicle_id] = Action([])
-                else:
-                    actions[vehicle_id] = Action([])
-            
-            # 执行动作
-            next_states, step_rewards, done, info = env.step(actions)
-            step_reward = sum(step_rewards.values()) if isinstance(step_rewards, dict) else step_rewards
-            total_reward += step_reward
-        else:
-            # 如果没有可用车辆，执行空动作
-            actions = {vehicle_id: Action([]) for vehicle_id in env.vehicles}
-            next_states, step_rewards, done, info = env.step(actions)
-            step_reward = sum(step_rewards.values()) if isinstance(step_rewards, dict) else step_rewards
-            total_reward += step_reward
-    
-    stats = {
-        'charging_events': charging_events,
-        'served_requests': served_requests,
-        'avg_battery': np.mean([v['battery'] for v in env.vehicles.values()]),
-        'strategy': strategy_name
-    }
-    
-    return total_reward, stats
-
-
-def analyze_comparison_results(gurobi_results, heuristic_results):
-    """分析对比结果"""
-    print("\n=== 对比分析结果 ===")
-    
-    # 计算平均值
-    gurobi_avg_reward = np.mean([r['reward'] for r in gurobi_results])
-    heuristic_avg_reward = np.mean([r['reward'] for r in heuristic_results])
-    
-    gurobi_avg_charging = np.mean([r['stats']['charging_events'] for r in gurobi_results])
-    heuristic_avg_charging = np.mean([r['stats']['charging_events'] for r in heuristic_results])
-    
-    gurobi_avg_served = np.mean([r['stats']['served_requests'] for r in gurobi_results])
-    heuristic_avg_served = np.mean([r['stats']['served_requests'] for r in heuristic_results])
-    
-    gurobi_avg_battery = np.mean([r['stats']['avg_battery'] for r in gurobi_results])
-    heuristic_avg_battery = np.mean([r['stats']['avg_battery'] for r in heuristic_results])
-    
-    print(f"Gurobi优化:")
-    print(f"  - 平均奖励: {gurobi_avg_reward:.2f}")
-    print(f"  - 平均充电事件: {gurobi_avg_charging:.2f}")
-    print(f"  - 平均服务请求: {gurobi_avg_served:.2f}")
-    print(f"  - 平均电池水平: {gurobi_avg_battery:.2f}")
-    
-    print(f"\n启发式策略:")
-    print(f"  - 平均奖励: {heuristic_avg_reward:.2f}")
-    print(f"  - 平均充电事件: {heuristic_avg_charging:.2f}")
-    print(f"  - 平均服务请求: {heuristic_avg_served:.2f}")
-    print(f"  - 平均电池水平: {heuristic_avg_battery:.2f}")
-    
-    # 计算改进百分比
-    reward_improvement = ((heuristic_avg_reward - gurobi_avg_reward) / abs(gurobi_avg_reward)) * 100
-    print(f"\n性能对比:")
-    print(f"  - 启发式策略奖励相对改进: {reward_improvement:.2f}%")
-    
-    if reward_improvement > 0:
-        print("  ✅ 启发式策略表现更好")
-    else:
-        print("  ❌ Gurobi优化表现更好")
-    
-    # 保存结果到CSV
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 创建DataFrame
-    all_results = []
-    for i, (g_result, h_result) in enumerate(zip(gurobi_results, heuristic_results)):
-        all_results.append({
-            'episode': i + 1,
-            'strategy': 'Gurobi',
-            'reward': g_result['reward'],
-            'charging_events': g_result['stats']['charging_events'],
-            'served_requests': g_result['stats']['served_requests'],
-            'avg_battery': g_result['stats']['avg_battery']
-        })
-        all_results.append({
-            'episode': i + 1,
-            'strategy': 'Heuristic',
-            'reward': h_result['reward'],
-            'charging_events': h_result['stats']['charging_events'],
-            'served_requests': h_result['stats']['served_requests'],
-            'avg_battery': h_result['stats']['avg_battery']
-        })
-    
-    df = pd.DataFrame(all_results)
-    df.to_csv(f'results/heuristic_vs_gurobi_comparison_{timestamp}.csv', index=False)
-    print(f"\n📊 详细结果已保存到: results/heuristic_vs_gurobi_comparison_{timestamp}.csv")
 
 
 if __name__ == "__main__":

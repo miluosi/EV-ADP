@@ -466,7 +466,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.completed_requests = []  # Completed requests for analysis
         self.rejected_requests = []  # Rejected requests for analysis
         self.request_counter = 0
-        self.request_generation_rate = 0.6  # Increased to 60% for more active environment
+        self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
         
         # Tracking for visualization
@@ -563,7 +563,7 @@ class ChargingIntegratedEnvironment(Environment):
             location_index = y * self.grid_size + x
             
             # Determine vehicle type: 70% EV, 30% AEV
-            vehicle_type = 'AEV' if random.random() < 0.3 else 'EV'
+            vehicle_type = 'AEV' if random.random() < 0.5 else 'EV'
             
             self.vehicles[i] = {
                 'type': vehicle_type,  # Vehicle type: EV or AEV
@@ -596,7 +596,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Exponential distribution for rejection probability
         # Base rejection rate increases exponentially with distance
-        base_rate = 0.1  # 10% base rejection rate for distance 0
+        base_rate = 0.01  # 5% base rejection rate for distance 0
         distance_factor = 0.5  # Exponential growth factor
         
         rejection_prob = base_rate * np.exp(distance * distance_factor)
@@ -660,7 +660,7 @@ class ChargingIntegratedEnvironment(Environment):
             ]
             
             # Probability weights for each hotspot (should sum to 1.0)
-            probability_weights = [0.7, 0.2, 0.1]  # 70%, 20%, 10%
+            probability_weights = [0.6, 0.3, 0.1]  # 60%, 30%, 10%
 
             # Select hotspot based on probability weights
             rand_val = random.random()
@@ -683,7 +683,7 @@ class ChargingIntegratedEnvironment(Environment):
             pickup_location = pickup_y * self.grid_size + pickup_x
             
             # Generate dropoff location (can be anywhere or biased toward other hotspots)
-            if random.random() < 0.8:  # 80% chance dropoff is near another hotspot
+            if random.random() < 0.9:  # 80% chance dropoff is near another hotspot
                 # Choose a different hotspot for dropoff based on probability weights
                 available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
                 if available_hotspot_indices:
@@ -733,7 +733,7 @@ class ChargingIntegratedEnvironment(Environment):
                 destination=dropoff_location,
                 current_time=self.current_time,
                 travel_time=travel_time,
-                value=3.0 + travel_time * 0.1  # Base fare + distance fare
+                value= 5.0 + travel_time * 0.1  # Base fare + distance fare
             )
             
             self.active_requests[self.request_counter] = request
@@ -1032,7 +1032,8 @@ class ChargingIntegratedEnvironment(Environment):
                 action = actions[vehicle_id]
                 reward = rewards[vehicle_id]
                 current_location = self.vehicles[vehicle_id]['location']
-                next_location = next_states[vehicle_id]['location'] if vehicle_id in next_states else current_location
+                # next_states contains numpy arrays, so we use current vehicle location after action
+                next_location = self.vehicles[vehicle_id]['location']  # Location after action execution
                 
                 # Determine action type and target location for consistency with neural network training
                 if isinstance(action, ServiceAction):
