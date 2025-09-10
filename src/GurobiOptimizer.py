@@ -676,8 +676,34 @@ class GurobiOptimizer:
                 for i in range(len(vehicle_ids)):
                     served_requests += request_decision[i][j]
             
-            
-            
+            for i in range(len(vehicle_ids)):
+                # 使用神经网络预测的idle Q值替代固定的idle_vehicle_reward
+                vehicle_id = vehicle_ids[i]
+                vehicle = self.env.vehicles[vehicle_id]
+                
+                # 获取神经网络预测的idle Q值
+                idle_q_value = 0
+                if hasattr(self.env, 'get_idle_q_value'):
+                    try:
+                        idle_q_value = self.env.get_idle_q_value(
+                            vehicle_id=vehicle_id,
+                            vehicle_location=vehicle['location'],
+                            battery_level=vehicle['battery'],
+                            current_time=getattr(self.env, 'current_time', 0.0),
+                            other_vehicles=len(vehicle_ids) - 1,  # 其他车辆数量
+                            num_requests=len(available_requests)
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_id}: {e}")
+                        # 使用默认的idle奖励作为后备
+                        idle_q_value = getattr(self.env, 'idle_vehicle_reward', 0.0)
+                else:
+                    # 如果没有神经网络方法，使用默认奖励
+                    idle_q_value = getattr(self.env, 'idle_vehicle_reward', 0.0)
+                
+                # 将神经网络预测的Q值加权到目标函数中
+                adp_weight = getattr(self.env, 'adp_value', 1.0)
+                objective_terms += idle_q_value * adp_weight * idle_vehicle[i]
 
 
             # Penalty for unserved requests

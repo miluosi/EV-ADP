@@ -125,7 +125,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             actions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
             next_states, rewards, done, info = env.step(actions)
 
-            # Debug: Output step statistics every 200 steps
+            # Debug: Output step statistics every 100 steps
             if step % 100 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
@@ -135,6 +135,35 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                                    if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None])
                 step_reward = sum(rewards.values())
                 print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Charging: {charging_vehicles}, Idle: {idle_vehicles}, Step reward: {step_reward:.2f}")
+                
+                # Neural network monitoring (if using neural network)
+                if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
+                    recent_loss = value_function.training_losses[-1] if value_function.training_losses else 0.0
+                    buffer_size = len(value_function.experience_buffer)
+                    training_step = value_function.training_step
+                    
+                    # Sample some Q-values to show the actual raw values used by Gurobi
+                    if buffer_size > 0:
+                        # Get a sample Q-value to demonstrate what Gurobi actually uses
+                        sample_vehicle_id = list(env.vehicles.keys())[0] if env.vehicles else 0
+                        sample_location = list(env.vehicles.values())[0]['location'] if env.vehicles else 0
+                        sample_battery = list(env.vehicles.values())[0]['battery'] if env.vehicles else 1.0
+                        
+                        try:
+                            # Test different action types - these are the raw Q-values Gurobi uses
+                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, step)
+                            assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, step)
+                            charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, step)
+                            
+                            print(f"  Neural Network Status:")
+                            print(f"    Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
+                            print(f"    Raw Q-values (no normalization): Idle={idle_q:.3f}, Assign={assign_q:.3f}, Charge={charge_q:.3f}")
+                            print(f"    Note: Gurobi uses these raw Q-values directly in optimization objective")
+                        except Exception as e:
+                            print(f"  Neural Network Status: Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
+                            print(f"    Error getting sample Q-values: {e}")
+                else:
+                    print(f"  Neural Network: {'Not training yet' if use_neural_network else 'Disabled'}")
             
             # Note: Q-learning experience storage is now handled automatically in env.step()
             # This ensures consistency between traditional Q-table and neural network training
@@ -192,15 +221,51 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
         print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
         print(f"  Rebalancing: {rebalancing_calls} calls, {total_assignments} total assignments, {avg_assignments:.1f} avg assignments/call")
+        
+        # Add neural network Q-value summary
+        if use_neural_network:
+            idle_q = episode_stats.get('sample_idle_q_value', 0.0)
+            assign_q = episode_stats.get('sample_assign_q_value', 0.0)
+            charge_q = episode_stats.get('sample_charge_q_value', 0.0)
+            nn_loss = episode_stats.get('neural_network_loss', 0.0)
+            print(f"  Neural Network: Loss={nn_loss:.4f}, Q-values(Gurobi): Idle={idle_q:.3f}, Assign={assign_q:.3f}, Charge={charge_q:.3f}")
         # Only record neural network metrics if using neural network
         if use_neural_network:
             episode_stats['neural_network_loss'] = np.mean(episode_losses) if episode_losses else 0.0
             episode_stats['neural_network_loss_std'] = np.std(episode_losses) if episode_losses else 0.0
             episode_stats['training_steps_in_episode'] = len(episode_losses)
+            
+            # Sample Q-values for different action types (actual values used by Gurobi)
+            if len(value_function.experience_buffer) > 0:
+                try:
+                    sample_vehicle_id = list(env.vehicles.keys())[0] if env.vehicles else 0
+                    sample_location = list(env.vehicles.values())[0]['location'] if env.vehicles else 0
+                    sample_battery = list(env.vehicles.values())[0]['battery'] if env.vehicles else 1.0
+                    
+                    # Get sample Q-values for statistics
+                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, env.current_time)
+                    assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, env.current_time, battery_level=sample_battery)
+                    charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, env.current_time, battery_level=sample_battery)
+                    
+                    episode_stats['sample_idle_q_value'] = idle_q
+                    episode_stats['sample_assign_q_value'] = assign_q
+                    episode_stats['sample_charge_q_value'] = charge_q
+                    
+                except Exception as e:
+                    episode_stats['sample_idle_q_value'] = 0.0
+                    episode_stats['sample_assign_q_value'] = 0.0
+                    episode_stats['sample_charge_q_value'] = 0.0
+            else:
+                episode_stats['sample_idle_q_value'] = 0.0
+                episode_stats['sample_assign_q_value'] = 0.0
+                episode_stats['sample_charge_q_value'] = 0.0
         else:
             episode_stats['neural_network_loss'] = 0.0
             episode_stats['neural_network_loss_std'] = 0.0
             episode_stats['training_steps_in_episode'] = 0
+            episode_stats['sample_idle_q_value'] = 0.0
+            episode_stats['sample_assign_q_value'] = 0.0
+            episode_stats['sample_charge_q_value'] = 0.0
         results['episode_detailed_stats'].append(episode_stats)
         
         # Analyze charging usage history for this episode
@@ -1031,7 +1096,7 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0,0.1,0.3,0.5,0.7,0.9,1.0]
+        adplist = [0,0.1,0.3,0.5,0.7,1.0]
         for adpvalue in adplist:
             assignmentgurobi =True
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"

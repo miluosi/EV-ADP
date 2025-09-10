@@ -494,13 +494,15 @@ class ChargingIntegratedEnvironment(Environment):
                               vehicle_location: int, target_location: int) -> float:
         """Get Q-value for vehicle assignment using ValueFunction if available"""
         if self.value_function and hasattr(self.value_function, 'get_assignment_q_value'):
-            # Provide additional context for neural network
+            # Provide additional context for neural network including battery level
+            vehicle = self.vehicles.get(vehicle_id, {})
+            battery_level = vehicle.get('battery', 1.0)  # 获取车辆电池电量
             other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
             num_requests = len(self.active_requests)
             
             return self.value_function.get_assignment_q_value(
                 vehicle_id, target_id, vehicle_location, target_location, 
-                self.current_time, other_vehicles, num_requests)
+                self.current_time, other_vehicles, num_requests, battery_level)  # 添加battery_level参数
         else:
             # Fallback to parent class method
             return super().get_assignment_q_value(vehicle_id, target_id, vehicle_location, target_location)
@@ -509,17 +511,60 @@ class ChargingIntegratedEnvironment(Environment):
                            vehicle_location: int, station_location: int) -> float:
         """Get Q-value for vehicle charging decision"""
         if self.value_function and hasattr(self.value_function, 'get_charging_q_value'):
-            # Provide additional context for neural network
+            # Provide additional context for neural network including battery level
+            vehicle = self.vehicles.get(vehicle_id, {})
+            battery_level = vehicle.get('battery', 1.0)  # 获取车辆电池电量
             other_vehicles = len([v for v in self.vehicles.values() if v['charging_station'] is not None])
             num_requests = len(self.active_requests)
             
             return self.value_function.get_charging_q_value(
                 vehicle_id, station_id, vehicle_location, station_location, 
-                self.current_time, other_vehicles, num_requests)
+                self.current_time, other_vehicles, num_requests, battery_level)  # 添加battery_level参数
         else:
             # Fallback calculation
             distance = abs(vehicle_location - station_location)
             return 5.0 - distance * 0.1  # Simple heuristic
+    
+    def get_idle_q_value(self, vehicle_id: int, vehicle_location: int, 
+                        battery_level: float, current_time: float = None, 
+                        other_vehicles: int = None, num_requests: int = None) -> float:
+        """
+        Get Q-value for vehicle idle action
+        
+        Args:
+            vehicle_id: 车辆ID
+            vehicle_location: 车辆当前位置
+            battery_level: 电池电量 (0-1)
+            current_time: 当前时间 (可选，如果不提供则使用self.current_time)
+            other_vehicles: 其他车辆数量 (可选，如果不提供则自动计算)
+            num_requests: 当前请求数量 (可选，如果不提供则自动计算)
+            
+        Returns:
+            float: idle动作的Q值
+        """
+        if self.value_function and hasattr(self.value_function, 'get_idle_q_value'):
+            # 使用神经网络计算idle Q值，提供所有必要的上下文信息
+            other_vehicles = len([v for v in self.vehicles.values() 
+                                if v['assigned_request'] is None and 
+                                   v['passenger_onboard'] is None and 
+                                   v['charging_station'] is None]) - 1  # 减去当前车辆
+            num_requests = len(self.active_requests)
+            
+            return self.value_function.get_idle_q_value(
+                vehicle_id=vehicle_id,
+                vehicle_location=vehicle_location,
+                battery_level=battery_level,
+                current_time=self.current_time,
+                other_vehicles=max(0, other_vehicles),  # 确保非负
+                num_requests=num_requests
+            )
+        else:
+            # 后备计算：简单的基于电池电量和时间的启发式
+            base_idle_value = -0.1  # idle的基础成本
+            battery_bonus = battery_level * 0.5  # 高电量时idle的价值更高
+            time_penalty = self.current_time / self.episode_length * 0.2  # 后期idle惩罚更大
+            
+            return base_idle_value + battery_bonus - time_penalty
     
     # Note: store_q_learning_experience is now integrated into _update_q_learning
     # for better consistency between Q-table and neural network training
@@ -708,12 +753,13 @@ class ChargingIntegratedEnvironment(Environment):
             hotspots = [
                 (self.grid_size // 4, self.grid_size // 4),           # Bottom-left hotspot
                 (3 * self.grid_size // 4, self.grid_size // 4),       # Bottom-right hotspot
-                (self.grid_size // 2, 3 * self.grid_size // 4)        # Top-center hotspot
+                (self.grid_size // 4, 3 * self.grid_size // 4),       # Top-left hotspot
+                (3 * self.grid_size // 4, 3 * self.grid_size // 4)    # Top-right hotspot
             ]
             
             # Probability weights for each hotspot (should sum to 1.0)
-            probability_weights = [0.6, 0.3, 0.1]  # 60%, 30%, 10%
-            
+            probability_weights = [0.4, 0.1, 0.2, 0.3]  # 40%, 10%, 20%, 30%
+
             for _ in range(num_requests):
                 self.request_counter += 1
                 
@@ -784,7 +830,7 @@ class ChargingIntegratedEnvironment(Environment):
                 travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
                 
                 # Create request with dynamic pricing based on demand
-                base_value = 30
+                base_value = 50
                 # Add surge pricing during high demand periods
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
                 final_value = base_value * surge_factor
@@ -1195,6 +1241,8 @@ class ChargingIntegratedEnvironment(Environment):
 
     def _update_q_learning(self, actions, rewards, next_states):
         """Update Q-learning based on actions taken and rewards received - unified with neural network training"""
+        from .Action import ServiceAction, ChargingAction, IdleAction
+        
         for vehicle_id in actions.keys():
             if vehicle_id in self.vehicles and vehicle_id in rewards:
                 action = actions[vehicle_id]
@@ -1210,6 +1258,10 @@ class ChargingIntegratedEnvironment(Environment):
                 elif isinstance(action, ChargingAction):
                     action_type = f"charge_{action.charging_station_id}" if hasattr(action, 'charging_station_id') else "charge"
                     target_location = action.charging_station_id * 10 if hasattr(action, 'charging_station_id') else current_location
+                elif isinstance(action, IdleAction):
+                    # Handle idle action specifically
+                    action_type = "idle"
+                    target_location = current_location  # For idle, target is current location
                 else:
                     action_type = "move"
                     target_location = current_location
@@ -1220,17 +1272,55 @@ class ChargingIntegratedEnvironment(Environment):
                     other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
                     num_requests = len(self.active_requests)
                     
-                    self.value_function.store_experience(
-                        vehicle_id=vehicle_id,
-                        action_type=action_type,
-                        vehicle_location=current_location,
-                        target_location=target_location,
-                        current_time=self.current_time,
-                        reward=reward,
-                        next_vehicle_location=next_location,
-                        other_vehicles=other_vehicles,
-                        num_requests=num_requests
-                    )
+                    # Get battery information for enhanced experience storage
+                    current_battery = self.vehicles[vehicle_id]['battery']
+                    next_battery = self.vehicles[vehicle_id]['battery']  # Battery after action
+                    
+                    # Store different experience types based on action
+                    if action_type == "idle":
+                        # Use specialized idle experience storage if available
+                        if hasattr(self.value_function, 'store_idle_experience'):
+                            self.value_function.store_idle_experience(
+                                vehicle_id=vehicle_id,
+                                vehicle_location=current_location,
+                                battery_level=current_battery,
+                                current_time=self.current_time,
+                                reward=reward,
+                                next_vehicle_location=next_location,
+                                next_battery_level=next_battery,
+                                other_vehicles=other_vehicles,
+                                num_requests=num_requests
+                            )
+                        else:
+                            # Fall back to general experience storage
+                            self.value_function.store_experience(
+                                vehicle_id=vehicle_id,
+                                action_type=action_type,
+                                vehicle_location=current_location,
+                                target_location=target_location,
+                                current_time=self.current_time,
+                                reward=reward,
+                                next_vehicle_location=next_location,
+                                battery_level=current_battery,
+                                next_battery_level=next_battery,
+                                other_vehicles=other_vehicles,
+                                num_requests=num_requests
+                            )
+                    else:
+                        # For non-idle actions, use general experience storage with battery info
+                        self.value_function.store_experience(
+                            vehicle_id=vehicle_id,
+                            action_type=action_type,
+                            vehicle_location=current_location,
+                            target_location=target_location,
+                            current_time=self.current_time,
+                            reward=reward,
+                            next_vehicle_location=next_location,
+                            battery_level=current_battery,
+                            next_battery_level=next_battery,
+                            other_vehicles=other_vehicles,
+                            num_requests=num_requests
+                        )
                 
                 # Also update traditional Q-table for consistency
                 current_state = self.get_state_representation(current_location, target_location, self.current_time)
@@ -1341,9 +1431,9 @@ class ChargingIntegratedEnvironment(Environment):
                 # Movement consumes battery
                 vehicle['battery'] -= distance * 0.03 + np.random.random()*0.001
                 vehicle['battery'] = max(0, vehicle['battery'])
-                reward = -0.1 * distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+                reward = -0.1*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
             else:
-                reward = -0.2 - np.random.normal(0, 0.05)
+                reward = -1 - np.random.normal(0, 0.05)
 
         else:
             # Movement action - intelligent target-oriented movement

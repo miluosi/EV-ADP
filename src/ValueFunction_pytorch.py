@@ -325,14 +325,24 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
     
     def get_q_value(self, vehicle_id: int, action_type: str, vehicle_location: int, 
                    target_location: int, current_time: float = 0.0, 
-                   other_vehicles: int = 0, num_requests: int = 0) -> float:
+                   other_vehicles: int = 0, num_requests: int = 0, 
+                   battery_level: float = 1.0) -> float:
         """
         Neural network-based Q-value calculation using PyTorchPathBasedNetwork
+        现在支持battery_level参数
         """
-        # Prepare input for neural network
-        path_locations, path_delays, time_tensor, others_tensor, requests_tensor = self._prepare_network_input(
-            vehicle_location, target_location, current_time, other_vehicles, num_requests, action_type
+        # 使用支持battery的输入准备方法
+        inputs = self._prepare_network_input_with_battery(
+            vehicle_location, target_location, current_time, 
+            other_vehicles, num_requests, action_type, battery_level
         )
+        
+        # 处理返回的输入（可能包含或不包含battery）
+        if len(inputs) == 6:  # 包含battery
+            path_locations, path_delays, time_tensor, others_tensor, requests_tensor, battery_tensor = inputs
+        else:  # 不包含battery（向后兼容）
+            path_locations, path_delays, time_tensor, others_tensor, requests_tensor = inputs
+            battery_tensor = torch.tensor([[battery_level]], dtype=torch.float32).to(self.device)
         
         # Forward pass through network
         self.network.eval()
@@ -342,10 +352,12 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 path_delays=path_delays,
                 current_time=time_tensor,
                 other_agents=others_tensor,
-                num_requests=requests_tensor
+                num_requests=requests_tensor,
+                battery_level=battery_tensor
             )
-        
-        return float(q_value.item())
+            
+            # Return raw Q-value without any normalization
+            return float(q_value.item())
     
     def _prepare_network_input(self, vehicle_location: int, target_location: int, 
                               current_time: float, other_vehicles: int, num_requests: int,
@@ -388,38 +400,181 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 others_tensor.to(self.device),
                 requests_tensor.to(self.device))
     
+    def _prepare_network_input_with_battery(self, vehicle_location: int, target_location: int, 
+                                           current_time: float, other_vehicles: int, 
+                                           num_requests: int, action_type: str, 
+                                           battery_level: float = 1.0):
+        """
+        Prepare input tensors for the neural network including battery information
+        
+        Args:
+            vehicle_location: 车辆当前位置
+            target_location: 目标位置
+            current_time: 当前时间
+            other_vehicles: 附近其他车辆数量
+            num_requests: 当前请求数量
+            action_type: 动作类型
+            battery_level: 电池电量 (0-1)
+        """
+        # 根据动作类型选择合适的输入准备方法
+        if action_type == 'idle':
+            # 对于idle状态，处理目标位置为当前位置
+            path_locations = torch.zeros(1, 3, dtype=torch.long)  # batch_size=1, seq_len=3
+            path_delays = torch.zeros(1, 3, 1, dtype=torch.float32)
+            
+            # 设置路径：当前位置 -> 当前位置（表示停留）-> 结束
+            path_locations[0, 0] = vehicle_location + 1  # +1 because 0 is padding
+            path_locations[0, 1] = vehicle_location + 1  # 同样的位置表示idle
+            path_locations[0, 2] = 0  # End token
+            
+            # 设置延迟 - idle状态的延迟模式
+            path_delays[0, 0, 0] = 0.0  # 当前位置无延迟
+            path_delays[0, 1, 0] = 0.05  # idle的小延迟（等待成本）
+            path_delays[0, 2, 0] = 0.0  # 结束位置无延迟
+            
+            # 归一化时间 (0-1 range)
+            time_tensor = torch.tensor([[current_time / 100.0]], dtype=torch.float32)
+            
+            # 归一化其他指标
+            others_tensor = torch.tensor([[other_vehicles / self.num_vehicles]], dtype=torch.float32)
+            requests_tensor = torch.tensor([[num_requests / 10.0]], dtype=torch.float32)
+            
+            # 归一化电池电量
+            battery_tensor = torch.tensor([[battery_level]], dtype=torch.float32)
+            
+            # Move to device
+            return (path_locations.to(self.device), 
+                    path_delays.to(self.device),
+                    time_tensor.to(self.device),
+                    others_tensor.to(self.device),
+                    requests_tensor.to(self.device),
+                    battery_tensor.to(self.device))
+        else:
+            # 对于非idle动作，使用标准方法并添加battery信息
+            path_locations, path_delays, time_tensor, others_tensor, requests_tensor = self._prepare_network_input(
+                vehicle_location, target_location, current_time, 
+                other_vehicles, num_requests, action_type
+            )
+            
+            # 添加battery信息
+            battery_tensor = torch.tensor([[battery_level]], dtype=torch.float32).to(self.device)
+            
+            return (path_locations, path_delays, time_tensor, 
+                   others_tensor, requests_tensor, battery_tensor)
+    
     def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
                               vehicle_location: int, target_location: int, 
                               current_time: float = 0.0, other_vehicles: int = 0, 
-                              num_requests: int = 0) -> float:
-        """Get Q-value for vehicle assignment to request using neural network"""
+                              num_requests: int = 0, battery_level: float = 1.0) -> float:
+        """
+        Get Q-value for vehicle assignment to request using neural network
+        现在支持battery_level参数
+        """
         return self.get_q_value(vehicle_id, f"assign_{target_id}", 
                                vehicle_location, target_location, current_time, 
-                               other_vehicles, num_requests)
+                               other_vehicles, num_requests, battery_level)
+    def get_idle_q_value(self, vehicle_id: int, vehicle_location: int, 
+                        battery_level: float, current_time: float = 0.0, 
+                        other_vehicles: int = 0, num_requests: int = 0) -> float:
+        """
+        Get Q-value for vehicle idle action using neural network
+        
+        Args:
+            vehicle_id: 车辆ID
+            vehicle_location: 车辆当前位置
+            battery_level: 电池电量 (0-1)
+            current_time: 当前时间
+            other_vehicles: 附近其他车辆数量
+            num_requests: 当前请求数量
+            
+        Returns:
+            float: idle动作的Q值
+        """
+        # 使用统一的get_q_value方法，保持与其他动作的一致性
+        return self.get_q_value(vehicle_id, "idle", vehicle_location, vehicle_location, 
+                               current_time, other_vehicles, num_requests, battery_level)
+    
     
     def get_charging_q_value(self, vehicle_id: int, station_id: int,
                            vehicle_location: int, station_location: int,
                            current_time: float = 0.0, other_vehicles: int = 0,
-                           num_requests: int = 0) -> float:
-        """Get Q-value for vehicle charging decision using neural network"""
+                           num_requests: int = 0, battery_level: float = 1.0) -> float:
+        """
+        Get Q-value for vehicle charging decision using neural network
+        现在支持battery_level参数
+        """
         return self.get_q_value(vehicle_id, f"charge_{station_id}",
                                vehicle_location, station_location, current_time,
-                               other_vehicles, num_requests)
+                               other_vehicles, num_requests, battery_level)
     
     def store_experience(self, vehicle_id: int, action_type: str, vehicle_location: int,
                         target_location: int, current_time: float, reward: float,
-                        next_vehicle_location: int, other_vehicles: int = 0, num_requests: int = 0):
-        """Store experience for training"""
+                        next_vehicle_location: int, battery_level: float = 1.0, 
+                        next_battery_level: float = 1.0, other_vehicles: int = 0, 
+                        num_requests: int = 0):
+        """
+        Store experience for training - 现在支持battery信息
+        
+        Args:
+            vehicle_id: 车辆ID
+            action_type: 动作类型
+            vehicle_location: 车辆当前位置
+            target_location: 目标位置
+            current_time: 当前时间
+            reward: 获得的奖励
+            next_vehicle_location: 下一状态的车辆位置
+            battery_level: 当前电池电量 (默认1.0为向后兼容)
+            next_battery_level: 下一状态的电池电量 (默认1.0为向后兼容)
+            other_vehicles: 附近其他车辆数量
+            num_requests: 当前请求数量
+        """
         experience = {
             'vehicle_id': vehicle_id,
             'action_type': action_type,
             'vehicle_location': vehicle_location,
             'target_location': target_location,
+            'battery_level': battery_level,  # 添加当前电池电量
             'current_time': current_time,
             'reward': reward,
             'next_vehicle_location': next_vehicle_location,
+            'next_battery_level': next_battery_level,  # 添加下一状态电池电量
             'other_vehicles': other_vehicles,
-            'num_requests': num_requests
+            'num_requests': num_requests,
+            'is_idle': action_type == 'idle'  # 自动标记idle状态
+        }
+        self.experience_buffer.append(experience)
+    
+    def store_idle_experience(self, vehicle_id: int, vehicle_location: int, 
+                            battery_level: float, current_time: float, reward: float,
+                            next_vehicle_location: int, next_battery_level: float,
+                            other_vehicles: int = 0, num_requests: int = 0):
+        """
+        Store idle experience for training - 专门为idle动作存储经验
+        
+        Args:
+            vehicle_id: 车辆ID
+            vehicle_location: 车辆当前位置
+            battery_level: 当前电池电量
+            current_time: 当前时间
+            reward: 获得的奖励
+            next_vehicle_location: 下一状态的车辆位置
+            next_battery_level: 下一状态的电池电量
+            other_vehicles: 附近其他车辆数量
+            num_requests: 当前请求数量
+        """
+        experience = {
+            'vehicle_id': vehicle_id,
+            'action_type': 'idle',
+            'vehicle_location': vehicle_location,
+            'target_location': vehicle_location,  # idle时目标位置就是当前位置
+            'battery_level': battery_level,
+            'current_time': current_time,
+            'reward': reward,
+            'next_vehicle_location': next_vehicle_location,
+            'next_battery_level': next_battery_level,
+            'other_vehicles': other_vehicles,
+            'num_requests': num_requests,
+            'is_idle': True  # 标记这是一个idle经验
         }
         self.experience_buffer.append(experience)
     
@@ -437,32 +592,52 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         rewards = []
         
         for exp in batch:
-            # Current state
-            current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor = self._prepare_network_input(
+            # Current state - 使用支持battery的输入准备方法
+            current_battery = exp.get('battery_level', 0.5)  # 向后兼容
+            current_inputs = self._prepare_network_input_with_battery(
                 exp['vehicle_location'], exp['target_location'], exp['current_time'], 
-                exp['other_vehicles'], exp['num_requests'], exp['action_type']
+                exp['other_vehicles'], exp['num_requests'], exp['action_type'], current_battery
             )
+            
+            # 处理返回的输入（可能包含或不包含battery）
+            if len(current_inputs) == 6:  # 包含battery
+                current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor, current_battery_tensor = current_inputs
+            else:  # 不包含battery（向后兼容）
+                current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor = current_inputs
+                current_battery_tensor = torch.tensor([[1.0]], dtype=torch.float32).to(self.device)
             
             current_states.append({
                 'path_locations': current_path_locations.squeeze(0),
                 'path_delays': current_path_delays.squeeze(0),
                 'current_time': current_time_tensor.squeeze(0),
                 'other_agents': current_others_tensor.squeeze(0),
-                'num_requests': current_requests_tensor.squeeze(0)
+                'num_requests': current_requests_tensor.squeeze(0),
+                'battery_level': current_battery_tensor.squeeze(0)  # 添加battery信息
             })
             
-            # Next state (for target calculation)
-            next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor = self._prepare_network_input(
+            # Next state (for target calculation) - 使用支持battery的输入准备方法
+            next_battery = exp.get('next_battery_level', 1.0)  # 向后兼容
+            next_inputs = self._prepare_network_input_with_battery(
                 exp['next_vehicle_location'], exp['target_location'], 
-                exp['current_time'] + 1, exp['other_vehicles'], exp['num_requests'], exp['action_type']
+                exp['current_time'] + 1, exp['other_vehicles'], exp['num_requests'], 
+                exp['action_type'], next_battery
             )
+            
+            
+            # 处理next state的返回值
+            if len(next_inputs) == 6:  # 包含battery
+                next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor, next_battery_tensor = next_inputs
+            else:  # 不包含battery（向后兼容）
+                next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor = next_inputs
+                next_battery_tensor = torch.tensor([[1.0]], dtype=torch.float32).to(self.device)
             
             next_states.append({
                 'path_locations': next_path_locations.squeeze(0),
                 'path_delays': next_path_delays.squeeze(0),
                 'current_time': next_time_tensor.squeeze(0),
                 'other_agents': next_others_tensor.squeeze(0),
-                'num_requests': next_requests_tensor.squeeze(0)
+                'num_requests': next_requests_tensor.squeeze(0),
+                'battery_level': next_battery_tensor.squeeze(0)  # 添加battery信息
             })
             
             rewards.append(exp['reward'])
@@ -473,6 +648,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         current_batch_current_time = torch.stack([state['current_time'] for state in current_states])
         current_batch_other_agents = torch.stack([state['other_agents'] for state in current_states])
         current_batch_num_requests = torch.stack([state['num_requests'] for state in current_states])
+        current_batch_battery_levels = torch.stack([state['battery_level'] for state in current_states])  # 添加battery批处理
         
         # Stack batch inputs for next states
         next_batch_path_locations = torch.stack([state['path_locations'] for state in next_states])
@@ -480,18 +656,20 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         next_batch_current_time = torch.stack([state['current_time'] for state in next_states])
         next_batch_other_agents = torch.stack([state['other_agents'] for state in next_states])
         next_batch_num_requests = torch.stack([state['num_requests'] for state in next_states])
+        next_batch_battery_levels = torch.stack([state['battery_level'] for state in next_states])  # 添加next states的battery批处理
         
-        # Current Q-values (with gradients)
+        # Current Q-values (with gradients) - 现在包含battery信息
         self.network.train()
         current_q_values = self.network(
             path_locations=current_batch_path_locations,
             path_delays=current_batch_path_delays,
             current_time=current_batch_current_time,
             other_agents=current_batch_other_agents,
-            num_requests=current_batch_num_requests
+            num_requests=current_batch_num_requests,
+            battery_level=current_batch_battery_levels  # 添加battery参数
         )
         
-        # Next Q-values using target network (without gradients)
+        # Next Q-values using target network (without gradients) - 现在包含battery信息
         with torch.no_grad():
             self.target_network.eval()
             next_q_values = self.target_network(
@@ -499,26 +677,19 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 path_delays=next_batch_path_delays,
                 current_time=next_batch_current_time,
                 other_agents=next_batch_other_agents,
-                num_requests=next_batch_num_requests
+                num_requests=next_batch_num_requests,
+                battery_level=next_batch_battery_levels  # 添加battery参数
             )
         
-        # Calculate TD targets with improved stability
+        # Calculate TD targets without normalization
         gamma = 0.95  # Slightly lower discount factor for stability
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(self.device).unsqueeze(1)
         
-        # Apply reward clipping to prevent extreme targets
-        rewards_tensor = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
-        
-        # Calculate target Q-values with stability improvements
+        # Calculate target Q-values directly without normalization
         with torch.no_grad():
-            # Clip next Q-values to prevent instability
-            next_q_values = torch.clamp(next_q_values, min=-20.0, max=20.0)
             target_q_values = rewards_tensor + gamma * next_q_values
             
-        # Apply target clipping for additional stability
-        target_q_values = torch.clamp(target_q_values, min=-15.0, max=15.0)
-        
-        # Compute loss
+        # Compute loss with raw values
         loss = self.loss_fn(current_q_values, target_q_values)
         loss_value = loss.item()  # Define loss_value immediately after loss computation
         
@@ -566,10 +737,12 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         self.training_step += 1
         
-        # Print training progress occasionally with more details
-        if self.training_step % 50 == 0:
+        # Print training progress occasionally  
+        if self.training_step % 100 == 0:
             current_lr = self.optimizer.param_groups[0]['lr']
+            
             print(f"Training step {self.training_step}: Loss={loss_value:.4f}, Q_mean={q_mean:.4f}, Q_std={q_std:.4f}, Q_range=[{q_min:.4f}, {q_max:.4f}], LR={current_lr:.6f}")
+            print(f"  Gradient norm: {total_grad_norm:.4f}, No normalization - using raw Q-values")
         
         return loss_value
     
@@ -686,8 +859,8 @@ class PyTorchPathBasedNetwork(nn.Module):
             nn.ELU()
         )
         
-        # State embedding layers
-        state_input_dim = lstm_hidden + embedding_dim + 2  # path + time + other_agents + num_requests
+        # State embedding layers - 增加battery维度
+        state_input_dim = lstm_hidden + embedding_dim + 3  # path + time + other_agents + num_requests + battery
         self.state_embedding = nn.Sequential(
             nn.Linear(state_input_dim, dense_hidden),
             nn.ELU(),
@@ -719,7 +892,8 @@ class PyTorchPathBasedNetwork(nn.Module):
                 path_delays: torch.Tensor,
                 current_time: torch.Tensor,
                 other_agents: torch.Tensor,
-                num_requests: torch.Tensor) -> torch.Tensor:
+                num_requests: torch.Tensor,
+                battery_level: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass through the network
         
@@ -729,6 +903,7 @@ class PyTorchPathBasedNetwork(nn.Module):
             current_time: [batch_size, 1] - Current time
             other_agents: [batch_size, 1] - Number of other agents nearby
             num_requests: [batch_size, 1] - Number of current requests
+            battery_level: [batch_size, 1] - Battery level (0-1), optional
         """
         batch_size = path_locations.size(0)
         
@@ -753,12 +928,17 @@ class PyTorchPathBasedNetwork(nn.Module):
         # Process time
         time_embed = self.time_embedding(current_time)  # [batch_size, embedding_dim]
         
+        # Handle battery level - 如果没有提供battery_level，使用默认值1.0
+        if battery_level is None:
+            battery_level = torch.ones(current_time.size()).to(current_time.device)
+        
         # Combine all features
         combined_features = torch.cat([
             path_representation,
             time_embed,
             other_agents,
-            num_requests
+            num_requests,
+            battery_level  # 添加battery_level到特征组合中
         ], dim=1)  # [batch_size, total_features]
         
         # Get final value prediction
