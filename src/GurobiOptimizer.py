@@ -588,7 +588,7 @@ class GurobiOptimizer:
                 
                 
                 model.addConstr(battery_t[i] == battery_t_minus_1[i] + battery_change)
-                # model.addConstr(battery_t[i] >= self.env.min_battery_level)
+                model.addConstr(battery_t[i] >= self.env.min_battery_level)
 
             
             

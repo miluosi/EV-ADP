@@ -40,7 +40,7 @@ class Environment(metaclass=ABCMeta):
         self.idle_penalty = 0.5
         self.charging_penalty = 0.2
         self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
-        self.min_battery_level = 0.2
+        self.min_battery_level = 0.1
         # Q-learning components for ADP integration
         self.q_table = {}  # Q-table for state-action values
         self.learning_rate = 0.1
@@ -447,8 +447,8 @@ class ChargingIntegratedEnvironment(Environment):
         self.adp_value = 1.0  # Weight for Q-value contribution
         self.unserved_penalty = 1.5  # Penalty for unserved requests (reduced from 5.0)
         self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
-        self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
-        self.min_battery_level = 0.2
+        self.chargeincrease_per_epoch = 0.5
+        self.min_battery_level = 0.1
         # Initialize charging station manager
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
@@ -1195,9 +1195,9 @@ class ChargingIntegratedEnvironment(Environment):
                         current_coords = vehicle['coordinates']
                         # Generate random target for unassigned vehicles
                         target_x = max(0, min(self.grid_size-1, 
-                                            current_coords[0] + random.randint(-2, 2)))
+                                            current_coords[0] + random.randint(-3, 3)))
                         target_y = max(0, min(self.grid_size-1, 
-                                            current_coords[1] + random.randint(-2, 2)))
+                                            current_coords[1] + random.randint(-3, 3)))
                         target_coords = (target_x, target_y)
                         actions[vehicle_id] = IdleAction([], current_coords, target_coords)
                 
@@ -1392,48 +1392,8 @@ class ChargingIntegratedEnvironment(Environment):
                     reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
 
         elif isinstance(action, IdleAction):
-            # Idle action - move towards specified target coordinates
-            if vehicle['charging_station'] is None:  # Only move if not charging
-                current_coords = vehicle['coordinates']
-                target_coords = action.target_coords
-                # Move one step towards target coordinates
-                current_x, current_y = current_coords
-                target_x, target_y = target_coords
-                # Calculate next position (one step towards target)
-                if current_x < target_x:
-                    new_x = current_x + 1
-                    new_y = current_y
-                elif current_x > target_x:
-                    new_x = current_x - 1
-                    new_y = current_y
-                elif current_y < target_y:
-                    new_x = current_x
-                    new_y = current_y + 1
-                elif current_y > target_y:
-                    new_x = current_x
-                    new_y = current_y - 1
-                else:
-                    new_x, new_y = current_x, current_y
-                # Update vehicle position
-                distance = abs(new_x - current_x) + abs(new_y - current_y)
-                new_location_index = new_y * self.grid_size + new_x
-                vehicle['coordinates'] = (new_x, new_y)
-                vehicle['location'] = new_location_index
-                vehicle['total_distance'] += distance
-                # Track vehicle position for visualization
-                if vehicle_id not in self.vehicle_position_history:
-                    self.vehicle_position_history[vehicle_id] = []
-                self.vehicle_position_history[vehicle_id].append({
-                    'coords': (new_x, new_y),
-                    'time': self.current_time,
-                    'action_type': 'idle_movement'
-                })
-                # Movement consumes battery
-                vehicle['battery'] -= distance * 0.03 + np.random.random()*0.001
-                vehicle['battery'] = max(0, vehicle['battery'])
-                reward = -0.1*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
-            else:
-                reward = -1 - np.random.normal(0, 0.05)
+            # Idle action - move towards specified target coordinates using unified method
+            reward = self._execute_movement_towards_idle(vehicle_id, action.target_coords)
 
         else:
             # Movement action - intelligent target-oriented movement
@@ -1591,8 +1551,8 @@ class ChargingIntegratedEnvironment(Environment):
         vehicle['battery'] -= distance * 0.03 + np.random.random()*0.001
         vehicle['battery'] = max(0, vehicle['battery'])
         
-        # Small time penalty for movement
-        return -0.2*distance - np.random.random()*0.001
+        # Small time penalty for movement (consistent with other movement methods)
+        return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
     
 
 
@@ -1676,11 +1636,63 @@ class ChargingIntegratedEnvironment(Environment):
         distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
         
         # Movement consumes battery
-        vehicle['battery'] -= distance * 0.03+ np.random.random()*0.001  # Increased battery consumption for charging station movement
+        vehicle['battery'] -= distance * 0.03 + np.random.random()*0.001
         vehicle['battery'] = max(0, vehicle['battery'])
         
-        # Small time penalty for movement
-        return -0.2*distance + np.random.random()*0.001
+        # Small time penalty for movement (consistent with other movement methods)
+        return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+    
+    def _execute_movement_towards_idle(self, vehicle_id, target_coords):
+        """Execute movement towards idle target coordinates"""
+        vehicle = self.vehicles[vehicle_id]
+        
+        if vehicle['charging_station'] is not None:
+            return -0.2  # Charging penalty for movement
+        
+        old_coords = vehicle['coordinates']
+        current_x, current_y = old_coords
+        target_x, target_y = target_coords
+        
+        # Move one step towards target coordinates (Manhattan distance)
+        if current_x < target_x:
+            new_x = current_x + 1
+            new_y = current_y
+        elif current_x > target_x:
+            new_x = current_x - 1
+            new_y = current_y
+        elif current_y < target_y:
+            new_x = current_x
+            new_y = current_y + 1
+        elif current_y > target_y:
+            new_x = current_x
+            new_y = current_y - 1
+        else:
+            # Already at target
+            new_x, new_y = current_x, current_y
+        
+        # Update vehicle position
+        distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
+        new_location_index = new_y * self.grid_size + new_x
+        
+        vehicle['coordinates'] = (new_x, new_y)
+        vehicle['location'] = new_location_index
+        vehicle['total_distance'] += distance
+        
+        # Track vehicle position for visualization
+        if vehicle_id not in self.vehicle_position_history:
+            self.vehicle_position_history[vehicle_id] = []
+        self.vehicle_position_history[vehicle_id].append({
+            'coords': (new_x, new_y),
+            'time': self.current_time,
+            'action_type': 'idle_movement'
+        })
+        
+        # Movement consumes battery (same as other movement methods)
+        vehicle['battery'] -= distance * 0.03 + np.random.random()*0.001
+        vehicle['battery'] = max(0, vehicle['battery'])
+        
+        # Small time penalty for movement (consistent with other methods)
+        return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
     
     def _update_environment(self):
         """Update environment state"""
@@ -1699,7 +1711,7 @@ class ChargingIntegratedEnvironment(Environment):
                 vehicle['charging_time_left'] -= 1
                 
                 # Charging increases battery (reduced rate for more realistic charging)
-                vehicle['battery'] += 0.3 + np.random.random()*0.001
+                vehicle['battery'] += self.chargeincrease_per_epoch + np.random.random()*0.001
                 vehicle['battery'] = min(1.0, vehicle['battery'])
                 
                 # Charging complete
