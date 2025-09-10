@@ -41,8 +41,8 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 30  # Doubled vehicles for more interaction
-    num_stations = 9  # More stations for complex charging decisions
+    num_vehicles = 20  # Doubled vehicles for more interaction
+    num_stations = 10  # More stations for complex charging decisions
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
     # Initialize neural network-based ValueFunction for decision making only if needed
@@ -105,8 +105,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     for episode in range(num_episodes):
 
         current_epsilon = max(epsilon_end, epsilon_start - episode * epsilon_decay)
-        use_exploration = episode < exploration_episodes and random.random() < current_epsilon
-            
+        use_exploration = False
         
         # Reset environment
         states = env.reset()
@@ -127,7 +126,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             next_states, rewards, done, info = env.step(actions)
 
             # Debug: Output step statistics every 200 steps
-            if step % 200 == 0:
+            if step % 100 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
                 assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
@@ -148,20 +147,15 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                     if training_loss > 0:
                         episode_losses.append(training_loss)
                 
-                # Additional mid-episode training for exploration episodes
-                if use_exploration and step % (training_frequency * 2) == 0:
-                    training_loss = value_function.train_step(batch_size=32)
-                    if training_loss > 0:
-                        episode_losses.append(training_loss)
             
-            # Intensive training at episode end (only if using neural network)
-            if (use_neural_network and step == env.episode_length - 1 and 
-                len(value_function.experience_buffer) >= warmup_steps):
-                # Multiple training steps at episode end
-                for _ in range(5):  # More training steps
-                    training_loss = value_function.train_step(batch_size=64)
-                    if training_loss > 0:
-                        episode_losses.append(training_loss)
+            # # Intensive training at episode end (only if using neural network)
+            # if (use_neural_network and step == env.episode_length - 1 and 
+            #     len(value_function.experience_buffer) >= warmup_steps):
+            #     # Multiple training steps at episode end
+            #     for _ in range(5):  # More training steps
+            #         training_loss = value_function.train_step(batch_size=64)
+            #         if training_loss > 0:
+            #             episode_losses.append(training_loss)
             
             # Update results
             episode_reward += sum(rewards.values())
@@ -185,7 +179,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         episode_stats = env.get_episode_stats()
         episode_stats['episode_number'] = episode + 1
         episode_stats['episode_reward'] = episode_reward
-        episode_stats['charging_events_count'] = len(episode_charging_events)
+        episode_stats['charging_events_count'] = len(episode_charging_events)/env.episode_length  # Average per step
         
         # Output rebalancing assignment statistics
         rebalancing_calls = episode_stats.get('total_rebalancing_calls', 0)
@@ -943,6 +937,7 @@ def generate_integration_report(results, analysis, assignmentgurobi=True):
         f.write(f"- 总充电次数: {analysis['total_charging']}\n")
         f.write(f"- 平均电池电量: {analysis['avg_battery']:.2f}\n")
         f.write(f"- 奖励改进: {analysis['improvement']:.2f}\n")
+
         f.write(f"- 最低电量: {analysis['min_battery']:.2f}\n")
         f.write(f"- 电量稳定性: {analysis['battery_stability']:.3f}\n\n")
         
@@ -1036,8 +1031,7 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-
-        adplist = [1]
+        adplist = [0,0.1,0.3,0.5,0.7,0.9,1.0]
         for adpvalue in adplist:
             assignmentgurobi =True
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
