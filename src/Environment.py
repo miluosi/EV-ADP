@@ -738,7 +738,7 @@ class ChargingIntegratedEnvironment(Environment):
                 pickup_location = pickup_y * self.grid_size + pickup_x
                 
                 # Generate dropoff location (can be anywhere or biased toward other hotspots)
-                if random.random() < 0.5:  # 90% chance dropoff is near another hotspot
+                if random.random() < 0.9:  # 90% chance dropoff is near another hotspot
                     # Choose a different hotspot for dropoff based on probability weights
                     available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
                     if available_hotspot_indices:
