@@ -58,7 +58,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             num_vehicles=num_vehicles,
             device='cuda' if torch.cuda.is_available() else 'cpu',  # Use GPU if available
             episode_length=env.episode_length,  # 传递正确的episode长度
-            max_requests=1000  # 设置合理的最大请求数
+            max_requests=5000  # 设置合理的最大请求数
         )
         # Set the value function in the environment for Q-value calculation
         env.set_value_function(value_function)
@@ -1022,16 +1022,11 @@ def main():
         
 
 
-
-
-
-        if success:
-            print("📈 可视化图表生成成功")
         assignmentgurobi =True
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0,0.5,1.0]
+        adplist = [0.5,1.0]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")

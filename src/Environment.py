@@ -451,7 +451,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.charge_duration = 2
         self.chargeincrease_per_epoch = 0.4
         self.chargeincrease_whole = self.chargeincrease_per_epoch * self.charge_duration
-        self.min_battery_level = 0.2
+        self.min_battery_level = 0.1
         # Initialize charging station manager
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
@@ -471,7 +471,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_counter = 0
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
-        self.battery_consum = 0.005  # Battery consumption per epoch when moving
+        self.battery_consum = 0.001  # Battery consumption per epoch when moving
         # Assignment tracking for rebalancing analysis
         self.rebalancing_assignments_per_step = []  # Store assignments count per step
         self.total_rebalancing_calls = 0
@@ -643,7 +643,9 @@ class ChargingIntegratedEnvironment(Environment):
                 'passenger_onboard': None,  # Passenger being transported
                 'service_earnings': 0,  # Total earnings from completed requests
                 'rejected_requests': 0,  # Track rejected requests for analysis
-                'unserved_penalty': 0  # Accumulated penalty for unserved requests
+                'unserved_penalty': 0,  # Accumulated penalty for unserved requests
+                'is_stationary': False,  # Whether the vehicle is in waiting/stationary state
+                'stationary_duration': 0  # Duration to remain stationary
             }
     
     def _calculate_rejection_probability(self, vehicle_id, request):
@@ -684,11 +686,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.5:
-                num_requests = random.randint(5, 10)
+                num_requests = random.randint(20, 25)
             elif rand_val < 0.8:
-                num_requests = random.randint(10, 15)
+                num_requests = random.randint(25, 30)
             else:
-                num_requests = random.randint(15, 20)
+                num_requests = random.randint(30, 40)
             
             for _ in range(num_requests):
                 self.request_counter += 1
@@ -714,10 +716,10 @@ class ChargingIntegratedEnvironment(Environment):
                 travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
                 
                 # Create request with dynamic pricing based on demand
-                base_value = 30 
-                # Add surge pricing during high demand periods
+                base_value = 20
+                distance_value = travel_time * (2 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
-                final_value = base_value * surge_factor
+                final_value = base_value * surge_factor + distance_value
                 
                 request = Request(
                     request_id=self.request_counter,
@@ -1194,7 +1196,7 @@ class ChargingIntegratedEnvironment(Environment):
                 if (vehicle['assigned_request'] is None and
                     vehicle['passenger_onboard'] is None and
                     vehicle['charging_station'] is None and
-                    vehicle.get('idle_target') is None ) or (vehicle['battery'] <= self.min_battery_level+1e-3):
+                    vehicle.get('idle_target') is None ) or (vehicle['battery'] <= self.min_battery_level+1e-3) or vehicle['is_stationary']:
                     vehicles_to_rebalance.append(vehicle_id)
 
             if vehicles_to_rebalance:
@@ -1232,6 +1234,8 @@ class ChargingIntegratedEnvironment(Environment):
                             # Generate charging action
                             from src.Action import ChargingAction
                             actions[vehicle_id] = ChargingAction([], station_id, self.charge_duration)
+                            vehicle = self.vehicles[vehicle_id]
+                            vehicle['is_stationary'] = False  # Reset stationary state if moving to charge
                         elif hasattr(target_request, 'request_id'):
                             # Handle regular request assignment  
                             self._assign_request_to_vehicle(vehicle_id, target_request.request_id)
@@ -1239,11 +1243,21 @@ class ChargingIntegratedEnvironment(Environment):
                             # Generate service action
                             from src.Action import ServiceAction
                             actions[vehicle_id] = ServiceAction([], target_request.request_id)
+                        elif isinstance(target_request, str) and target_request == "waiting":
+                            # Handle waiting state - mark vehicle as stationary for next simulation
+                            vehicle = self.vehicles[vehicle_id]
+                            vehicle['is_stationary'] = True
+                            vehicle['stationary_duration'] = getattr(target_request, 'duration', 1)  # Default 2 steps
+                            # Generate idle action to keep vehicle stationary
+                            from src.Action import IdleAction
+                            current_coords = vehicle['coordinates']
+                            actions[vehicle_id] = IdleAction([], current_coords, current_coords)  # Stay in place
                         else:
                             self._assign_idle_vehicle(vehicle_id)
                             # Generate idle action using the target set by _assign_idle_vehicle
                             from src.Action import IdleAction
                             vehicle = self.vehicles[vehicle_id]
+                            vehicle['is_stationary'] = False  # Reset stationary state if moving to idle target
                             current_coords = vehicle['coordinates']
                             target_coords = vehicle.get('idle_target', current_coords)  # Use assigned target
                             actions[vehicle_id] = IdleAction([], current_coords, target_coords)
@@ -1270,8 +1284,13 @@ class ChargingIntegratedEnvironment(Environment):
         from src.Action import Action, ChargingAction, ServiceAction, IdleAction
         for vehicle_id, vehicle in self.vehicles.items():
             if vehicle_id not in actions:
+                # Check if vehicle is in stationary state
+                if vehicle.get('is_stationary', False):
+                    # Generate idle action to keep vehicle stationary
+                    current_coords = vehicle['coordinates']
+                    actions[vehicle_id] = IdleAction([], current_coords, current_coords)
                 # Generate action based on current vehicle state
-                if vehicle['charging_station'] is not None:
+                elif vehicle['charging_station'] is not None:
                     # Vehicle is charging - continue charging action
                     station_id = vehicle['charging_station']
                     charge_duration = vehicle.get('charging_time_left', 2)  # Use remaining time or default
@@ -1406,6 +1425,20 @@ class ChargingIntegratedEnvironment(Environment):
         from src.Action import ChargingAction, ServiceAction, IdleAction
 
         vehicle = self.vehicles[vehicle_id]
+        
+        # Check if vehicle is in stationary state
+        if vehicle.get('is_stationary', False):
+            # Reduce stationary duration
+            vehicle['stationary_duration'] = 1
+            
+            # If stationary duration is finished, remove stationary status
+            if vehicle['stationary_duration'] <= 0:
+                vehicle['is_stationary'] = False
+                vehicle['stationary_duration'] = 0
+            
+            # Return minimal reward for stationary period (no action taken)
+            return 0  # Small penalty for staying stationary
+        
         reward = 0
 
         # Get parameters for consistency with Gurobi

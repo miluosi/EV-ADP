@@ -90,6 +90,7 @@ class GurobiOptimizer:
 
         charge_decision = {}
         idle_vehicle = {}
+        waiting_vehicle = {}
         for i, vehicle_id in enumerate(vehicle_ids):
             for j, request in enumerate(available_requests):
                 request_decision[i, j] = model.addVar(vtype=self.GRB.BINARY,
@@ -106,13 +107,16 @@ class GurobiOptimizer:
             idle_vehicle[i] = model.addVar(vtype=self.GRB.BINARY,
                                      name=f'vehicle_{vehicle_ids[i]}_idle')
         for i in range(len(vehicle_ids)):
+            waiting_vehicle[i] = model.addVar(vtype=self.GRB.BINARY,
+                                     name=f'vehicle_{vehicle_ids[i]}_waiting')
+        for i in range(len(vehicle_ids)):
             actionv = self.gp.LinExpr()
             for j in range(len(available_requests)):
                 actionv += request_decision[i, j]
             for j in range(len(charging_stations)):
                 actionv += charge_decision[i, j]
             model.addConstr(actionv <= 1)
-            model.addConstr(idle_vehicle[i] + actionv == 1) 
+            model.addConstr(idle_vehicle[i] + actionv + waiting_vehicle[i] == 1) 
         idlevehicle = self.gp.LinExpr()
         for i in range(len(vehicle_ids)):
             idlevehicle += idle_vehicle[i]
@@ -183,7 +187,7 @@ class GurobiOptimizer:
                         if charge_decision[i, j].x > 0.5:  # Binary variable threshold
                             assignments[vehicle_id] = f"charge_{station.id}"
                             break
-
+                
         return assignments
     
     
@@ -572,7 +576,12 @@ class GurobiOptimizer:
                     vtype=self.GRB.BINARY,
                     name=f'vehicle_{vehicle_ids[i]}_idle'
                 )
-            
+            waiting_vehicle = {}
+            for i in range(len(vehicle_ids)):
+                waiting_vehicle[i] = model.addVar(
+                    vtype=self.GRB.BINARY,
+                    name=f'vehicle_{vehicle_ids[i]}_waiting'
+                )
             # Battery level transition constraints (t-1 to t relationship)
             for i, vehicle_id in enumerate(vehicle_ids):
                 vehicle = self.env.vehicles[vehicle_id]
@@ -628,7 +637,7 @@ class GurobiOptimizer:
                     for j in range(len(charging_stations)):
                         actionv += charge_decision[i, j]
                 model.addConstr(actionv <= 1)
-                model.addConstr(idle_vehicle[i] + actionv == 1)
+                model.addConstr(idle_vehicle[i] + actionv + waiting_vehicle[i] == 1)
             
             # Minimum idle vehicles constraint
             idle_vehicles = self.gp.LinExpr()
@@ -753,7 +762,9 @@ class GurobiOptimizer:
                             if charge_decision[i, j].x > 0.5:
                                 assignments[vehicle_id] = f"charge_{station.id}"
                                 break
-                                
+                    if waiting_vehicle[i].x > 0.5:
+                        assignments[vehicle_id] = f"waiting"
+                        break
                 # Update vehicle battery levels based on optimization results
                 for i, vehicle_id in enumerate(vehicle_ids):
                     if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):
