@@ -3,6 +3,7 @@ Integrated Test: Vehicle Charging Behavior Integration Test using src folder com
 """
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -16,6 +17,8 @@ from src.ChargingIntegrationVisualization import ChargingIntegrationVisualizatio
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False  # Fix minus sign display issue
 
+# 导入配置管理器
+from config.config_manager import ConfigManager, get_config, get_training_config, get_sampling_config
 
 from src.Environment import Environment
 from src.LearningAgent import LearningAgent
@@ -36,12 +39,12 @@ USE_SRC_COMPONENTS = True
 
 
 
-def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi):
+def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 20  # Doubled vehicles for more interaction
+    num_vehicles = 50  # Doubled vehicles for more interaction
     num_stations = 12
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
@@ -53,7 +56,9 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         value_function = PyTorchChargingValueFunction(
             grid_size=env.grid_size, 
             num_vehicles=num_vehicles,
-            device='cuda' if torch.cuda.is_available() else 'cpu'  # Use GPU if available
+            device='cuda' if torch.cuda.is_available() else 'cpu',  # Use GPU if available
+            episode_length=env.episode_length,  # 传递正确的episode长度
+            max_requests=1000  # 设置合理的最大请求数
         )
         # Set the value function in the environment for Q-value calculation
         env.set_value_function(value_function)
@@ -172,28 +177,16 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             if use_neural_network and len(value_function.experience_buffer) >= warmup_steps:
                 # Train more frequently based on our new parameters
                 if step % training_frequency == 0:
-                    training_loss = value_function.train_step(batch_size=64)  # Larger batch
+                    training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
                     if training_loss > 0:
                         episode_losses.append(training_loss)
                 
-            
-            # # Intensive training at episode end (only if using neural network)
-            # if (use_neural_network and step == env.episode_length - 1 and 
-            #     len(value_function.experience_buffer) >= warmup_steps):
-            #     # Multiple training steps at episode end
-            #     for _ in range(5):  # More training steps
-            #         training_loss = value_function.train_step(batch_size=64)
-            #         if training_loss > 0:
-            #             episode_losses.append(training_loss)
-            
-            # Update results
             episode_reward += sum(rewards.values())
             episode_charging_events.extend(info.get('charging_events', []))
             
             if done:
                 break
-        
-        # Record episode results
+
         results['episode_rewards'].append(episode_reward)
         results['charging_events'].extend(episode_charging_events)
         results['value_function_losses'].append(np.mean(episode_losses) if episode_losses else 0.0)
@@ -280,12 +273,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         vehicle_visit_stats = analyze_vehicle_visit_patterns(env)
         results['vehicle_visit_stats'].append(vehicle_visit_stats)
         
-        # print(f"Episode {episode + 1} Completed:")
-        # print(f"  Reward: {episode_reward:.2f}")
-        # print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
-        # print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
-        # print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
-    
+
     print("\n=== Integration Test Complete ===")
     if use_neural_network:
         print(f"✓ Neural Network ValueFunction trained over {num_episodes} episodes")
@@ -707,90 +695,18 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
         
         # Generate and save spatial visualization
         try:
-            print(f"🗺️ Generating spatial visualization...")
             spatial_viz = SpatialVisualization(env.grid_size)
+            success = spatial_viz.create_comprehensive_spatial_plot(
+                env=env, 
+                save_path=spatial_image_path,
+                adpvalue=adpvalue,
+                demand_pattern=demand_pattern
+            )
             
-            # Create comprehensive spatial plot
-            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-            
-            # Plot 1: Request generation heatmap
-            if hasattr(env, 'request_generation_history') and env.request_generation_history:
-                pickup_coords = [req['pickup_coords'] for req in env.request_generation_history]
-                pickup_x = [coord[0] for coord in pickup_coords]
-                pickup_y = [coord[1] for coord in pickup_coords]
-                
-                ax1.hist2d(pickup_x, pickup_y, bins=env.grid_size//2, alpha=0.7, cmap='Reds')
-                ax1.set_title(f'Request Generation Heatmap\n(Pattern: {demand_pattern})')
-                ax1.set_xlabel('X Coordinate')
-                ax1.set_ylabel('Y Coordinate')
-                ax1.grid(True, alpha=0.3)
-            
-            # Plot 2: Vehicle position distribution
-            vehicle_positions = [v['coordinates'] for v in env.vehicles.values()]
-            if vehicle_positions:
-                veh_x = [pos[0] for pos in vehicle_positions]
-                veh_y = [pos[1] for pos in vehicle_positions]
-                
-                # Color by vehicle type
-                ev_x = [pos[0] for v_id, v in env.vehicles.items() if v['type'] == 'EV' for pos in [v['coordinates']]]
-                ev_y = [pos[1] for v_id, v in env.vehicles.items() if v['type'] == 'EV' for pos in [v['coordinates']]]
-                aev_x = [pos[0] for v_id, v in env.vehicles.items() if v['type'] == 'AEV' for pos in [v['coordinates']]]
-                aev_y = [pos[1] for v_id, v in env.vehicles.items() if v['type'] == 'AEV' for pos in [v['coordinates']]]
-                
-                ax2.scatter(ev_x, ev_y, c='blue', alpha=0.6, label='EV', s=50)
-                ax2.scatter(aev_x, aev_y, c='green', alpha=0.6, label='AEV', s=50)
-                ax2.set_title('Final Vehicle Distribution')
-                ax2.set_xlabel('X Coordinate')
-                ax2.set_ylabel('Y Coordinate')
-                ax2.legend()
-                ax2.grid(True, alpha=0.3)
-            
-            # Plot 3: Charging station utilization
-            if hasattr(env, 'charging_manager') and env.charging_manager.stations:
-                station_data = []
-                for station_id, station in env.charging_manager.stations.items():
-                    station_x = station.location % env.grid_size
-                    station_y = station.location // env.grid_size
-                    utilization = len(station.current_vehicles) / station.max_capacity
-                    station_data.append((station_x, station_y, utilization))
-                
-                if station_data:
-                    station_x, station_y, utilizations = zip(*station_data)
-                    scatter = ax3.scatter(station_x, station_y, c=utilizations, s=200, 
-                                        cmap='YlOrRd', alpha=0.8, edgecolor='black')
-                    plt.colorbar(scatter, ax=ax3, label='Utilization Rate')
-                    ax3.set_title('Charging Station Utilization')
-                    ax3.set_xlabel('X Coordinate')
-                    ax3.set_ylabel('Y Coordinate')
-                    ax3.grid(True, alpha=0.3)
-            
-            # Plot 4: Performance summary
-            ax4.axis('off')
-            performance_text = f"""
-Performance Summary
-ADP Value: {adpvalue}
-Demand Pattern: {demand_pattern}
-Charging Penalty: {charging_penalty}
-Unserved Penalty: {unserved_penalty}
-
-Episodes: {len(df)}
-Avg Battery Level: {df['avg_battery_level'].mean():.2f}
-Total Orders: {df['total_orders'].sum()}
-Accepted Orders: {df['accepted_orders'].sum()}
-Rejection Rate: {((df['rejected_orders'].sum() / df['total_orders'].sum()) * 100) if df['total_orders'].sum() > 0 else 0:.1f}%
-
-EV Vehicles: {df['ev_count'].iloc[0] if not df.empty else 0}
-AEV Vehicles: {df['aev_count'].iloc[0] if not df.empty else 0}
-            """
-            ax4.text(0.1, 0.9, performance_text, transform=ax4.transAxes, 
-                    fontsize=11, verticalalignment='top', fontfamily='monospace',
-                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-            
-            plt.tight_layout()
-            plt.savefig(spatial_image_path, dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            print(f"✓ Spatial visualization saved: {spatial_image_path}")
+            if success:
+                print(f"✓ Spatial visualization saved: {spatial_image_path}")
+            else:
+                print(f"⚠ Failed to generate spatial visualization")
             
         except Exception as e:
             print(f"⚠ Error generating spatial visualization: {e}")
@@ -942,7 +858,7 @@ def analyze_results(results):
     }
 
 
-def visualize_integrated_results(results, assignmentgurobi=True):
+def visualize_integrated_results(env,results, assignmentgurobi=True):
     """可视化集成测试结果"""
     print("\n=== 生成可视化图表 ===")
     
@@ -957,14 +873,14 @@ def visualize_integrated_results(results, assignmentgurobi=True):
             results_dir = Path("results/integrated_tests_h")
         results_dir.mkdir(parents=True, exist_ok=True)
         
-        # 生成主要结果图表
-        plot_path = results_dir / "integrated_charging_results.png"
-        fig1 = visualizer.plot_integrated_results(results, save_path=str(plot_path))
-        
+        adpvalue = getattr(env, 'adp_value', 1.0)
+        plot_path = results_dir / f"integrated_charging_results_{adpvalue}.png"
+        fig1 = visualizer.plot_integrated_results(results,  save_path=str(plot_path))
+
         # 生成策略分析图表
-        strategy_plot_path = results_dir / "charging_strategy_analysis.png"
+        strategy_plot_path = results_dir / f"charging_strategy_analysis_{adpvalue}.png"
         fig2 = visualizer.plot_charging_strategy_analysis(results, save_path=str(strategy_plot_path))
-        
+
         print(f"✓ 主要结果图表已保存至: {plot_path}")
         print(f"✓ 策略分析图表已保存至: {strategy_plot_path}")
         
@@ -1052,53 +968,71 @@ def main():
     print("🚗⚡ 充电行为集成测试程序")
     print("使用src文件夹中的Environment和充电组件")
     print("-" * 60)
+    
+    # 加载配置
+    config_manager = ConfigManager()
+    print("📋 加载配置参数...")
+    config_manager.print_config('training')
+    config_manager.print_config('environment')
+    
+    # 从配置获取参数
+    training_config = get_training_config()
+    env_config = config_manager.get_environment_config()
+    
     use_intense_requests = True  # 使用热点请求模式
 
     try:
+        # 从配置获取训练参数
+        num_episodes = env_config.get('episode_length', 100)
+        print(f"📊 使用配置参数: episodes={num_episodes}")
+        
+        batch_size = training_config.get('batch_size', 256)
+        # adpvalue = 0
+        # assignmentgurobi =False
+        # results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
 
-        num_episodes = 100
-        adpvalue = 0
-        assignmentgurobi =False
-        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
+        #     # 分析结果
+        # analysis = analyze_results(results)
+        
+        # # 生成可视化
+        # success = visualize_integrated_results(env,results, assignmentgurobi=assignmentgurobi)
+        
+        # # 空间分布可视化已在Excel导出中生成
+        # print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
+        
+        # # 生成传统的空间分布分析（用于兼容性）
+        # spatial_viz = SpatialVisualization(env.grid_size)
+        # spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+        # spatial_viz.print_spatial_analysis(spatial_analysis)
+        
+        # # 生成报告
+        # generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
+        
+        # # 输出车辆访问模式总结
+        # print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
+        
+        # print("\n" + "="*60)
+        # assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
+        # print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
+        # print("📊 结果摘要:")
+        # print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
+        # print(f"   - 充电次数: {analysis['total_charging']}")
+        # print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
+        # print(f"   - 奖励改进: {analysis['improvement']:.2f}")
+        
 
-            # 分析结果
-        analysis = analyze_results(results)
-        
-        # 生成可视化
-        success = visualize_integrated_results(results, assignmentgurobi=assignmentgurobi)
-        
-        # 空间分布可视化已在Excel导出中生成
-        print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
-        
-        # 生成传统的空间分布分析（用于兼容性）
-        spatial_viz = SpatialVisualization(env.grid_size)
-        spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
-        spatial_viz.print_spatial_analysis(spatial_analysis)
-        
-        # 生成报告
-        generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
-        
-        # 输出车辆访问模式总结
-        print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
-        
-        print("\n" + "="*60)
-        assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
-        print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
-        print("📊 结果摘要:")
-        print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-        print(f"   - 充电次数: {analysis['total_charging']}")
-        print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-        print(f"   - 奖励改进: {analysis['improvement']:.2f}")
-        
+
+
+
+
         if success:
             print("📈 可视化图表生成成功")
-        
+        assignmentgurobi =True
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0.1,0.3,0.5,0.7,1.0]
+        adplist = [0,0.5,1.0]
         for adpvalue in adplist:
-            assignmentgurobi =True
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
             results, env = run_charging_integration_test(adpvalue, num_episodes=100, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
@@ -1114,7 +1048,7 @@ def main():
             
             # 生成传统的空间分布分析（用于兼容性）
             spatial_viz = SpatialVisualization(env.grid_size)
-            spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+            spatial_analysis = spatial_viz.analyze_spatial_patterns(env, adp_value=adpvalue)
             spatial_viz.print_spatial_analysis(spatial_analysis)
             
             # 生成报告

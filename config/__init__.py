@@ -2,34 +2,18 @@
 配置包初始化文件
 """
 
-from .gnn_config import (
-    MODEL_CONFIG,
-    TRAINING_CONFIG, 
-    LOSS_WEIGHTS,
-    DIVERSITY_CONFIG,
-    INITIALIZATION_CONFIG,
-    DEVICE_CONFIG,
-    DATA_CONFIG,
-    SAVE_CONFIG,
-    VISUALIZATION_CONFIG,
-    EXPERIMENT_CONFIGS,
+from .config_manager import (
+    ConfigManager,
     get_config,
-    update_config_for_data_type,
-    validate_config
+    get_training_config,
+    get_sampling_config,
+    config_manager
 )
 
 __all__ = [
-    'MODEL_CONFIG',
-    'TRAINING_CONFIG', 
-    'LOSS_WEIGHTS',
-    'DIVERSITY_CONFIG',
-    'INITIALIZATION_CONFIG',
-    'DEVICE_CONFIG',
-    'DATA_CONFIG',
-    'SAVE_CONFIG',
-    'VISUALIZATION_CONFIG',
-    'EXPERIMENT_CONFIGS',
+    'ConfigManager',
     'get_config',
-    'update_config_for_data_type',
-    'validate_config'
+    'get_training_config',
+    'get_sampling_config',
+    'config_manager'
 ]

@@ -164,7 +164,7 @@ class ChargingIntegrationVisualization:
             print(f"✓ Integrated results chart saved to: {save_path}")
         
         return fig
-    
+
     def plot_charging_strategy_analysis(self, results, save_path=None):
         """Plot charging strategy analysis charts"""
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))

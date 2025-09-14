@@ -14,6 +14,7 @@ class GurobiOptimizer:
             self.gp = gp
             self.GRB = GRB
             self.available = True
+            
             print("✓ Gurobi optimizer available")
         except ImportError:
             print("⚠ Gurobi not available, using heuristic methods")
@@ -501,8 +502,8 @@ class GurobiOptimizer:
             
             # Parameters
             min_battery_level = self.env.min_battery_level if hasattr(self.env, 'min_battery_level') else 0.2
-            charging_rate = 0.15     # Battery increase per charging period
-            travel_consumption = 0.02 # Battery consumption per unit distance
+
+            battery_consum = self.env.battery_consum if hasattr(self.env, 'battery_consum') else 0.05 # Battery consumption per travel step
             service_consumption = 0.05 # Battery consumption per service
             
             # Filter out rejected requests for each EV
@@ -575,20 +576,44 @@ class GurobiOptimizer:
             # Battery level transition constraints (t-1 to t relationship)
             for i, vehicle_id in enumerate(vehicle_ids):
                 vehicle = self.env.vehicles[vehicle_id]
-                battery_change = self.gp.LinExpr()
                 
-                # Base battery consumption for staying idle
-                base_consumption = 0.01  # 1% per time step
-                battery_change += -base_consumption
+                # Initialize battery expressions as Gurobi LinExpr
+                battery_loss = self.gp.LinExpr()
+                battery_increase = self.gp.LinExpr()
                 
-                # Battery gain from charging
+                # Battery consumption from charging (travel to station)
                 if charging_stations:
                     for j, station in enumerate(charging_stations):
-                        battery_change += self.env.chargeincrease_per_epoch * charge_decision[i, j]
+                        # Convert station location index to coordinates
+                        station_x = station.location % self.env.grid_size
+                        station_y = station.location // self.env.grid_size
+                        travel_distance = abs(vehicle['coordinates'][0] - station_x) + abs(vehicle['coordinates'][1] - station_y)
+                        battery_loss += travel_distance * battery_consum * charge_decision[i, j]
+                        battery_increase += self.env.chargeincrease_whole * charge_decision[i, j]
                 
+                # Battery consumption from service requests (travel to pickup + pickup to dropoff)
+                if available_requests:
+                    for j, request in enumerate(available_requests):
+                        # Travel from vehicle current position to pickup
+                        pickup_x = request.pickup % self.env.grid_size
+                        pickup_y = request.pickup // self.env.grid_size
+                        travel_distance_to_pickup = abs(vehicle['coordinates'][0] - pickup_x) + abs(vehicle['coordinates'][1] - pickup_y)
+                        
+                        # Travel from pickup to dropoff
+                        dropoff_x = request.dropoff % self.env.grid_size
+                        dropoff_y = request.dropoff // self.env.grid_size
+                        travel_distance_pickup_to_dropoff = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+                        
+                        # Total battery consumption for this request
+                        total_travel_distance = travel_distance_to_pickup + travel_distance_pickup_to_dropoff
+                        battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
                 
-                model.addConstr(battery_t[i] == battery_t_minus_1[i] + battery_change)
-                model.addConstr(battery_t[i] >= self.env.min_battery_level)
+                # Battery transition constraint (simplified to avoid infeasibility)
+                model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss + battery_increase)
+                # Ensure vehicle has enough battery for actions (but allow some flexibility)
+                model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
+                # Ensure battery doesn't go below minimum (but allow some flexibility)
+                model.addConstr(battery_t[i] >= min_battery_level )  # Small tolerance for feasibility
 
             
             
@@ -623,8 +648,10 @@ class GurobiOptimizer:
                 for j, station in enumerate(charging_stations):
                     model.addConstr(
                         self.gp.quicksum(charge_decision[i, j] for i in range(len(vehicle_ids))) 
-                        <= station.max_capacity
-                    )
+                        <= max(
+                            0,
+                            station.max_capacity - len(station.current_vehicles)
+                    ))
             
             # Objective: Maximize total value considering Q-values
             objective_terms = self.gp.LinExpr()
@@ -640,7 +667,7 @@ class GurobiOptimizer:
                         if hasattr(self.env, 'get_assignment_q_value'):
                             q_value = self.env.get_assignment_q_value(
                                 vehicle_id, request.request_id,
-                                vehicle['location'], request.pickup
+                                vehicle['location'], request.pickup,
                             )
                         
                         # Combined objective: request value + Q-value benefit
@@ -655,12 +682,7 @@ class GurobiOptimizer:
                         if hasattr(self.env, 'get_charging_q_value'):
                             charging_q_value = self.env.get_charging_q_value(
                                 vehicle_id, station.id,
-                                vehicle['location'], station.location
-                            )
-                        elif hasattr(self.env, 'get_assignment_q_value'):
-                            charging_q_value = self.env.get_assignment_q_value(
-                                vehicle_id, f"charge_{station.id}",
-                                vehicle['location'], station.location
+                                vehicle['location'], station.location,
                             )
                         
                         # Charging penalty offset by Q-value benefit
@@ -689,8 +711,6 @@ class GurobiOptimizer:
                             vehicle_id=vehicle_id,
                             vehicle_location=vehicle['location'],
                             battery_level=vehicle['battery'],
-                            current_time=getattr(self.env, 'current_time', 0.0),
-                            other_vehicles=len(vehicle_ids) - 1,  # 其他车辆数量
                             num_requests=len(available_requests)
                         )
                     except Exception as e:
