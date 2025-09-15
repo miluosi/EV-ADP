@@ -619,7 +619,7 @@ class GurobiOptimizer:
                 # Ensure vehicle has enough battery for actions (but allow some flexibility)
                 model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
                 # Ensure battery doesn't go below minimum (but allow some flexibility)
-                model.addConstr(battery_t[i] >= min_battery_level)  # Small tolerance for feasibility
+                #model.addConstr(battery_t[i] >= 0.1)  # Small tolerance for feasibility
 
             
             

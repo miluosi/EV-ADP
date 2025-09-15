@@ -462,7 +462,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Environment state
         self.current_time = 0
-        self.episode_length = 200  # Increased episode length for more complex scenarios
+        self.episode_length = 100  # Increased episode length for more complex scenarios
         
         # Request system
         self.active_requests = {}  # Active passenger requests
@@ -1217,7 +1217,10 @@ class ChargingIntegratedEnvironment(Environment):
                     available_requests = []
                     if hasattr(self, 'active_requests') and self.active_requests:
                         available_requests = list(self.active_requests.values())
-                    rebalancing_assignments = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests)
+                    charging_stations = []
+                    charging_stations = [station for station in self.charging_manager.stations.values() 
+                               if station.available_slots > 0]
+                    rebalancing_assignments = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests, charging_stations)
                 
                 # Debug: Count assignments made
                 new_assignments = 0

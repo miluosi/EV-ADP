@@ -44,7 +44,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 20  # Doubled vehicles for more interaction
+    num_vehicles = 10  # Doubled vehicles for more interaction
     num_stations = 6
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
@@ -201,7 +201,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         episode_stats = env.get_episode_stats()
         episode_stats['episode_number'] = episode + 1
         episode_stats['episode_reward'] = episode_reward
-        episode_stats['charging_events_count'] = len(episode_charging_events)/env.episode_length  # Average per step
+        episode_stats['charging_events_count'] = len(episode_charging_events)
         
         # Output rebalancing assignment statistics
         rebalancing_calls = episode_stats.get('total_rebalancing_calls', 0)
