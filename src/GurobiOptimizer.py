@@ -593,7 +593,7 @@ class GurobiOptimizer:
                         station_x = station.location % self.env.grid_size
                         station_y = station.location // self.env.grid_size
                         travel_distance = abs(vehicle['coordinates'][0] - station_x) + abs(vehicle['coordinates'][1] - station_y)
-                        #battery_loss += travel_distance * battery_consum * charge_decision[i, j]
+                        battery_loss += travel_distance * battery_consum * charge_decision[i, j]
                         battery_increase +=  self.env.chargeincrease_whole*charge_decision[i, j]
                 
                 # Battery consumption from service requests (travel to pickup + pickup to dropoff)
@@ -729,7 +729,7 @@ class GurobiOptimizer:
                 # 将神经网络预测的Q值加权到目标函数中
                 adp_weight = getattr(self.env, 'adp_value', 1.0)
                 objective_terms += idle_q_value * adp_weight * idle_vehicle[i]
-
+                objective_terms += -10 * waiting_vehicle[i]  # Small penalty for waiting to encourage action
 
             # Penalty for unserved requests
             unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)

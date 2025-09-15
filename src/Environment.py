@@ -1129,10 +1129,10 @@ class ChargingIntegratedEnvironment(Environment):
         self._update_environment()
         batterypenaltyv = self._check_dead_battery_vehicles()
 
-        # 将电池耗尽惩罚合并到主奖励中
-        for vehicle_id in batterypenaltyv:
-            if vehicle_id in rewards:
-                rewards[vehicle_id] -= 50.0
+        # # 将电池耗尽惩罚合并到主奖励中
+        # for vehicle_id in batterypenaltyv:
+        #     if vehicle_id in rewards:
+        #         rewards[vehicle_id] -= 50.0
 
 
         # 集成Gurobi优化和Q-learning更新
