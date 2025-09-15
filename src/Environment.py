@@ -41,7 +41,7 @@ class Environment(metaclass=ABCMeta):
         self.charging_penalty = 0.2
         self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
         self.min_battery_level = 0.1
-        self.complete_ratio_reward = 0.25
+        self.complete_ratio_reward = 0.5
         # Q-learning components for ADP integration
         self.q_table = {}  # Q-table for state-action values
         self.learning_rate = 0.1
@@ -427,7 +427,7 @@ class ChargingIntegratedEnvironment(Environment):
     Integrated charging environment class, inheriting from src.Environment
     """
 
-    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True, assignmentgurobi=True):  # Increased grid size
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=12, use_intense_requests=True, assignmentgurobi=True):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -462,7 +462,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Environment state
         self.current_time = 0
-        self.episode_length = 50  # Increased episode length for more complex scenarios
+        self.episode_length = 200  # Increased episode length for more complex scenarios
         
         # Request system
         self.active_requests = {}  # Active passenger requests
@@ -471,7 +471,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_counter = 0
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
-        self.battery_consum = 0.003  # Battery consumption per epoch when moving
+        self.battery_consum = 0.001  # Battery consumption per epoch when moving
         # Assignment tracking for rebalancing analysis
         self.rebalancing_assignments_per_step = []  # Store assignments count per step
         self.total_rebalancing_calls = 0
@@ -503,10 +503,11 @@ class ChargingIntegratedEnvironment(Environment):
             other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
             num_requests = len(self.active_requests)
             
-            # 获取请求的价值信息
+            # 获取请求的价值信息 - 使用final_value确保与奖励一致
             request_value = 0.0
             if target_id in self.active_requests:
-                request_value = self.active_requests[target_id].value
+                # 使用final_value而不是value，确保与实际奖励计算一致
+                request_value = self.active_requests[target_id].final_value
             
             return self.value_function.get_assignment_q_value(
                 vehicle_id, target_id, vehicle_location, target_location, 
@@ -716,8 +717,8 @@ class ChargingIntegratedEnvironment(Environment):
                 travel_time = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
                 
                 # Create request with dynamic pricing based on demand
-                base_value = 20
-                distance_value = travel_time * (2 + np.random.rand()*0.1)
+                base_value = 10
+                distance_value = travel_time * (3 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
                 final_value = base_value * surge_factor + distance_value
                 
@@ -758,11 +759,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.8:
-                num_requests = random.randint(10, 15)
+                num_requests = random.randint(5, 10)
             elif rand_val < 0.95:
-                num_requests = random.randint(15, 20)
+                num_requests = random.randint(11, 15)
             else:
-                num_requests = random.randint(20, 25)
+                num_requests = random.randint(16, 20)
 
             # Define 3 hotspot centers in the grid
             hotspots = [
@@ -773,8 +774,8 @@ class ChargingIntegratedEnvironment(Environment):
             ]
             
             # Probability weights for each hotspot (should sum to 1.0)
-            probability_weights = [0.4, 0.1, 0.3, 0.2]  # 40%, 10%, 20%, 30%
-
+            probability_weights = [0.25, 0.25, 0.25, 0.25]  # 25% for each hotspot
+            selected_hotspot_idx_reward = [50, 10, 50, 10]  # Reward weights for each hotspot
             for _ in range(num_requests):
                 self.request_counter += 1
                 
@@ -827,7 +828,7 @@ class ChargingIntegratedEnvironment(Environment):
                                             dropoff_hotspot[0] + random.randint(-hotspot_radius, hotspot_radius)))
                         dropoff_y = max(0, min(self.grid_size - 1, 
                                             dropoff_hotspot[1] + random.randint(-hotspot_radius, hotspot_radius)))
-                        random_shift = random.randint(-3, 3)
+                        random_shift = random.randint(-self.grid_size // 2, self.grid_size // 2)
                         dropoff_x = max(0, min(self.grid_size - 1, dropoff_x + random_shift))
                         dropoff_y = max(0, min(self.grid_size - 1, dropoff_y + random_shift))
                 
@@ -850,7 +851,7 @@ class ChargingIntegratedEnvironment(Environment):
                 base_value = 20
                 distance_value = travel_time * (2 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
-                final_value = base_value * surge_factor + distance_value
+                final_value = base_value * surge_factor + distance_value + selected_hotspot_idx_reward[selected_hotspot_idx]
                 
                 request = Request(
                     request_id=self.request_counter,
@@ -858,7 +859,8 @@ class ChargingIntegratedEnvironment(Environment):
                     destination=dropoff_location,
                     current_time=self.current_time,
                     travel_time=travel_time,
-                    value=final_value
+                    value=base_value,
+                    final_value=final_value
                 )
                 
                 self.active_requests[self.request_counter] = request
@@ -1001,7 +1003,7 @@ class ChargingIntegratedEnvironment(Environment):
                 self.completed_requests.append(completed_request)
                 
                 # Calculate earnings
-                earnings = completed_request.value/self.complete_ratio_reward
+                earnings = completed_request.final_value
                 vehicle['passenger_onboard'] = None
                 
                 return earnings
@@ -1345,7 +1347,7 @@ class ChargingIntegratedEnvironment(Environment):
                     action_type = "move"
                     target_location = current_location
                 
-                # Store experience for neural network training (if neural network exists)
+                # Store experience for neural network training with type filtering
                 if (self.value_function and 
                     hasattr(self.value_function, 'store_experience')):
                     other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
@@ -1366,40 +1368,11 @@ class ChargingIntegratedEnvironment(Environment):
                                 request_value = req.fare
                                 break
                     
-                    # Store different experience types based on action
-                    if action_type == "idle":
-                        # Use specialized idle experience storage if available
-                        if hasattr(self.value_function, 'store_idle_experience'):
-                            self.value_function.store_idle_experience(
-                                vehicle_id=vehicle_id,
-                                vehicle_location=current_location,
-                                battery_level=current_battery,
-                                current_time=self.current_time,
-                                reward=reward,
-                                next_vehicle_location=next_location,
-                                next_battery_level=next_battery,
-                                other_vehicles=other_vehicles,
-                                num_requests=num_requests,
-                                request_value=request_value  # idle时为0.0
-                            )
-                        else:
-                            # Fall back to general experience storage
-                            self.value_function.store_experience(
-                                vehicle_id=vehicle_id,
-                                action_type=action_type,
-                                vehicle_location=current_location,
-                                target_location=target_location,
-                                current_time=self.current_time,
-                                reward=reward,
-                                next_vehicle_location=next_location,
-                                battery_level=current_battery,
-                                next_battery_level=next_battery,
-                                other_vehicles=other_vehicles,
-                                num_requests=num_requests,
-                                request_value=request_value  # idle时为0.0
-                            )
-                    else:
-                        # For non-idle actions, use general experience storage with battery and request value info
+                    # 只存储关键决策点的experience
+                    should_store = self._should_store_experience(action_type, reward, current_battery)
+                    
+                    if should_store:
+                        # Store experience using general method
                         self.value_function.store_experience(
                             vehicle_id=vehicle_id,
                             action_type=action_type,
@@ -1412,7 +1385,7 @@ class ChargingIntegratedEnvironment(Environment):
                             next_battery_level=next_battery,
                             other_vehicles=other_vehicles,
                             num_requests=num_requests,
-                            request_value=request_value  # assign时为实际请求价值，其他时为0.0
+                            request_value=request_value
                         )
                 
                 # Also update traditional Q-table for consistency
@@ -1480,7 +1453,7 @@ class ChargingIntegratedEnvironment(Environment):
                 if self._assign_request_to_vehicle(vehicle_id, action.request_id):
                     if action.request_id in self.active_requests:
                         request = self.active_requests[action.request_id]
-                        reward = request.value*(1 - self.complete_ratio_reward) + np.random.normal(0, 0.2)
+                        reward = np.random.normal(0, 0.1)  # Request not found
                     else:
                         reward = np.random.normal(0, 0.1)  # Request not found
                 else:
@@ -1589,6 +1562,41 @@ class ChargingIntegratedEnvironment(Environment):
                 reward = -0.2 - np.random.normal(0, 0.05)
 
         return reward
+    
+    def _should_store_experience(self, action_type: str, reward: float, battery_level: float) -> bool:
+        """
+        决定是否存储experience，只存储关键决策点：
+        1. 完成订单的experience（reward >= 15）
+        2. 充电决策的experience（低电量情况）
+        3. idle决策的experience（空闲移动决策）
+        排除pickup/dropoff执行过程中的中间experience
+        """
+        # 1. 完成订单的experience（最高优先级）
+        if reward >= 15:
+            #print(f"✓ Storing COMPLETED ORDER experience: reward={reward}")
+            return True
+        
+        # 2. 充电决策experience（电池管理的关键决策）
+        if action_type.startswith('charge') and battery_level < 0.5:
+            #print(f"✓ Storing CHARGING decision experience: battery={battery_level}")
+            return True
+        
+        # 3. Idle决策experience（空闲状态的移动决策）
+        if action_type == 'idle':
+            return True  # 所有idle决策都存储
+        
+        # 4. 初始assignment决策（只存储决策时刻，不存储执行过程）
+        if action_type.startswith('assign'):
+            # 只存储真正的分配决策时刻或失败的分配
+            if reward > 0 or reward <= -10:  # 成功分配或严重失败
+                #print(f"✓ Storing assignment decision: reward={reward}")
+                return True
+            else:
+                # 排除pickup/dropoff执行过程中的中间状态
+                return False
+        
+        # 5. 其他情况不存储
+        return False
     
     def _execute_movement_towards_target(self, vehicle_id):
         """Execute intelligent movement towards target (pickup/dropoff/charging)"""
@@ -1899,11 +1907,16 @@ class ChargingIntegratedEnvironment(Environment):
             if self.vehicles[vehicle_id]['assigned_request'] and self.vehicles[vehicle_id]['assigned_request'] in expired_requests:
                 vehicle['assigned_request'] = None  # Clear assigned request if it expired
             if self.vehicles[vehicle_id]['passenger_onboard'] and self.vehicles[vehicle_id]['battery'] <= self.min_battery_level:
-                vehicle['passenger_onboard'] = None  
-                vehicle['reward'] -= self.penalty_for_passenger_stranding
-                request = self.active_requests.get(vehicle['passenger_onboard'])
+                # Handle passenger stranding due to low battery
                 request_id = vehicle['passenger_onboard']
-                self.active_requests.pop(request_id, None)
+                vehicle['passenger_onboard'] = None  
+                # Add to unserved penalty instead of trying to modify non-existent reward field
+                vehicle['unserved_penalty'] += self.penalty_for_passenger_stranding
+                # Remove the stranded passenger's request from active requests
+                if request_id in self.active_requests:
+                    request = self.active_requests[request_id]
+                    self.rejected_requests.append(request)
+                    del self.active_requests[request_id]
 
             
     def reset(self):

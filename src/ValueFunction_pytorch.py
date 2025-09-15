@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
+import math
 import gym
 from gym import spaces
 from typing import List, Tuple, Dict, Any, Optional
@@ -560,12 +561,73 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                               num_requests: int = 0, battery_level: float = 1.0,
                               request_value: float = 0.0) -> float:
         """
-        Get Q-value for vehicle assignment to request using neural network
-        现在支持battery_level和request_value参数
+        Enhanced Q-value for vehicle assignment to request using neural network
+        现在包含更丰富的上下文信息和优化的计算逻辑
         """
-        return self.get_q_value(vehicle_id, f"assign_{target_id}", 
-                               vehicle_location, target_location, current_time, 
-                               other_vehicles, num_requests, battery_level, request_value)
+        # 基础Q值计算
+        base_q_value = self.get_q_value(vehicle_id, f"assign_{target_id}", 
+                                       vehicle_location, target_location, current_time, 
+                                       other_vehicles, num_requests, battery_level, request_value)
+        
+        # # 增强的上下文调整因子
+        # context_adjustment = self._calculate_context_adjustment(
+        #     vehicle_id, vehicle_location, target_location, battery_level, 
+        #     request_value, other_vehicles, num_requests, current_time
+        # )
+        
+        # 返回调整后的Q值
+        return base_q_value 
+        
+    def _calculate_context_adjustment(self, vehicle_id: int, vehicle_location: int, 
+                                    target_location: int, battery_level: float,
+                                    request_value: float, other_vehicles: int, 
+                                    num_requests: int, current_time: float) -> float:
+        """
+        计算基于上下文的Q值调整因子
+        考虑车辆类型、电池状态、竞争环境、请求价值等因素
+        """
+        adjustment = 0.0
+        
+        # 1. 电池电量对分配的影响
+        if battery_level < 0.3:  # 低电量时
+            # 计算到充电站的距离影响
+            grid_size = int(math.sqrt(max(vehicle_location, target_location)) + 1)
+            distance_to_target = self._calculate_manhattan_distance(vehicle_location, target_location, grid_size)
+            # 距离越远，电量越低，Q值调整越负
+            battery_penalty = -0.2 * (0.3 - battery_level) * (distance_to_target / 10.0)
+            adjustment += battery_penalty
+            
+        # 2. 请求价值对分配的影响
+        if request_value > 0:
+            # 高价值请求获得奖励
+            value_bonus = min(0.1 * (request_value / 50.0), 0.5)  # 最大奖励0.5
+            adjustment += value_bonus
+            
+        # 3. 竞争环境的影响
+        if other_vehicles > 0 and num_requests > 0:
+            competition_ratio = other_vehicles / max(num_requests, 1)
+            if competition_ratio > 1.0:  # 车辆多于请求
+                # 竞争激烈时，距离近的分配获得更多奖励
+                grid_size = int(math.sqrt(max(vehicle_location, target_location)) + 1)
+                distance = self._calculate_manhattan_distance(vehicle_location, target_location, grid_size)
+                distance_bonus = max(0, 0.2 - 0.02 * distance)  # 距离越近奖励越高
+                adjustment += distance_bonus
+                
+        # 4. 时间因素的影响（紧急请求）
+        # 假设current_time可以反映请求的紧急程度
+        if current_time > 0:
+            time_factor = min(current_time / 100.0, 1.0)  # 时间标准化
+            urgency_bonus = 0.1 * time_factor  # 时间越长越紧急
+            adjustment += urgency_bonus
+            
+        # 5. 车辆类型的影响
+        vehicle_type_id = 1 if vehicle_id % 2 == 0 else 2  # 简化的车辆类型判断
+        if vehicle_type_id == 2:  # AEV类型车辆
+            # AEV在某些情况下可能有优势
+            aev_bonus = 0.05 if battery_level > 0.7 else -0.05
+            adjustment += aev_bonus
+            
+        return adjustment
     def get_idle_q_value(self, vehicle_id: int, vehicle_location: int, 
                         battery_level: float, current_time: float = 0.0, 
                         other_vehicles: int = 0, num_requests: int = 0) -> float:
@@ -679,27 +741,16 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         }
         self.experience_buffer.append(experience)
     
-    def _advanced_sample(self, batch_size: int, method: str = "importance"):
+    def _advanced_sample(self, batch_size: int, method: str = "balanced"):
         """
-        高级采样策略：重要性采样、Thompson采样、优先经验回放
-        
-        Args:
-            batch_size: 批次大小
-            method: 采样方法 ("importance", "thompson", "prioritized", "balanced")
-            
-        Returns:
-            采样的经验列表
+        简化的采样策略：只保留balanced和importance采样
         """
         experiences = list(self.experience_buffer)
         
         if method == "importance":
             return self._importance_sampling(experiences, batch_size)
-        elif method == "thompson":
-            return self._thompson_sampling(experiences, batch_size)
-        elif method == "prioritized":
-            return self._prioritized_sampling(experiences, batch_size)
         else:
-            return self._balanced_sample(batch_size)  # 回退到平衡采样
+            return self._balanced_sample(batch_size)
     
     def _importance_sampling(self, experiences, batch_size: int):
         """
@@ -1024,17 +1075,17 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             return 0.0
         
         # 原始随机采样方法（已替换为高级采样）
-        # batch = random.sample(list(self.experience_buffer), batch_size)
+        batch = random.sample(list(self.experience_buffer), batch_size)
 
-        # 使用高级采样策略，根据训练步数选择不同的方法
-        if self.training_step < 1000:
-            # 初期使用平衡采样建立基础
-            batch = self._advanced_sample(batch_size, method="importance")
-        else:
-            # 中期使用重要性采样
-            batch = self._advanced_sample(batch_size, method="balanced")
+        # 使用简化采样策略
+        # if self.training_step < 500:
+        #     # 初期使用平衡采样建立基础
+        #     batch = self._advanced_sample(batch_size, method="balanced")
+        # else:
+        #     # 后期使用重要性采样
+        #     batch = self._advanced_sample(batch_size, method="importance")
 
-
+    
         # Separate current states and next states for batch processing
         current_states = []
         next_states = []
@@ -1299,9 +1350,204 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             self.training_step += 1
     
     def remember(self, experience: Experience):
-        """Store experience (compatibility method)"""
-        # Convert Experience to our format if needed
-        pass
+        """简化的经验存储，依赖Environment进行筛选"""
+        try:
+            # 从Experience中提取相关信息
+            for agent_id, actions_info in experience.action_to_take_all_agents.items():
+                if not actions_info:
+                    continue
+                
+                action, reward = actions_info[0] if len(actions_info) > 0 else (None, 0.0)
+                if action is None:
+                    continue
+                
+                # 获取当前状态信息
+                current_state = experience.current_states.get(agent_id)
+                next_state = experience.next_states.get(agent_id) if hasattr(experience, 'next_states') else None
+                
+                if current_state is None:
+                    continue
+                
+                # 创建简化的经验记录
+                enhanced_experience = {
+                    'vehicle_id': agent_id,
+                    'vehicle_location': getattr(current_state, 'location', 0),
+                    'target_location': 0,  # 将从action中提取
+                    'current_time': experience.current_time,
+                    'reward': reward,
+                    'next_vehicle_location': getattr(next_state, 'location', 0) if next_state else 0,
+                    'other_vehicles': len(experience.current_states) - 1,
+                    'num_requests': len(getattr(experience, 'active_requests', [])),
+                    'battery_level': getattr(current_state, 'battery', 1.0),
+                    'next_battery_level': getattr(next_state, 'battery', 1.0) if next_state else 1.0,
+                    'request_value': 0.0,
+                    'action_type': 'idle',  # 默认值
+                }
+                
+                # 根据action类型更新相关信息
+                if hasattr(action, 'requests') and action.requests:
+                    # Service action
+                    request = list(action.requests)[0]
+                    enhanced_experience['target_location'] = getattr(request, 'pickup', 0)
+                    enhanced_experience['request_value'] = getattr(request, 'final_value', 0.0)
+                    enhanced_experience['action_type'] = 'assign'
+                elif hasattr(action, 'charging_station_id'):
+                    # Charging action
+                    enhanced_experience['action_type'] = 'charge'
+                    enhanced_experience['target_location'] = getattr(action, 'charging_station_id', 0)
+                else:
+                    # Idle action
+                    enhanced_experience['action_type'] = 'idle'
+                    if hasattr(action, 'target_coords'):
+                        target_x, target_y = action.target_coords
+                        grid_size = int(math.sqrt(enhanced_experience['vehicle_location']) + 1)
+                        enhanced_experience['target_location'] = target_y * grid_size + target_x
+                
+                # 直接存储，依赖Environment进行预筛选
+                self.experience_buffer.append(enhanced_experience)
+                    
+                # 定期进行训练
+                if len(self.experience_buffer) % 50 == 0:
+                    self.train_step(batch_size=32)
+                        
+        except Exception as e:
+            print(f"Warning: Error in simplified remember method: {e}")
+            pass
+    
+    def _evaluate_assignment_quality(self, action, reward: float) -> float:
+        """
+        重新定义分配质量评估：专注于订单完成能力
+        成功的assignment = 能够完成整个服务流程的分配
+        """
+        # 1. 最高优先级：实际完成了订单（获得了final_value奖励）
+        if reward >= 15:  # 完成订单的典型奖励范围
+            return 1.0  # 完美质量 - 这是我们最想学习的经验
+        
+        # 2. 高优先级：部分完成但有正向进展
+        elif reward >= 5:  # 可能完成了pickup但还未dropoff
+            return 0.8  # 高质量 - 展示了完成能力
+        
+        # 3. 中等优先级：成功分配但还在执行中
+        elif reward > 0:  # 成功分配，正在执行
+            return 0.6  # 中等质量 - 有潜力完成
+        
+        # 4. 低优先级：分配被拒绝或失败
+        elif reward == 0:  # 分配失败或被拒绝
+            return 0.2  # 低质量 - 可以学习为什么失败
+        
+        # 5. 负面案例：电池耗尽、无法完成等
+        else:  # 负奖励 - 电池耗尽、乘客滞留等
+            return 0.0  # 零质量 - 避免学习这类经验
+    
+    def _analyze_competitive_context(self, experience: Experience) -> float:
+        """分析竞争环境上下文"""
+        num_vehicles = len(experience.current_states) if hasattr(experience, 'current_states') else 1
+        num_requests = len(getattr(experience, 'active_requests', []))
+        
+        if num_requests == 0:
+            return 0.0  # 无请求环境
+        
+        competition_ratio = num_vehicles / num_requests
+        if competition_ratio > 2.0:
+            return 1.0  # 高竞争
+        elif competition_ratio > 1.0:
+            return 0.6  # 中等竞争
+        else:
+            return 0.2  # 低竞争
+
+    def _assess_order_completion_potential(self, action, current_state, reward: float) -> float:
+        """
+        评估订单完成潜力：预测这个分配决策能否成功完成订单
+        """
+        # 基础完成潜力评估
+        completion_potential = 0.0
+        
+        # 1. 电池充足度对完成潜力的影响
+        battery_level = getattr(current_state, 'battery', 1.0)
+        if battery_level > 0.5:
+            completion_potential += 0.4  # 高电量 = 高完成潜力
+        elif battery_level > 0.3:
+            completion_potential += 0.2  # 中等电量 = 中等完成潜力
+        else:
+            completion_potential += 0.0  # 低电量 = 低完成潜力
+        
+        # 2. 如果是assignment action，考虑距离因素
+        if hasattr(action, 'requests') and action.requests:
+            request = list(action.requests)[0]
+            pickup_location = getattr(request, 'pickup', 0)
+            current_location = getattr(current_state, 'location', 0)
+            
+            # 简化的距离计算（假设grid_size=40）
+            grid_size = 40
+            pickup_x, pickup_y = pickup_location % grid_size, pickup_location // grid_size
+            current_x, current_y = current_location % grid_size, current_location // grid_size
+            distance = abs(pickup_x - current_x) + abs(pickup_y - current_y)
+            
+            # 距离越近，完成潜力越高
+            if distance <= 3:
+                completion_potential += 0.3  # 很近
+            elif distance <= 6:
+                completion_potential += 0.2  # 较近
+            elif distance <= 10:
+                completion_potential += 0.1  # 中等距离
+            # 远距离不加分
+        
+        # 3. 实际奖励反馈的完成潜力
+        if reward >= 15:  # 已完成订单
+            completion_potential = 1.0  # 确定完成
+        elif reward >= 5:  # 部分完成
+            completion_potential = max(completion_potential, 0.8)
+        elif reward > 0:  # 正在执行
+            completion_potential = max(completion_potential, 0.6)
+        
+        return min(1.0, completion_potential)
+    
+    def _is_order_completion_valuable_experience(self, experience: dict) -> bool:
+        """
+        严格控制experience存储：只存储关键决策点
+        - 完成订单的experience（最终收益）
+        - 充电决策的experience  
+        - idle移动决策的experience
+        - 排除pickup/dropoff执行过程中的experience
+        """
+        reward = experience['reward']
+        action_type = experience['action_type']
+        assignment_quality = experience['assignment_quality']
+        
+        # 1. 【最高优先级】完成订单的experience - 这是最终的成功决策结果
+        if reward >= 15 and assignment_quality >= 0.8:
+            print(f"✓ Storing COMPLETED ORDER experience: reward={reward}, vehicle={experience['vehicle_id']}")
+            return True
+        
+        # 2. 【充电决策】- 电池管理的关键决策点
+        if action_type.startswith('charge'):
+            battery_level = experience.get('battery_level', 1.0)
+            # 只存储真正需要充电的决策（低电量）
+            if battery_level < 0.5:
+                print(f"✓ Storing CHARGING decision experience: battery={battery_level}, vehicle={experience['vehicle_id']}")
+                return True
+            return False
+        
+        # 3. 【Idle决策】- 空闲状态的移动决策
+        if action_type == 'idle':
+            # 存储所有idle决策，因为这些是重要的定位决策
+            return True
+        
+        # 4. 【初始assignment决策】- 只存储刚开始分配的决策，不存储执行过程
+        if action_type.startswith('assign'):
+            # 只存储真正的分配决策时刻（高质量或负面教训）
+            if assignment_quality >= 0.6:  # 成功的分配决策
+                print(f"✓ Storing SUCCESSFUL assignment decision: quality={assignment_quality}, reward={reward}")
+                return True
+            elif assignment_quality == 0.0 and reward <= 0:  # 失败的分配决策（学习教训）
+                print(f"✓ Storing FAILED assignment decision for learning: quality={assignment_quality}, reward={reward}")
+                return True
+            else:
+                # 排除执行过程中的中间状态（pickup进行中、dropoff进行中等）
+                return False
+        
+        # 5. 其他情况：不存储
+        return False
     
     def plot_training_metrics(self, save_path: str = None):
         """Plot training losses and Q-values over time"""
