@@ -512,7 +512,7 @@ class GurobiOptimizer:
             
             # Filter out rejected requests for each EV
             valid_assignments = {}  # (vehicle_id, request_idx) -> is_valid
-            
+
             for i, vehicle_id in enumerate(vehicle_ids):
                 vehicle = self.env.vehicles[vehicle_id]
                 for j, request in enumerate(available_requests):
@@ -560,8 +560,7 @@ class GurobiOptimizer:
                 # t battery level (decision variable)
                 battery_t[i] = model.addVar(
                     vtype=self.GRB.CONTINUOUS,
-                    lb=0,  # Minimum battery constraint
-                    ub=1.0,                # Maximum battery is 100%
+
                     name=f'battery_t_{vehicle_id}'
                 )
             
@@ -595,7 +594,7 @@ class GurobiOptimizer:
                         station_y = station.location // self.env.grid_size
                         travel_distance = abs(vehicle['coordinates'][0] - station_x) + abs(vehicle['coordinates'][1] - station_y)
                         battery_loss += travel_distance * battery_consum * charge_decision[i, j]
-                        battery_increase += self.env.chargeincrease_whole * charge_decision[i, j]
+                        battery_increase +=  charge_decision[i, j]
                 
                 # Battery consumption from service requests (travel to pickup + pickup to dropoff)
                 if available_requests:
@@ -615,11 +614,11 @@ class GurobiOptimizer:
                         battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
                 
                 # Battery transition constraint (simplified to avoid infeasibility)
-                model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss + battery_increase)
+                model.addConstr(battery_t[i] == battery_t_minus_1[i] + battery_increase)
                 # Ensure vehicle has enough battery for actions (but allow some flexibility)
                 model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
                 # Ensure battery doesn't go below minimum (but allow some flexibility)
-                #model.addConstr(battery_t[i] >= 0.1)  # Small tolerance for feasibility
+                model.addConstr(battery_t[i] >=min_battery_level)  
 
             
             

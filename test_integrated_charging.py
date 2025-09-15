@@ -212,8 +212,8 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         print(f"  Reward: {episode_reward:.2f}")
         print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
         print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
-        print(f"  Station Usage: {episode_stats['avg_vehicles_per_station']:.1f} vehicles/station")
-        print(f"  Rebalancing: {rebalancing_calls} calls, {total_assignments} total assignments, {avg_assignments:.1f} avg assignments/call")
+
+        
         
         # Add neural network Q-value summary
         if use_neural_network:
@@ -646,13 +646,10 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
                     'Average Rejected Orders per Episode',
                     'Overall Rejection Rate (%)',
                     'Average Battery Level',
-                    'Average Vehicles per Station',
-                    'Average Station Utilization Rate (%)',
                     'Total EV Vehicles',
                     'Total AEV Vehicles',
                     'EV Rejection Rate (%)',
                     'AEV Rejection Rate (%)',
-                    'Total Earnings',
                     'Average Neural Network Loss',
                     'Neural Network Loss Std Dev',
                     'Average Training Steps per Episode'
@@ -664,13 +661,10 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
                     df['rejected_orders'].mean(),
                     (df['rejected_orders'].sum() / df['total_orders'].sum() * 100) if df['total_orders'].sum() > 0 else 0,
                     df['avg_battery_level'].mean(),
-                    df['avg_vehicles_per_station'].mean(),
-                    df['station_utilization_rate'].mean() * 100,
                     df['ev_count'].iloc[0] if not df.empty else 0,
                     df['aev_count'].iloc[0] if not df.empty else 0,
                     (df['ev_rejected'].sum() / (df['accepted_orders'].sum() + df['ev_rejected'].sum()) * 100) if (df['accepted_orders'].sum() + df['ev_rejected'].sum()) > 0 else 0,
                     (df['aev_rejected'].sum() / (df['accepted_orders'].sum() + df['aev_rejected'].sum()) * 100) if (df['accepted_orders'].sum() + df['aev_rejected'].sum()) > 0 else 0,
-                    df['total_earnings'].sum(),
                     df['neural_network_loss'].mean() if 'neural_network_loss' in df.columns else 0,
                     df['neural_network_loss_std'].mean() if 'neural_network_loss_std' in df.columns else 0,
                     df['training_steps_in_episode'].mean() if 'training_steps_in_episode' in df.columns else 0
@@ -1026,7 +1020,7 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0,0.1,0.3,0.5,1.0]
+        adplist = [0.1,0.3,0.5,1.0]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")

@@ -14,7 +14,7 @@ class ChargingStation:
     def is_available(self) -> bool:
         """Check if there are available charging slots"""
         return self.available_slots > 0
-
+    
     def add_to_queue(self, vehicle_id: str) -> bool:
         """Add vehicle to charging queue"""
         if vehicle_id not in self.charging_queue and vehicle_id not in self.current_vehicles:
