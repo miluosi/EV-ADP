@@ -1026,7 +1026,7 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0.1,0.3,0.5,1.0]
+        adplist = [0,0.1,0.3,0.5,1.0]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
