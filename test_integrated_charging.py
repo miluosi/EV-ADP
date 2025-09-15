@@ -45,7 +45,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     
     # Create environment with significantly more complexity for better learning
     num_vehicles = 10  # Doubled vehicles for more interaction
-    num_stations = 6
+    num_stations = 10
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
     # Initialize neural network-based ValueFunction for decision making only if needed
@@ -974,7 +974,7 @@ def main():
     env_config = config_manager.get_environment_config()
     
     use_intense_requests = True  # 使用热点请求模式
-
+    
     try:
         # 从配置获取训练参数
         num_episodes = 100

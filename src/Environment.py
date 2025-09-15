@@ -449,9 +449,9 @@ class ChargingIntegratedEnvironment(Environment):
         self.unserved_penalty = 1.5  # Penalty for unserved requests (reduced from 5.0)
         self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
         self.charge_duration = 2
-        self.chargeincrease_per_epoch = 0.4
+        self.chargeincrease_per_epoch = 0.5
         self.chargeincrease_whole = self.chargeincrease_per_epoch * self.charge_duration
-        self.min_battery_level = 0.1
+        self.min_battery_level = 0.2
         self.charge_finished = 0.0
         self.charge_stats = {}
         # Initialize charging station manager
@@ -464,7 +464,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Environment state
         self.current_time = 0
-        self.episode_length = 100  # Increased episode length for more complex scenarios
+        self.episode_length = 50
         
         # Request system
         self.active_requests = {}  # Active passenger requests
@@ -1724,9 +1724,7 @@ class ChargingIntegratedEnvironment(Environment):
     def _execute_movement_towards_charging_station(self, vehicle_id, station_id):
         """Execute movement towards charging station"""
         vehicle = self.vehicles[vehicle_id]
-        
-        if station_id not in self.charging_manager.stations:
-            return -10  # Invalid station penalty
+
             
         station = self.charging_manager.stations[station_id]
         current_location = vehicle['location']  # Use location index, not coordinates[0]
@@ -1752,6 +1750,13 @@ class ChargingIntegratedEnvironment(Environment):
         elif current_y > target_y:
             new_x = current_x
             new_y = current_y - 1
+            distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
+
+            vehicle['coordinates'] = (new_x, new_y)
+            vehicle['location'] = new_y * self.grid_size + new_x
+            vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.0005))
+            vehicle['battery'] = max(0, vehicle['battery'])
+            return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
         else:
             # Already at charging station - try to start charging
             success = station.start_charging(str(vehicle_id))
