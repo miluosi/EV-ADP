@@ -687,11 +687,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.5:
-                num_requests = random.randint(20, 25)
+                num_requests = random.randint(4, 8)
             elif rand_val < 0.8:
-                num_requests = random.randint(25, 30)
+                num_requests = random.randint(8, 10)
             else:
-                num_requests = random.randint(30, 40)
+                num_requests = random.randint(10,12)
             
             for _ in range(num_requests):
                 self.request_counter += 1
@@ -759,11 +759,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.8:
-                num_requests = random.randint(5, 10)
+                num_requests = random.randint(20, 40)
             elif rand_val < 0.95:
-                num_requests = random.randint(11, 15)
+                num_requests = random.randint(40, 60)
             else:
-                num_requests = random.randint(16, 20)
+                num_requests = random.randint(60, 80)
 
             # Define 3 hotspot centers in the grid
             hotspots = [

@@ -44,7 +44,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 10  # Doubled vehicles for more interaction
+    num_vehicles = 20  # Doubled vehicles for more interaction
     num_stations = 6
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
