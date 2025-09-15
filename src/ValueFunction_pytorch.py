@@ -1027,7 +1027,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # batch = random.sample(list(self.experience_buffer), batch_size)
 
         # 使用高级采样策略，根据训练步数选择不同的方法
-        if self.training_step < 2000:
+        if self.training_step < 1000:
             # 初期使用平衡采样建立基础
             batch = self._advanced_sample(batch_size, method="importance")
         else:

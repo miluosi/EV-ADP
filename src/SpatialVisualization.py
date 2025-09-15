@@ -432,25 +432,25 @@ class SpatialVisualization:
             
             # 构建摘要文本
             summary_text = f"""
-性能摘要
-ADP值: {adpvalue}
-需求模式: {demand_pattern}
+Performance Summary
+ADP Value: {adpvalue}
+Demand Pattern: {demand_pattern}
 
-网格大小: {self.grid_size}x{self.grid_size}
-车辆总数: {env.num_vehicles if hasattr(env, 'num_vehicles') else 'N/A'}
-充电站数: {env.num_stations if hasattr(env, 'num_stations') else 'N/A'}
+Grid Size: {self.grid_size}x{self.grid_size}
+Total Vehicles: {env.num_vehicles if hasattr(env, 'num_vehicles') else 'N/A'}
+Charging Stations: {env.num_stations if hasattr(env, 'num_stations') else 'N/A'}
 
-当前活跃请求: {stats.get('active_requests', 'N/A')}
-已完成请求: {stats.get('completed_requests', 'N/A')}
-平均电池电量: {stats.get('average_battery', 0):.2f}
+Active Requests: {stats.get('active_requests', 'N/A')}
+Completed Requests: {stats.get('completed_requests', 'N/A')}
+Average Battery Level: {stats.get('average_battery', 0):.2f}
 
-EV车辆: {sum(1 for v in env.vehicles.values() if v['type'] == 'EV') if hasattr(env, 'vehicles') else 'N/A'}
-AEV车辆: {sum(1 for v in env.vehicles.values() if v['type'] == 'AEV') if hasattr(env, 'vehicles') else 'N/A'}
+EV Vehicles: {sum(1 for v in env.vehicles.values() if v['type'] == 'EV') if hasattr(env, 'vehicles') else 'N/A'}
+AEV Vehicles: {sum(1 for v in env.vehicles.values() if v['type'] == 'AEV') if hasattr(env, 'vehicles') else 'N/A'}
             """
             
             ax.text(0.1, 0.9, summary_text.strip(), transform=ax.transAxes, 
                     fontsize=11, verticalalignment='top', fontfamily='monospace',
                     bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
         except Exception as e:
-            ax.text(0.5, 0.5, f'无法生成性能摘要\n错误: {str(e)}', 
+            ax.text(0.5, 0.5, f'Unable to generate performance summary\nError: {str(e)}', 
                     ha='center', va='center', transform=ax.transAxes)

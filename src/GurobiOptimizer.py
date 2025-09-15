@@ -566,10 +566,7 @@ class GurobiOptimizer:
                 )
             
             
-            
-            # for i in range(len(vehicle_ids)):
-            #     model.addConstr(battery_t[i] >= min_battery_level)
-            # Idle vehicle variables
+
             idle_vehicle = {}
             for i in range(len(vehicle_ids)):
                 idle_vehicle[i] = model.addVar(
@@ -622,7 +619,7 @@ class GurobiOptimizer:
                 # Ensure vehicle has enough battery for actions (but allow some flexibility)
                 model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
                 # Ensure battery doesn't go below minimum (but allow some flexibility)
-                model.addConstr(battery_t[i] >= min_battery_level )  # Small tolerance for feasibility
+                model.addConstr(battery_t[i] >= min_battery_level)  # Small tolerance for feasibility
 
             
             

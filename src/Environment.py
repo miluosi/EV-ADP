@@ -462,7 +462,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Environment state
         self.current_time = 0
-        self.episode_length = 100  # Increased episode length for more complex scenarios
+        self.episode_length = 50  # Increased episode length for more complex scenarios
         
         # Request system
         self.active_requests = {}  # Active passenger requests
@@ -471,11 +471,11 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_counter = 0
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
-        self.battery_consum = 0.001  # Battery consumption per epoch when moving
+        self.battery_consum = 0.003  # Battery consumption per epoch when moving
         # Assignment tracking for rebalancing analysis
         self.rebalancing_assignments_per_step = []  # Store assignments count per step
         self.total_rebalancing_calls = 0
-        
+        self.penalty_for_passenger_stranding = -50  
         # Tracking for visualization
         self.request_generation_history = []  # Track where requests are generated
         self.vehicle_position_history = {}  # Track vehicle movement patterns
@@ -757,12 +757,12 @@ class ChargingIntegratedEnvironment(Environment):
             # Generate between 1 and 10 requests with higher probability for fewer requests
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
-            if rand_val < 0.5:
-                num_requests = random.randint(20, 25)
-            elif rand_val < 0.8:
-                num_requests = random.randint(25, 30)
+            if rand_val < 0.8:
+                num_requests = random.randint(10, 15)
+            elif rand_val < 0.95:
+                num_requests = random.randint(15, 20)
             else:
-                num_requests = random.randint(30, 40)
+                num_requests = random.randint(20, 25)
 
             # Define 3 hotspot centers in the grid
             hotspots = [
@@ -1576,7 +1576,7 @@ class ChargingIntegratedEnvironment(Environment):
                     'time': self.current_time,
                     'action_type': movement_purpose
                 })
-                vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.001))
+                vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.0005))
                 vehicle['battery'] = max(0, vehicle['battery'])
                 
                 # 检查电池是否耗尽，如果是则标记为需要紧急处理
@@ -1673,7 +1673,7 @@ class ChargingIntegratedEnvironment(Environment):
         })
         
         # Movement consumes battery
-        vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.001))
+        vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.0005))
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # 检查电池是否耗尽，如果是则标记为需要紧急处理
@@ -1766,7 +1766,7 @@ class ChargingIntegratedEnvironment(Environment):
         distance = abs(new_x - old_coords[0]) + abs(new_y - old_coords[1])
         
         # Movement consumes battery
-        vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.001))
+        vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.0005))
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # 检查电池是否耗尽，如果是则标记为需要紧急处理
@@ -1825,7 +1825,7 @@ class ChargingIntegratedEnvironment(Environment):
         })
         
         # Movement consumes battery (same as other movement methods)
-        vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.001))
+        vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.0005))
         vehicle['battery'] = max(0, vehicle['battery'])
         
         # 检查电池是否耗尽，如果是则标记为需要紧急处理
@@ -1895,11 +1895,17 @@ class ChargingIntegratedEnvironment(Environment):
             del self.active_requests[request_id]
         
         # Distribute unserved penalty among all vehicles
-        if unserved_penalty_total > 0 and self.vehicles:
-            penalty_per_vehicle = unserved_penalty_total / len(self.vehicles)
-            for vehicle in self.vehicles.values():
-                vehicle['unserved_penalty'] = vehicle.get('unserved_penalty', 0) + penalty_per_vehicle
-    
+        for vehicle_id, vehicle in self.vehicles.items():
+            if self.vehicles[vehicle_id]['assigned_request'] and self.vehicles[vehicle_id]['assigned_request'] in expired_requests:
+                vehicle['assigned_request'] = None  # Clear assigned request if it expired
+            if self.vehicles[vehicle_id]['passenger_onboard'] and self.vehicles[vehicle_id]['battery'] <= self.min_battery_level:
+                vehicle['passenger_onboard'] = None  
+                vehicle['reward'] -= self.penalty_for_passenger_stranding
+                request = self.active_requests.get(vehicle['passenger_onboard'])
+                request_id = vehicle['passenger_onboard']
+                self.active_requests.pop(request_id, None)
+
+            
     def reset(self):
         """重置环境"""
         self.current_time = 0
