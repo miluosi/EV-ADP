@@ -444,7 +444,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.grid_size = grid_size
         self.minimum_charging_level = 0.2  # Minimum battery level before needing to charge
         # Parameters for reward alignment with Gurobi optimization
-        self.charging_penalty = 5.0  # Penalty for charging action (reduced from 10.0)
+        self.charging_penalty = 3  # Penalty for charging action (reduced from 10.0)
         self.adp_value = 1.0  # Weight for Q-value contribution
         self.unserved_penalty = 1.5  # Penalty for unserved requests (reduced from 5.0)
         self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
@@ -458,13 +458,17 @@ class ChargingIntegratedEnvironment(Environment):
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
         self.unserve_penalty = -100  # Penalty for unserved requests
+        self.movingpenalty = -1e-2
         # Vehicle states
+        self.rebalance_battery_threshold = 0.5
         self.vehicles = {}
+        
+        
         self._setup_vehicles()
         
         # Environment state
         self.current_time = 0
-        self.episode_length = 50
+        self.episode_length = 200
         
         # Request system
         self.active_requests = {}  # Active passenger requests
@@ -473,7 +477,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_counter = 0
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
-        self.battery_consum = 0.01  # Battery consumption per epoch when moving
+        self.battery_consum = 0.001  # Battery consumption per epoch when moving
         # Assignment tracking for rebalancing analysis
         self.rebalancing_assignments_per_step = []  # Store assignments count per step
         self.total_rebalancing_calls = 0
@@ -508,8 +512,8 @@ class ChargingIntegratedEnvironment(Environment):
             # 获取请求的价值信息 - 使用final_value确保与奖励一致
             request_value = 0.0
             if target_id in self.active_requests:
-                # 使用final_value而不是value，确保与实际奖励计算一致
-                request_value = self.active_requests[target_id].final_value
+                # 使用value而不是final_value，确保与实际奖励计算一致
+                request_value = self.active_requests[target_id].value
             
             return self.value_function.get_assignment_q_value(
                 vehicle_id, target_id, vehicle_location, target_location, 
@@ -761,11 +765,11 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.8:
-                num_requests = random.randint(20, 40)
+                num_requests = random.randint(8, 12)
             elif rand_val < 0.95:
-                num_requests = random.randint(40, 60)
+                num_requests = random.randint(12, 24)
             else:
-                num_requests = random.randint(60, 80)
+                num_requests = random.randint(24, 32)
 
             # Define 3 hotspot centers in the grid
             hotspots = [
@@ -776,8 +780,8 @@ class ChargingIntegratedEnvironment(Environment):
             ]
             
             # Probability weights for each hotspot (should sum to 1.0)
-            probability_weights = [0.25, 0.25, 0.25, 0.25]  # 25% for each hotspot
-            selected_hotspot_idx_reward = [50, 10, 50, 10]  # Reward weights for each hotspot
+            probability_weights = [0.4, 0.1, 0.1, 0.4]  # 25% for each hotspot
+            selected_hotspot_idx_reward = [25, 5, 5, 25]  # Reward weights for each hotspot
             for _ in range(num_requests):
                 self.request_counter += 1
                 
@@ -801,38 +805,28 @@ class ChargingIntegratedEnvironment(Environment):
                                     hotspot_center[1] + random.randint(-hotspot_radius, hotspot_radius)))
                 pickup_location = pickup_y * self.grid_size + pickup_x
                 
-                if selected_hotspot_idx<2:
+                available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
+                if available_hotspot_indices:
+                    # Get weights for available hotspots and normalize them
+                    available_weights = [probability_weights[i] for i in available_hotspot_indices]
+                    total_weight = sum(available_weights)
+                    normalized_weights = [w / total_weight for w in available_weights]
+                    
+                    # Select dropoff hotspot based on normalized weights
+                    rand_val = random.random()
+                    cumulative_prob = 0
+                    selected_dropoff_idx = 0
+                    for i, weight in enumerate(normalized_weights):
+                        cumulative_prob += weight
+                        if rand_val <= cumulative_prob:
+                            selected_dropoff_idx = available_hotspot_indices[i]
+                            break
+                    
                     dropoff_hotspot = hotspots[selected_hotspot_idx]
                     dropoff_x = max(0, min(self.grid_size - 1, 
                                         dropoff_hotspot[0] + random.randint(-hotspot_radius, hotspot_radius)))
                     dropoff_y = max(0, min(self.grid_size - 1, 
                                         dropoff_hotspot[1] + random.randint(-hotspot_radius, hotspot_radius)))
-                else:
-                    available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
-                    if available_hotspot_indices:
-                        # Get weights for available hotspots and normalize them
-                        available_weights = [probability_weights[i] for i in available_hotspot_indices]
-                        total_weight = sum(available_weights)
-                        normalized_weights = [w / total_weight for w in available_weights]
-                        
-                        # Select dropoff hotspot based on normalized weights
-                        rand_val = random.random()
-                        cumulative_prob = 0
-                        selected_dropoff_idx = 0
-                        for i, weight in enumerate(normalized_weights):
-                            cumulative_prob += weight
-                            if rand_val <= cumulative_prob:
-                                selected_dropoff_idx = available_hotspot_indices[i]
-                                break
-                        
-                        dropoff_hotspot = hotspots[selected_dropoff_idx]
-                        dropoff_x = max(0, min(self.grid_size - 1, 
-                                            dropoff_hotspot[0] + random.randint(-hotspot_radius, hotspot_radius)))
-                        dropoff_y = max(0, min(self.grid_size - 1, 
-                                            dropoff_hotspot[1] + random.randint(-hotspot_radius, hotspot_radius)))
-                        random_shift = random.randint(-self.grid_size // 2, self.grid_size // 2)
-                        dropoff_x = max(0, min(self.grid_size - 1, dropoff_x + random_shift))
-                        dropoff_y = max(0, min(self.grid_size - 1, dropoff_y + random_shift))
                 
                 dropoff_location = dropoff_y * self.grid_size + dropoff_x
                 
@@ -1200,7 +1194,7 @@ class ChargingIntegratedEnvironment(Environment):
                 if (vehicle['assigned_request'] is None and
                     vehicle['passenger_onboard'] is None and
                     vehicle['charging_station'] is None and
-                    vehicle.get('idle_target') is None ) or (vehicle['battery'] <= self.min_battery_level+1e-3) or vehicle['is_stationary']:
+                    vehicle.get('idle_target') is None ) or (vehicle['battery'] <= self.rebalance_battery_threshold+1e+3) or vehicle['is_stationary']:
                     vehicles_to_rebalance.append(vehicle_id)
 
             if vehicles_to_rebalance:
@@ -1465,12 +1459,10 @@ class ChargingIntegratedEnvironment(Environment):
             elif vehicle['assigned_request'] is not None:
                 # Progress towards pickup - check if我们能pickup
                 if self._pickup_passenger(vehicle_id):
-                    reward = 1.0 + np.random.normal(0, 0.2)
+                    reward = 0.5 + np.random.normal(0, 0.2)
                 else:
                     # 检查电池是否耗尽
                     if vehicle['battery'] <= 0.0:
-                        # 电池耗尽，无法移动，施加严厉惩罚
-                        reward = -5.0  # 订单失败的严厉惩罚
                         print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法继续前往pickup位置")
                     else:
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
@@ -1481,8 +1473,7 @@ class ChargingIntegratedEnvironment(Environment):
                 else:
                     # 检查电池是否耗尽
                     if vehicle['battery'] <= 0.0:
-                        # 电池耗尽，乘客滞留，施加严厉惩罚
-                        reward = -10.0  # 乘客滞留的更严厉惩罚
+
                         print(f"⚠️  车辆 {vehicle_id} 电池耗尽，乘客滞留无法到达dropoff位置")
                     else:
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
@@ -1561,7 +1552,7 @@ class ChargingIntegratedEnvironment(Environment):
                     vehicle['needs_emergency_charging'] = True
                     print(f"⚠️  车辆 {vehicle_id} 在移动后电池耗尽 (位置: {new_x}, {new_y})")
                 
-                reward = -0.1*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+                reward = self.movingpenalty*distance + np.random.normal(0, 0.05)
             else:
                 reward = -0.2 - np.random.normal(0, 0.05)
 
@@ -1694,7 +1685,7 @@ class ChargingIntegratedEnvironment(Environment):
             print(f"⚠️  车辆 {vehicle_id} 在智能移动后电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other movement methods)
-        return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+        return self.movingpenalty*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
     
 
 
@@ -1756,7 +1747,7 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle['location'] = new_y * self.grid_size + new_x
             vehicle['battery'] -= distance * (self.battery_consum + np.abs(np.random.random() * 0.0005))
             vehicle['battery'] = max(0, vehicle['battery'])
-            return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+            return self.movingpenalty*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
         else:
             # Already at charging station - try to start charging
             success = station.start_charging(str(vehicle_id))
@@ -1772,7 +1763,7 @@ class ChargingIntegratedEnvironment(Environment):
                 charging_penalty = getattr(self, 'charging_penalty', 2.0)
                 return -charging_penalty
             else:
-                return -10  # Station full penalty
+                return 0
         
         # Update vehicle position
         new_location_index = new_y * self.grid_size + new_x
@@ -1792,14 +1783,14 @@ class ChargingIntegratedEnvironment(Environment):
             print(f"⚠️  车辆 {vehicle_id} 前往充电站时电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other movement methods)
-        return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+        return self.movingpenalty*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
     
     def _execute_movement_towards_idle(self, vehicle_id, target_coords):
         """Execute movement towards idle target coordinates"""
         vehicle = self.vehicles[vehicle_id]
         
         if vehicle['charging_station'] is not None:
-            return -0.2  # Charging penalty for movement
+            return 0
         
         old_coords = vehicle['coordinates']
         current_x, current_y = old_coords
@@ -1851,7 +1842,7 @@ class ChargingIntegratedEnvironment(Environment):
             #print(f"⚠️  车辆 {vehicle_id} 在闲置移动后电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other methods)
-        return -0.2*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
+        return self.movingpenalty*distance + np.random.normal(0, 0.05) if distance > 0 else -0.05 + np.random.normal(0, 0.02)
     
     def _update_environment(self):
         """Update environment state"""

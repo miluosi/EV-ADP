@@ -45,7 +45,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     
     # Create environment with significantly more complexity for better learning
     num_vehicles = 10  # Doubled vehicles for more interaction
-    num_stations = 10
+    num_stations = 6
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
     # Initialize neural network-based ValueFunction for decision making only if needed
@@ -58,7 +58,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             num_vehicles=num_vehicles,
             device='cuda' if torch.cuda.is_available() else 'cpu',  # Use GPU if available
             episode_length=env.episode_length,  # 传递正确的episode长度
-            max_requests=5000  # 设置合理的最大请求数
+            max_requests=10000  # 设置合理的最大请求数
         )
         # Set the value function in the environment for Q-value calculation
         env.set_value_function(value_function)
@@ -75,7 +75,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     epsilon_decay = (epsilon_start - epsilon_end) / exploration_episodes
     
     # Enhanced training parameters for complex environment
-    training_frequency = 2  # Train every 2 steps for much more frequent learning
+    training_frequency = 10
     warmup_steps = 100     # Increased warmup for complex environment
     
     print(f"✓ Initialized environment with {num_vehicles} vehicles and {num_stations} charging stations")
@@ -1020,7 +1020,7 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0,0.1,0.3,0.5,1.0]
+        adplist = [0.1,0.3,0.5,1.0]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")

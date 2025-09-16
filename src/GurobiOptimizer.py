@@ -2,6 +2,11 @@ from typing import List, Dict
 from .Request import Request
 import random
 import gurobipy as gp
+
+from src.ValueFunction_pytorch import PyTorchChargingValueFunction
+
+
+
 class GurobiOptimizer:
     """Gurobi-based optimization for vehicle assignment and rebalancing"""
     
@@ -14,7 +19,6 @@ class GurobiOptimizer:
             self.gp = gp
             self.GRB = GRB
             self.available = True
-            
             print("✓ Gurobi optimizer available")
         except ImportError:
             print("⚠ Gurobi not available, using heuristic methods")
@@ -729,7 +733,7 @@ class GurobiOptimizer:
                 # 将神经网络预测的Q值加权到目标函数中
                 adp_weight = getattr(self.env, 'adp_value', 1.0)
                 objective_terms += idle_q_value * adp_weight * idle_vehicle[i]
-                objective_terms += -10 * waiting_vehicle[i]  # Small penalty for waiting to encourage action
+                objective_terms += -500 * waiting_vehicle[i]  # Small penalty for waiting to encourage action
 
             # Penalty for unserved requests
             unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)
