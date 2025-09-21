@@ -30,12 +30,14 @@ class ChargingAction(Action):
     charging stations in the environment.
     """
     
-    def __init__(self, requests: Iterable[Request], charging_station_id: int, charging_duration: float = 30.0) -> None:
+    def __init__(self, requests: Iterable[Request], charging_station_id: int, charging_duration: float = 30.0, vehicle_loc: tuple = None, vehicle_battery: float = None) -> None:
         super().__init__(requests)
         self.charging_station_id = charging_station_id
         self.charging_duration = charging_duration  # minutes
         self.action_type = "charging"
-    
+        self.dur_reward = 0
+        self.vehicle_loc = vehicle_loc
+        self.vehicle_battery = vehicle_battery
     def __eq__(self, other):
         if isinstance(other, ChargingAction):
             return (self.requests == other.requests and 
@@ -58,12 +60,14 @@ class ServiceAction(Action):
     """
     A ServiceAction represents accepting and serving a passenger request.
     """
-    
-    def __init__(self, requests: Iterable[Request], request_id: int) -> None:
+
+    def __init__(self, requests: Iterable[Request], request_id: int, vehicle_loc: tuple, vehicle_battery: float) -> None:
         super().__init__(requests)
         self.request_id = request_id
         self.action_type = "service"
-    
+        self.dur_reward = 0
+        self.vehicle_loc = vehicle_loc
+        self.vehicle_battery = vehicle_battery
     def __eq__(self, other):
         if isinstance(other, ServiceAction):
             return (self.requests == other.requests and 
@@ -89,12 +93,14 @@ class IdleAction(Action):
     randomly selected target coordinates when they have no assigned tasks.
     """
     
-    def __init__(self, requests: Iterable[Request], current_coords: tuple, target_coords: tuple) -> None:
+    def __init__(self, requests: Iterable[Request], current_coords: tuple, target_coords: tuple,vehicle_loc=None, vehicle_battery=None) -> None:
         super().__init__(requests)
         self.current_coords = current_coords  # (x, y) current position
         self.target_coords = target_coords    # (x, y) target position
         self.action_type = "idle"
-    
+        self.dur_reward = 0
+        self.vehicle_loc = vehicle_loc
+        self.vehicle_battery = vehicle_battery
     def __eq__(self, other):
         if isinstance(other, IdleAction):
             return (self.requests == other.requests and 
