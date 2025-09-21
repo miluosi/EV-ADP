@@ -231,9 +231,16 @@ class ADPTrainer:
                 
                 # Enhanced training: much more frequent training for better learning (only if using neural network)
                 if use_neural_network and len(value_function.experience_buffer) >= warmup_steps:
-                    # Train more frequently based on our new parameters
+                    # Prefer supervised training using optimizer-induced labels (src_2 style)
                     if step % training_frequency == 0:
-                        training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
+                        try:
+                            training_loss = value_function.train_step_supervised(env)
+                            if training_loss == 0.0:
+                                # Fallback to original DQN step if supervised step produced nothing
+                                training_loss = value_function.train_step(batch_size=batch_size)
+                        except Exception:
+                            training_loss = value_function.train_step(batch_size=batch_size)
+
                         if training_loss > 0:
                             episode_losses.append(training_loss)
                     

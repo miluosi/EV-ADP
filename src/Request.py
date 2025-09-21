@@ -23,7 +23,7 @@ class Request(object):
         self.value = value  # In the deafult case, all requests have equal value
         self.pickup_deadline = current_time + self.MAX_PICKUP_DELAY
         self.dropoff_deadline = current_time + travel_time + self.MAX_DROPOFF_DELAY
-        self.final_value = value  # In the deafult case, all requests have equal value
+        self.final_value = final_value  # 修正：应该使用final_value参数而不是value
     def __deepcopy__(self, memo):
         return self
 
@@ -42,5 +42,5 @@ class Request(object):
             # If the ids are the same, they are equal
             if (self.request_id == other.request_id):
                 return True
-
+        
         return False

@@ -391,8 +391,17 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 vehicle_type=vehicle_type_tensor
             )
             
-            # Return raw Q-value without any normalization
-            return float(q_value.item())
+            # Apply clipping to prevent extreme Q-values that can dominate the objective
+            raw_q_value = float(q_value.item())
+            
+            # Clip Q-values to reasonable range to prevent optimization instability
+            # This ensures Q-values don't overwhelm request values in the objective function
+            clipped_q_value = max(-50.0, min(50.0, raw_q_value))
+            
+            #if abs(raw_q_value - clipped_q_value) > 1e-6:  # Only log if actual clipping occurred
+                #print(f"Q-value clipped: {raw_q_value:.3f} -> {clipped_q_value:.3f} for action {action_type}")
+            
+            return clipped_q_value
     
     def _prepare_network_input(self, vehicle_location: int, target_location: int, 
                               current_time: float, other_vehicles: int, num_requests: int,
@@ -632,24 +641,39 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                         battery_level: float, current_time: float = 0.0, 
                         other_vehicles: int = 0, num_requests: int = 0) -> float:
         """
-        Get Q-value for vehicle idle action using neural network
-        
-        Args:
-            vehicle_id: 车辆ID
-            vehicle_location: 车辆当前位置
-            battery_level: 电池电量 (0-1)
-            current_time: 当前时间
-            other_vehicles: 附近其他车辆数量
-            num_requests: 当前请求数量
-            
-        Returns:
-            float: idle动作的Q值
+        Get Q-value for idle action with random movement
+        Idle action involves moving to a random nearby location, not staying in place
         """
-        # 使用统一的get_q_value方法，保持与其他动作的一致性
+        import random
+        
+        # Convert location index to coordinates for random target generation
+        current_x = vehicle_location % self.grid_size
+        current_y = vehicle_location // self.grid_size
+        
+        # Generate random target coordinates within 2 steps (matching Environment logic)
+        target_x = max(0, min(self.grid_size-1, 
+                                    current_x + random.randint(-1, 1)))
+        target_y = max(0, min(self.grid_size-1, 
+                                    current_y + random.randint(-1, 1)))
+        target_location = target_y * self.grid_size + target_x
+        
+        # Use the generated random target location for Q-value calculation
+        return self.get_q_value(vehicle_id, "idle", vehicle_location, target_location, 
+                               current_time, other_vehicles, num_requests, battery_level)
+
+    def get_waiting_q_value(self, vehicle_id: int, vehicle_location: int, 
+                        battery_level: float, current_time: float = 0.0, 
+                        other_vehicles: int = 0, num_requests: int = 0) -> float:
+        """
+        Get Q-value for waiting action (staying in place)
+        Unlike idle action, waiting means the vehicle stays at the current location
+        """
+        # For waiting action, target location equals current location (no movement)
         return self.get_q_value(vehicle_id, "idle", vehicle_location, vehicle_location, 
                                current_time, other_vehicles, num_requests, battery_level)
-    
-    
+
+
+
     def get_charging_q_value(self, vehicle_id: int, station_id: int,
                            vehicle_location: int, station_location: int,
                            current_time: float = 0.0, other_vehicles: int = 0,
@@ -1068,8 +1092,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             print(f"     Buffer stats: Pos={total_positive}, Neg={total_negative}, Neutral={total_neutral}")
         
         return sampled_batch
-    
-    def train_step(self, batch_size: int = 64):  # Increased batch size
+
+    def train_step(self, batch_size: int = 64, tau: float = 0.005):  # 软更新系数，推荐0.001~0.01，可调
         """Perform one training step using stored experiences with proper DQN algorithm"""
         if len(self.experience_buffer) < batch_size * 2:  # Wait for more experiences
             return 0.0
@@ -1302,16 +1326,18 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # 修复梯度裁剪：从0.5增加到10.0，避免过度裁剪
         # 原来的0.5太小，导致梯度被严重裁剪，学习能力受限
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=10.0)
+        # torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=10.0)
         self.optimizer.step()
         
         # Update learning rate scheduler based on loss
         self.scheduler.step(loss_value)
         
         # Update target network periodically (key DQN component)
+        
         if self.training_step % self.target_update_frequency == 0:
-            self.target_network.load_state_dict(self.network.state_dict())
-            print(f"🔄 Target network updated at step {self.training_step}")
+            for target_param, param in zip(self.target_network.parameters(), self.network.parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+            print(f"🔄 Target network soft-updated at step {self.training_step} with tau={tau}")
         
         # Record training metrics
         self.training_losses.append(loss_value)
@@ -1335,6 +1361,170 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             print(f"Training step {self.training_step}: Loss={loss_value:.4f}, Q_mean={q_mean:.4f}, Q_std={q_std:.4f}, Q_range=[{q_min:.4f}, {q_max:.4f}], LR={current_lr:.6f}")
             print(f"  Gradient norm: {total_grad_norm:.4f}, No normalization - using raw Q-values")
         
+        return loss_value
+
+    def train_step_supervised(self, env, num_samples: int = 64):
+        """
+        Supervised training: minimize MSE between optimizer-induced option values (labels)
+        and network predictions for the same actions, aligning with src_2's "planner-in-the-loop" idea.
+
+        This does NOT use optimizer to assign vehicles in the environment step; it only calls the
+        optimizer here to get a one-shot assignment to define labels. If optimizer is unavailable,
+        it falls back to a heuristic assignment.
+        """
+        import torch
+        import random
+        from collections import deque
+
+        # Sanity: environment must provide vehicles, requests, and evaluators
+        if env is None or not hasattr(env, 'vehicles'):
+            return 0.0
+
+        # 1) Build a pool of candidate idle vehicles similar to simulate_motion
+        vehicles_to_rebalance = []
+        for vehicle_id, vehicle in env.vehicles.items():
+            if ((vehicle.get('assigned_request') is None and
+                 vehicle.get('passenger_onboard') is None and
+                 vehicle.get('charging_station') is None and
+                 vehicle.get('idle_target') is None) or
+                (vehicle.get('battery', 1.0) <= getattr(env, 'rebalance_battery_threshold', 0.5)) or
+                vehicle.get('is_stationary', False)):
+                vehicles_to_rebalance.append(vehicle_id)
+
+        if not vehicles_to_rebalance:
+            return 0.0
+
+        # 2) Get an assignment mapping using optimizer (preferred) or heuristic fallback
+        assignments = {}
+        try:
+            if not hasattr(env, 'gurobi_optimizer'):
+                from src.GurobiOptimizer import GurobiOptimizer
+                env.gurobi_optimizer = GurobiOptimizer(env)
+            assignments = env.gurobi_optimizer.optimize_vehicle_rebalancing_reject(vehicles_to_rebalance)
+        except Exception:
+            # Heuristic fallback without modifying optimizer implementation
+            try:
+                available_requests = list(getattr(env, 'active_requests', {}).values())
+                charging_stations = [st for st in getattr(env, 'charging_manager').stations.values() if st.available_slots > 0] if hasattr(env, 'charging_manager') else []
+                assignments = env.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests, charging_stations)  # type: ignore
+            except Exception:
+                return 0.0
+
+        if not assignments:
+            return 0.0
+
+        # 3) Build supervised mini-batch from assignments (action -> label)
+        #    Label = env.evaluate_service_option / evaluate_charging_option (option completion value)
+        #    Match the network inputs for those actions
+        inputs_list = []
+        labels_list = []
+
+        # Helper: pack a single sample
+        def _append_sample(vehicle_id: int, action_type: str, veh_loc: int, tgt_loc: int,
+                           current_time: float, battery: float, request_value: float, label: float):
+            # Raw counts for normalization inside helper
+            other_vehicles_raw = max(0, sum(1 for v in env.vehicles.values() if v.get('assigned_request') is None and v.get('passenger_onboard') is None and v.get('charging_station') is None) - 1)
+            num_requests_raw = len(getattr(env, 'active_requests', {}))
+
+            # Prepare full set of inputs with battery/request value; tensors are already normalized as in other code paths
+            path_locations_b, path_delays_b, time_b, others_b, requests_b, battery_b, value_b = self._prepare_network_input_with_battery(
+                veh_loc, tgt_loc, current_time, other_vehicles_raw, num_requests_raw, action_type, battery, request_value
+            )
+            # Package tensors in expected dict form
+            sample = {
+                'path_locations': path_locations_b,
+                'path_delays': path_delays_b,
+                'current_time': time_b,
+                'other_agents': others_b,
+                'num_requests': requests_b,
+                'battery_level': battery_b,
+                'request_value': value_b,
+                'action_type': torch.tensor([[1 if action_type=='idle' else (2 if action_type.startswith('assign') else 3)]], dtype=torch.long, device=self.device),
+                'vehicle_id': torch.tensor([[vehicle_id + 1]], dtype=torch.long, device=self.device),
+                'vehicle_type': torch.tensor([[1 if vehicle_id % 2 == 0 else 2]], dtype=torch.long, device=self.device)
+            }
+            inputs_list.append(sample)
+            labels_list.append(label)
+
+        # Fill samples from assignments
+        for vehicle_id, target in assignments.items():
+            vehicle = env.vehicles.get(vehicle_id)
+            if not vehicle:
+                continue
+            veh_loc = vehicle.get('location', 0)
+            battery = vehicle.get('battery', 1.0)
+
+            # Service assignment
+            if target and hasattr(target, 'pickup') and hasattr(target, 'dropoff'):
+                try:
+                    label_val = env.evaluate_service_option(vehicle_id, target)
+                except Exception:
+                    label_val = 0.0
+                # Use pickup as target_location for the assign action
+                tgt_loc = getattr(target, 'pickup', veh_loc)
+                req_val = getattr(target, 'final_value', getattr(target, 'value', 0.0))
+                _append_sample(vehicle_id, f"assign_{getattr(target, 'request_id', 0)}", veh_loc, tgt_loc, env.current_time, battery, req_val, label_val)
+            # Charging assignment
+            elif target and hasattr(target, 'id') and hasattr(target, 'location'):
+                try:
+                    label_val = env.evaluate_charging_option(vehicle_id, target)
+                except Exception:
+                    label_val = 0.0
+                tgt_loc = getattr(target, 'location', veh_loc)
+                _append_sample(vehicle_id, f"charge_{getattr(target, 'id', 0)}", veh_loc, tgt_loc, env.current_time, battery, 0.0, label_val)
+            else:
+                # Idle/no-op: optionally skip, to focus on meaningful supervised labels
+                continue
+
+        if not inputs_list:
+            return 0.0
+
+        # Downsample to num_samples if necessary
+        if len(inputs_list) > num_samples:
+            idxs = random.sample(range(len(inputs_list)), num_samples)
+            inputs_list = [inputs_list[i] for i in idxs]
+            labels_list = [labels_list[i] for i in idxs]
+
+        # 4) Batch the tensors and train with MSE
+        def _stack(key):
+            return torch.cat([s[key] for s in inputs_list], dim=0)
+
+        self.network.train()
+        preds = self.network(
+            path_locations=_stack('path_locations'),
+            path_delays=_stack('path_delays'),
+            current_time=_stack('current_time'),
+            other_agents=_stack('other_agents'),
+            num_requests=_stack('num_requests'),
+            battery_level=_stack('battery_level'),
+            request_value=_stack('request_value'),
+            action_type=_stack('action_type'),
+            vehicle_id=_stack('vehicle_id'),
+            vehicle_type=_stack('vehicle_type')
+        )
+
+        labels_tensor = torch.tensor(labels_list, dtype=torch.float32, device=self.device).unsqueeze(1)
+        loss = self.loss_fn(preds, labels_tensor)
+
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=10.0)
+        self.optimizer.step()
+
+        loss_value = float(loss.item())
+        self.training_losses.append(loss_value)
+        self.training_step += 1
+
+        # Track Q stats
+        with torch.no_grad():
+            self.q_values_history.append({
+                'mean': preds.mean().item(),
+                'std': preds.std().item(),
+                'max': preds.max().item(),
+                'min': preds.min().item()
+            })
+
         return loss_value
     
     def get_value(self, experiences: List[Experience]) -> List[List[Tuple[Action, float]]]:

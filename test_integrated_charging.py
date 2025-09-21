@@ -44,7 +44,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 10  # Doubled vehicles for more interaction
+    num_vehicles = 12  # Doubled vehicles for more interaction
     num_stations = 6
     env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
     
@@ -131,7 +131,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             next_states, rewards, done, info = env.step(actions)
 
             # Debug: Output step statistics every 100 steps
-            if step % 100 == 0:
+            if step % 50 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
                 assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
@@ -156,9 +156,9 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                         
                         try:
                             # Test different action types - these are the raw Q-values Gurobi uses
-                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, step)
-                            assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, step)
-                            charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, step)
+                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, current_time=step)
+                            assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, current_time=step, battery_level=sample_battery)
+                            charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, current_time=step, battery_level=sample_battery)
                             
                             print(f"  Neural Network Status:")
                             print(f"    Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
@@ -236,9 +236,9 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                     sample_battery = list(env.vehicles.values())[0]['battery'] if env.vehicles else 1.0
                     
                     # Get sample Q-values for statistics
-                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, env.current_time)
-                    assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, env.current_time, battery_level=sample_battery)
-                    charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, env.current_time, battery_level=sample_battery)
+                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, current_time=env.current_time)
+                    assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, current_time=env.current_time, battery_level=sample_battery)
+                    charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, current_time=env.current_time, battery_level=sample_battery)
                     
                     episode_stats['sample_idle_q_value'] = idle_q
                     episode_stats['sample_assign_q_value'] = assign_q
@@ -981,38 +981,38 @@ def main():
         print(f"📊 使用配置参数: episodes={num_episodes}")
         
         batch_size = training_config.get('batch_size', 256)
-        adpvalue = 0
-        assignmentgurobi =False
-        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
+        # adpvalue = 0
+        # assignmentgurobi =False
+        # results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
 
-            # 分析结果
-        analysis = analyze_results(results)
+        #     # 分析结果
+        # analysis = analyze_results(results)
         
-        # 生成可视化
-        success = visualize_integrated_results(env,results, assignmentgurobi=assignmentgurobi)
+        # # 生成可视化
+        # success = visualize_integrated_results(env,results, assignmentgurobi=assignmentgurobi)
         
-        # 空间分布可视化已在Excel导出中生成
-        print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
+        # # 空间分布可视化已在Excel导出中生成
+        # print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
         
-        # 生成传统的空间分布分析（用于兼容性）
-        spatial_viz = SpatialVisualization(env.grid_size)
-        spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
-        spatial_viz.print_spatial_analysis(spatial_analysis)
+        # # 生成传统的空间分布分析（用于兼容性）
+        # spatial_viz = SpatialVisualization(env.grid_size)
+        # spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+        # spatial_viz.print_spatial_analysis(spatial_analysis)
         
-        # 生成报告
-        generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
+        # # 生成报告
+        # generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
         
-        # 输出车辆访问模式总结
-        print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
+        # # 输出车辆访问模式总结
+        # print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
         
-        print("\n" + "="*60)
-        assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
-        print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
-        print("📊 结果摘要:")
-        print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-        print(f"   - 充电次数: {analysis['total_charging']}")
-        print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-        print(f"   - 奖励改进: {analysis['improvement']:.2f}")
+        # print("\n" + "="*60)
+        # assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
+        # print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
+        # print("📊 结果摘要:")
+        # print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
+        # print(f"   - 充电次数: {analysis['total_charging']}")
+        # print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
+        # print(f"   - 奖励改进: {analysis['improvement']:.2f}")
         
 
 
@@ -1020,8 +1020,8 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        # adplist = [0.1,0.3,0.5,1.0]
-        adplist = [0]
+        adplist = [0.1,0.3,0.5,1.0]
+        #adplist = [0.1]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
