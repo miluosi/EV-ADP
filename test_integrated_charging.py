@@ -37,16 +37,51 @@ from collections import deque
 print("✓ Successfully imported core components from src folder")
 USE_SRC_COMPONENTS = True
 
+def set_random_seeds(seed=42):
+    """
+    设置所有随机数生成器的种子，确保实验的可重复性
+    
+    Args:
+        seed (int): 随机数种子，默认为42
+    """
+    # Python内置random模块
+    random.seed(seed)
+    
+    # NumPy随机数生成器
+    np.random.seed(seed)
+    
+    # PyTorch随机数生成器
+    torch.manual_seed(seed)
+    
+    # 如果使用CUDA，设置CUDA随机数种子
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # 确保CUDA操作的确定性（可能会影响性能）
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    print(f"✓ Random seeds set to {seed} for all generators (Python, NumPy, PyTorch)")
 
 
 def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
+    # 设置全局随机数种子，确保车辆初始化一致
+    set_random_seeds(seed=42)
+    
     # Create environment with significantly more complexity for better learning
-    num_vehicles = 12  # Doubled vehicles for more interaction
-    num_stations = 6
-    env = ChargingIntegratedEnvironment(num_vehicles=num_vehicles, num_stations=num_stations)
+    num_vehicles = 15  # Doubled vehicles for more interaction
+    num_stations = 12
+    env = ChargingIntegratedEnvironment(
+        num_vehicles=num_vehicles, 
+        num_stations=num_stations, 
+        random_seed=42  # 传入种子确保环境初始化的一致性
+    )
+    
+    print("✓ Fixed initial state setup: Vehicle positions and battery levels will be identical across all episodes")
+    print("✓ Request generation will vary by episode for learning progression")
     
     # Initialize neural network-based ValueFunction for decision making only if needed
     # Use PyTorchChargingValueFunction with neural network only when ADP > 0 and assignmentgurobi is True
@@ -108,7 +143,12 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     }
     
     for episode in range(num_episodes):
-
+        # 为每个episode设置请求生成专用的种子，确保请求序列的多样性
+        # 但保持不同ADP值下相同episode的请求序列一致
+        episode_seed = 32 + episode  # 基础种子42加上episode编号
+        env.set_request_generation_seed(episode_seed)
+        print(f"Episode {episode + 1}: Request generation seed set to {episode_seed}")
+        
         current_epsilon = max(epsilon_end, epsilon_start - episode * epsilon_decay)
         use_exploration = False
         
@@ -127,8 +167,8 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
 
 
             current_requests = list(env.active_requests.values())
-            actions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
-            next_states, rewards, done, info = env.step(actions)
+            actions, storeactions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+            next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions)
 
             # Debug: Output step statistics every 100 steps
             if step % 50 == 0:
@@ -136,10 +176,14 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
                 assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
                 charging_vehicles = len([v for v in env.vehicles.values() if v['charging_station'] is not None])
+                onboard = len([v for v in env.vehicles.values() if v['passenger_onboard'] is not None])
+                idlecar = len([v for v in env.vehicles.values() if v.get('is_stationary', False)==True or v.get('idle_target') is not None])
+                movecharge = len([v for v in env.vehicles.values() if v.get('charging_target') is not None])
+                target_location_v = len([v for v in env.vehicles.values() if v.get('target_location') is not None])
                 idle_vehicles = len([v for v in env.vehicles.values() 
                                    if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None])
                 step_reward = sum(rewards.values())
-                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Charging: {charging_vehicles}, Idle: {idle_vehicles}, Step reward: {step_reward:.2f}")
+                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Onboard: {onboard}, Charging: {charging_vehicles}, Idle: {idlecar},movecharge:{movecharge},Target:{target_location_v},   Idle Vehicles: {idle_vehicles}, Step reward: {step_reward:.2f}")
                 
                 # Neural network monitoring (if using neural network)
                 if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
@@ -207,14 +251,13 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         rebalancing_calls = episode_stats.get('total_rebalancing_calls', 0)
         total_assignments = episode_stats.get('total_rebalancing_assignments', 0)
         avg_assignments = episode_stats.get('avg_rebalancing_assignments_per_call', 0)
-        
         print(f"Episode {episode + 1} Completed:")
         print(f"  Reward: {episode_reward:.2f}")
         print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
         print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
 
-        
-        
+        print(f"  Rebalancing: Calls={rebalancing_calls}, Total Assignments={total_assignments}, Avg Assignments={avg_assignments:.2f}")
+
         # Add neural network Q-value summary
         if use_neural_network:
             idle_q = episode_stats.get('sample_idle_q_value', 0.0)
@@ -981,38 +1024,38 @@ def main():
         print(f"📊 使用配置参数: episodes={num_episodes}")
         
         batch_size = training_config.get('batch_size', 256)
-        adpvalue = 0
-        assignmentgurobi =False
-        results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
+        # adpvalue = 0
+        # assignmentgurobi =False
+        # results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
 
-            # 分析结果
-        analysis = analyze_results(results)
+        #     # 分析结果
+        # analysis = analyze_results(results)
         
-        # 生成可视化
-        success = visualize_integrated_results(env,results, assignmentgurobi=assignmentgurobi)
+        # # 生成可视化
+        # success = visualize_integrated_results(env,results, assignmentgurobi=assignmentgurobi)
         
-        # 空间分布可视化已在Excel导出中生成
-        print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
+        # # 空间分布可视化已在Excel导出中生成
+        # print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
         
-        # 生成传统的空间分布分析（用于兼容性）
-        spatial_viz = SpatialVisualization(env.grid_size)
-        spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
-        spatial_viz.print_spatial_analysis(spatial_analysis)
+        # # 生成传统的空间分布分析（用于兼容性）
+        # spatial_viz = SpatialVisualization(env.grid_size)
+        # spatial_analysis = spatial_viz.analyze_spatial_patterns(env)
+        # spatial_viz.print_spatial_analysis(spatial_analysis)
         
-        # 生成报告
-        generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
+        # # 生成报告
+        # generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
         
-        # 输出车辆访问模式总结
-        print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
+        # # 输出车辆访问模式总结
+        # print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
         
-        print("\n" + "="*60)
-        assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
-        print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
-        print("📊 结果摘要:")
-        print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-        print(f"   - 充电次数: {analysis['total_charging']}")
-        print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-        print(f"   - 奖励改进: {analysis['improvement']:.2f}")
+        # print("\n" + "="*60)
+        # assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
+        # print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
+        # print("📊 结果摘要:")
+        # print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
+        # print(f"   - 充电次数: {analysis['total_charging']}")
+        # print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
+        # print(f"   - 奖励改进: {analysis['improvement']:.2f}")
         
 
 
@@ -1020,7 +1063,7 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0, 0.1, 0.3, 0.5, 1.0]
+        adplist = [0.1, 0.3, 0.5, 1.0]
         #adplist = [0.1]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"

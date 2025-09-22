@@ -150,7 +150,7 @@ class GurobiOptimizer:
                     d1 = self._manhattan_loc(cur_loc, request.pickup)
                     d2 = self._manhattan_loc(request.pickup, request.dropoff)
                     moving_cost = getattr(self.env, 'movingpenalty', -0.1) * (d1 + d2)
-                    immediate = req_val + moving_cost
+                    immediate = req_val 
                     objective_terms += immediate * request_decision[i, j]
                 else:
                     option_q = 0.0
@@ -696,7 +696,7 @@ class GurobiOptimizer:
                     d1 = self._manhattan_loc(cur_loc, request.pickup)
                     d2 = self._manhattan_loc(request.pickup, request.dropoff)
                     moving_cost = getattr(self.env, 'movingpenalty', -0.1) * (d1 + d2)
-                    immediate = req_val + moving_cost
+                    immediate = req_val 
                     if adp_weight <= 0:
                         # Immediate reward fallback
                         objective_terms += immediate * request_decision[i, j]
@@ -708,7 +708,7 @@ class GurobiOptimizer:
                                 option_q = self.env.evaluate_service_option(vehicle_id, request)
                             except Exception:
                                 option_q = 0.0
-                        objective_terms += (immediate+option_q * adp_weight) * request_decision[i, j]
+                        objective_terms += option_q * adp_weight * request_decision[i, j]
                 
                 # Process charging assignments
             if charging_stations:
@@ -730,7 +730,7 @@ class GurobiOptimizer:
                                 charging_q = self.env.evaluate_charging_option(vehicle_id, station)
                             except Exception:
                                 charging_q = 0.0
-                        objective_terms += (immediate + charging_q * adp_weight) * charge_decision[i, j]
+                        objective_terms += charging_q * adp_weight * charge_decision[i, j]
             
 
             
@@ -782,11 +782,12 @@ class GurobiOptimizer:
                 # 如果没有神经网络方法，使用默认奖励
                 wait_q_value = getattr(self.env, 'waiting_vehicle_reward', -0.1)
             
-            # 将神经网络预测的Q值加权到目标函数中
-            objective_terms += idle_q_value * adp_weight * idle_vehicle[i]
-            objective_terms += -avg_request_value * idle_vehicle[i]
-            objective_terms += wait_q_value * adp_weight * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
-            objective_terms += -avg_request_value * waiting_vehicle[i]  # Additional opportunity cost penalty
+            if adp_weight <= 0:
+                objective_terms += -avg_request_value * idle_vehicle[i]
+                objective_terms += -avg_request_value * waiting_vehicle[i]  # Additional opportunity cost penalty
+            else:
+                objective_terms += (idle_q_value) * adp_weight * idle_vehicle[i]
+                objective_terms += (wait_q_value) * adp_weight * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
 
             # Penalty for unserved requests
         unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)

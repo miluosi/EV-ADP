@@ -690,7 +690,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                         target_location: int, current_time: float, reward: float,
                         next_vehicle_location: int, battery_level: float = 1.0, 
                         next_battery_level: float = 1.0, other_vehicles: int = 0, 
-                        num_requests: int = 0, request_value: float = 0.0):
+                        num_requests: int = 0, request_value: float = 0.0,
+                        next_action_type: str = None, next_request_value: float = 0.0):
         """
         Store experience for training - 现在支持vehicle_id、battery和request_value信息
         
@@ -707,6 +708,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             other_vehicles: 附近其他车辆数量
             num_requests: 当前请求数量
             request_value: 请求价值 (只对assign动作有效，默认0.0)
+            next_action_type: 下一个动作类型 (车辆完成当前动作后根据ILP分配的动作标签)
         """
         # 从vehicle_id推断车辆类型（简化处理）
         vehicle_type = 1 if vehicle_id % 2 == 0 else 2  # 1=EV, 2=AEV
@@ -722,9 +724,11 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             'reward': reward,
             'next_vehicle_location': next_vehicle_location,
             'next_battery_level': next_battery_level,  # 添加下一状态电池电量
+            'next_action_type': next_action_type if next_action_type is not None else action_type,  # 添加下一动作类型，默认为当前动作类型
             'other_vehicles': other_vehicles,
             'num_requests': num_requests,
             'request_value': request_value,  # 添加请求价值信息
+            'next_request_value': next_request_value,  # 下一状态请求价值
             'is_idle': action_type == 'idle'  # 自动标记idle状态
         }
         self.experience_buffer.append(experience)
@@ -1093,7 +1097,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         return sampled_batch
 
-    def train_step(self, batch_size: int = 64, tau: float = 0.005):  # 软更新系数，推荐0.001~0.01，可调
+    def train_step(self, batch_size: int = 64, tau: float = 0.01):  # 软更新系数，推荐0.001~0.01，可调
         """Perform one training step using stored experiences with proper DQN algorithm"""
         if len(self.experience_buffer) < batch_size * 2:  # Wait for more experiences
             return 0.0
@@ -1151,11 +1155,12 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             
             # Next state (for target calculation) - 使用支持battery和request_value的输入准备方法
             next_battery = exp.get('next_battery_level', 1.0)  # 向后兼容
-            next_request_value = exp.get('request_value', 0.0)  # 下一状态也使用相同的请求价值
+            next_request_value = exp.get('next_request_value', 0.0)  # 下一状态请求价值
+            next_action_type = exp.get('next_action_type', exp['action_type'])  # 获取下一个动作类型，如果没有则使用当前动作类型作为备用
             next_inputs = self._prepare_network_input_with_battery(
                 exp['next_vehicle_location'], exp['target_location'], 
                 exp['current_time'] + 1, exp['other_vehicles'], exp['num_requests'], 
-                exp['action_type'], next_battery, next_request_value
+                next_action_type, next_battery, next_request_value
             )
             
             
@@ -1164,11 +1169,9 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor, next_battery_tensor, next_value_tensor = next_inputs
             elif len(next_inputs) == 6:  # 包含battery但没有request_value
                 next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor, next_battery_tensor = next_inputs
-                next_value_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
             else:  # 不包含battery和request_value（向后兼容）
                 next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor = next_inputs
                 next_battery_tensor = torch.tensor([[1.0]], dtype=torch.float32).to(self.device)
-                next_value_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
             
             next_states.append({
                 'path_locations': next_path_locations.squeeze(0),
@@ -1178,7 +1181,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 'num_requests': next_requests_tensor.squeeze(0),
                 'battery_level': next_battery_tensor.squeeze(0),  # 添加battery信息
                 'request_value': next_value_tensor.squeeze(0),  # 添加request_value信息
-                'action_type': exp['action_type'],  # 添加action_type信息
+                'action_type': next_action_type,  # 使用下一个动作类型而不是当前动作类型
                 'vehicle_id': exp['vehicle_id'],    # 添加vehicle_id信息
                 'vehicle_type': exp.get('vehicle_type', 1)  # 添加vehicle_type信息（向后兼容）
             })
@@ -1224,13 +1227,15 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         next_batch_num_requests = torch.stack([state['num_requests'] for state in next_states])
         next_batch_battery_levels = torch.stack([state['battery_level'] for state in next_states])  # 添加next states的battery批处理
         next_batch_request_values = torch.stack([state['request_value'] for state in next_states])  # 添加next states的request_value批处理
-        
         # Convert action_type strings to tensors for next states
-        next_action_types = []
+
         next_vehicle_ids = []
         next_vehicle_types = []
+        next_action_types = []
         for state in next_states:
             action_type_str = state['action_type']
+            next_vehicle_ids.append(state['vehicle_id'] )  # +1因为0是padding
+            next_vehicle_types.append(state['vehicle_type'])
             if action_type_str == 'idle':
                 action_type_id = 1
             elif action_type_str.startswith('assign'):
@@ -1240,13 +1245,11 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             else:
                 action_type_id = 2  # 默认为assign
             next_action_types.append(action_type_id)
-            next_vehicle_ids.append(state['vehicle_id'] + 1)  # +1因为0是padding
-            next_vehicle_types.append(state['vehicle_type'])
-        
-        next_batch_action_types = torch.tensor(next_action_types, dtype=torch.long).to(self.device)
+
+
         next_batch_vehicle_ids = torch.tensor(next_vehicle_ids, dtype=torch.long).to(self.device)
         next_batch_vehicle_types = torch.tensor(next_vehicle_types, dtype=torch.long).to(self.device)
-        
+        next_batch_action_types = torch.tensor(next_action_types, dtype=torch.long).to(self.device)
         # Current Q-values (with gradients) - 现在包含所有特征信息
         self.network.train()
         current_q_values = self.network(
