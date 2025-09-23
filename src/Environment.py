@@ -464,7 +464,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
         self.unserve_penalty = -0.5  # Penalty for unserved requests
-        self.movingpenalty = -1e-2
+        self.movingpenalty = -5e-3
         # Vehicle states
         self.rebalance_battery_threshold = 0.3
         self.vehicles = {}
@@ -1738,6 +1738,10 @@ class ChargingIntegratedEnvironment(Environment):
         return actions, storeactions
 
     def _update_q_learning(self, actions, rewards):
+        valuefunction = self.value_function
+        offlinsedatalen = valuefunction.experience_buffer.__len__()
+        if self.current_time % 100 == 0:
+            print(f"🔄 Updating Q-learning - current offline data size: {offlinsedatalen}")
         """Update Q-learning based on actions taken and rewards received - unified with neural network training"""
         from .Action import ServiceAction, ChargingAction, IdleAction
         
@@ -1885,7 +1889,7 @@ class ChargingIntegratedEnvironment(Environment):
             active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
             avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
             # Return minimal reward for stationary period (no action taken)
-            return -avg_request_value*0.1,-avg_request_value*0.1
+            return - avg_request_value*1e-3, - avg_request_value*1e-3
         
         reward = 0
         dur_reward = 0.0
