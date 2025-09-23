@@ -786,8 +786,8 @@ class GurobiOptimizer:
                 objective_terms += -avg_request_value * idle_vehicle[i]
                 objective_terms += -avg_request_value * waiting_vehicle[i]  # Additional opportunity cost penalty
             else:
-                objective_terms += (idle_q_value) * adp_weight * idle_vehicle[i]
-                objective_terms += (wait_q_value) * adp_weight * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
+                objective_terms += idle_q_value * idle_vehicle[i]
+                objective_terms += wait_q_value * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
 
             # Penalty for unserved requests
         unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)
@@ -817,9 +817,12 @@ class GurobiOptimizer:
                             if charge_decision[i, j].x > 0.5:
                                 assignments[vehicle_id] = f"charge_{station.id}"
                                 break
-                    if waiting_vehicle[i].x > 0.5:
+                    if waiting_vehicle[i].x > 0.1:
                         assignments[vehicle_id] = f"waiting"
-                        break
+
+                    if idle_vehicle[i].x > 0.1:
+                        assignments[vehicle_id] = f"idle"
+                
                 # Update vehicle battery levels based on optimization results
                 for i, vehicle_id in enumerate(vehicle_ids):
                     if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):

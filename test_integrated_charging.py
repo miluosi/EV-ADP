@@ -50,7 +50,7 @@ def set_random_seeds(seed=42):
     # NumPy随机数生成器
     np.random.seed(seed)
     
-    # PyTorch随机数生成器
+    # PyTorch随机数生成器  
     torch.manual_seed(seed)
     
     # 如果使用CUDA，设置CUDA随机数种子
@@ -132,6 +132,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     # Test parameters
     num_episodes = num_episodes
     results = {
+        'Idle_average': [],
         'episode_rewards': [],
         'charging_events': [],
         'episode_detailed_stats': [],  # New: detailed stats for each episode
@@ -158,7 +159,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         episode_charging_events = []
         episode_losses = []
         
-        # Run one episode
+        Idle_list = []
         for step in range(env.episode_length):
             # Generate actions using ValueFunction
             actions = {}
@@ -169,22 +170,22 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             current_requests = list(env.active_requests.values())
             actions, storeactions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
             next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions)
-
             # Debug: Output step statistics every 100 steps
-            if step % 50 == 0:
+            if step % 25 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
                 assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
                 charging_vehicles = len([v for v in env.vehicles.values() if v['charging_station'] is not None])
                 onboard = len([v for v in env.vehicles.values() if v['passenger_onboard'] is not None])
-                idlecar = len([v for v in env.vehicles.values() if v.get('is_stationary', False)==True or v.get('idle_target') is not None])
+                idlecar = len([v for v in env.vehicles.values() if  v.get('idle_target') is not None ])
+                waitcar = len([v for v in env.vehicles.values() if  v.get('is_stationary') is True ])
                 movecharge = len([v for v in env.vehicles.values() if v.get('charging_target') is not None])
                 target_location_v = len([v for v in env.vehicles.values() if v.get('target_location') is not None])
                 idle_vehicles = len([v for v in env.vehicles.values() 
-                                   if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None])
+                                   if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None and v['target_location'] is None])
                 step_reward = sum(rewards.values())
-                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Onboard: {onboard}, Charging: {charging_vehicles}, Idle: {idlecar},movecharge:{movecharge},Target:{target_location_v},   Idle Vehicles: {idle_vehicles}, Step reward: {step_reward:.2f}")
-                
+                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Onboard: {onboard}, Charging: {charging_vehicles}, Idle: {idlecar}, waitcar: {waitcar}, movecharge: {movecharge}, Idle Vehicles: {idle_vehicles}, Step reward: {step_reward:.2f}")
+                Idle_list.append(idle_vehicles)
                 # Neural network monitoring (if using neural network)
                 if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
                     recent_loss = value_function.training_losses[-1] if value_function.training_losses else 0.0
@@ -230,7 +231,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             
             if done:
                 break
-
+        results['Idle_average'].append(sum(Idle_list)/len(Idle_list) if Idle_list else 0)
         results['episode_rewards'].append(episode_reward)
         results['charging_events'].extend(episode_charging_events)
         results['value_function_losses'].append(np.mean(episode_losses) if episode_losses else 0.0)
