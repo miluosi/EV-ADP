@@ -1437,7 +1437,7 @@ class ChargingIntegratedEnvironment(Environment):
         # self.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
 
         # 执行Q-learning更新
-        self._update_q_learning(storeactions,dur_rewards)
+        self._update_q_learning(storeactions)
         
         # Record charging station usage for this time step
         self._record_charging_usage()
@@ -1555,7 +1555,7 @@ class ChargingIntegratedEnvironment(Environment):
                     print(f"⚠️  Warning: Mismatch in assignments - vehicles: {len(vehicles_to_rebalance)}, assignments: {len(rebalancing_assignments)} at step {self.current_time}")
                 # print("vehicle_length:", len(vehicles_to_rebalance))
                 # print("rebalance_length:", len(rebalancing_assignments))
-
+                quest_num_now = len(self.active_requests)
                 for vehicle_id, target_request in rebalancing_assignments.items():
                     vehicle_location = self.vehicles[vehicle_id]['location']
                     vehicle_battery = self.vehicles[vehicle_id]['battery']
@@ -1573,16 +1573,23 @@ class ChargingIntegratedEnvironment(Environment):
                             charging_assignments += 1
                             # Generate charging action
                             from src.Action import ChargingAction
-                            actions[vehicle_id] = ChargingAction([], station_id, self.charge_duration, vehicle_location,vehicle_battery)
+                            
+                            actions[vehicle_id] = ChargingAction([], station_id, self.charge_duration, vehicle_location,vehicle_battery,req_num = quest_num_now)
                             if storeactions[vehicle_id] is None:
                                 storeactions[vehicle_id] = actions[vehicle_id]
+                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                             else:
-                                setattr(storeactions[vehicle_id], 'next_action', actions[vehicle_id])
-                                setattr(storeactions[vehicle_id], 'vehicle_loc_post', vehicle_location)
-                                setattr(storeactions[vehicle_id], 'vehicle_battery_post', vehicle_battery)
+                                storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                             vehicle = self.vehicles[vehicle_id]
                         elif isinstance(target_request, Request) and target_request.request_id in self.active_requests:
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to request {target_request.request_id} at step {self.current_time}, battery: {vehicle_battery:.2f}")
@@ -1591,18 +1598,20 @@ class ChargingIntegratedEnvironment(Environment):
                                 new_assignments += 1
                                 # Generate service action
                                 from src.Action import ServiceAction
-                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery)
+                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
                                 if storeactions[vehicle_id] is None:
                                     storeactions[vehicle_id] = actions[vehicle_id]
                                     self.storeactions[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions[vehicle_id].dur_reward = 0
+                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
                                 else:
-                                    setattr(storeactions[vehicle_id], 'next_action', actions[vehicle_id])
-                                    setattr(storeactions[vehicle_id], 'vehicle_loc_post', vehicle_location)
-                                    setattr(storeactions[vehicle_id], 'vehicle_battery_post', vehicle_battery)
+                                    storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                    storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                    storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                     self.storeactions[vehicle_id] = None
                                     self.storeactions[vehicle_id] = actions[vehicle_id]
-                            vehicle = self.vehicles[vehicle_id]
-
+                                    self.storeactions[vehicle_id].dur_reward = 0
+                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
                         elif isinstance(target_request, str) and target_request == "waiting":
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to waiting at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle waiting state - mark vehicle as stationary for next simulation
@@ -1612,16 +1621,20 @@ class ChargingIntegratedEnvironment(Environment):
                             # Generate idle action to keep vehicle stationary
                             from src.Action import IdleAction
                             current_coords = vehicle['coordinates']
-                            actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location,vehicle_battery)  # Stay in place
+                            actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location,vehicle_battery,req_num = quest_num_now)  # Stay in place
                             if storeactions[vehicle_id] is None:
                                 storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
                             else:
-                                setattr(storeactions[vehicle_id], 'next_action', actions[vehicle_id])
-                                setattr(storeactions[vehicle_id], 'vehicle_loc_post', vehicle_location)
-                                setattr(storeactions[vehicle_id], 'vehicle_battery_post', vehicle_battery)
+                                storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
                         elif isinstance(target_request, str) and target_request == "idle":
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             from src.Action import IdleAction
@@ -1629,16 +1642,20 @@ class ChargingIntegratedEnvironment(Environment):
                             self._assign_idle_vehicle(vehicle_id)
                             idle_target = vehicle.get('idle_target', None)
                             current_coords = vehicle['coordinates']
-                            actions[vehicle_id] = IdleAction([], current_coords, idle_target, vehicle_location, vehicle_battery)
+                            actions[vehicle_id] = IdleAction([], current_coords, idle_target, vehicle_location, vehicle_battery,req_num = quest_num_now)
                             if storeactions[vehicle_id] is None:
                                 storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['idle_target']
                             else:
-                                setattr(storeactions[vehicle_id], 'next_action', actions[vehicle_id])
-                                setattr(storeactions[vehicle_id], 'vehicle_loc_post', vehicle_location)
-                                setattr(storeactions[vehicle_id], 'vehicle_battery_post', vehicle_battery)
+                                storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['idle_target']
                         else:
                             print(f"DEBUG: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             self._assign_idle_vehicle(vehicle_id)
@@ -1736,17 +1753,35 @@ class ChargingIntegratedEnvironment(Environment):
             #print(f" {vehicle_id}  Status - finished Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
         return actions, storeactions
 
-    def _update_q_learning(self, actions, rewards):
+    def _update_q_learning(self, actions):
         valuefunction = self.value_function
         if valuefunction is None or not hasattr(valuefunction, 'experience_buffer'):
             return
+        
         offlinsedatalen = valuefunction.experience_buffer.__len__()
         if self.current_time % 100 == 0:
             print(f"🔄 Updating Q-learning - current offline data size: {offlinsedatalen}")
-        """Update Q-learning based on actions taken and rewards received - unified with neural network training"""
+            exp_analysis = self.value_function.analyze_experience_data()
+            if exp_analysis:
+                reward_stats = exp_analysis['reward_stats']
+                action_stats = exp_analysis['action_stats']
+                print(f" Assign: {action_stats['assign_count']}, chargelength: {action_stats['charge_count']}, idlelength: {action_stats['idle_count']}")
+                print(f"    📊 Experience Data Analysis (last 100 steps):")
+                print(f"      Reward Distribution: +{reward_stats['positive_ratio']} | 0{reward_stats['neutral_ratio']} | -{reward_stats['negative_ratio']}")
+                print(f"      Mean Rewards: Overall={reward_stats['mean_reward']}, Assign={action_stats['assign_mean_reward']}, Charge={action_stats['charge_mean_reward']}, Idle={action_stats['idle_mean_reward']}")
+                print(f"      Action Success Rates: Assign={action_stats['assign_positive_ratio']:.1%}, Charge={action_stats['charge_positive_ratio']:.1%}, Idle={action_stats['idle_positive_ratio']:.1%}")
+            else:
+                print("    ⚠️ No experience data available for analysis yet")
         from .Action import ServiceAction, ChargingAction, IdleAction
-        
-        # Helper for Manhattan distance on location index
+        # for vehicle_id, action in actions.items():
+        #     if action is None:
+        #         continue
+        #     print(f"vehid: {vehicle_id} ", end="")
+        #     print(f"Action for vehicle at time {self.current_time}: {action}")
+        #     print(f"   Vehicle location: {action.vehicle_loc}, Battery: {action.vehicle_battery:.2f}, Requests: {action.req_num}")
+        #     print(f"ifnext: {getattr(action, 'next_action', None)}")
+        #     print(f"durreward: {action.dur_reward}")
+
         def _manhattan_distance_loc(a_loc: int, b_loc: int) -> int:
             ax, ay = (a_loc % self.grid_size, a_loc // self.grid_size)
             bx, by = (b_loc % self.grid_size, b_loc // self.grid_size)
@@ -1761,6 +1796,7 @@ class ChargingIntegratedEnvironment(Environment):
             # Use pre-action as decision state
             current_location = action.vehicle_loc
             current_battery = action.vehicle_battery
+            current_request_num = action.req_num
             veh_curloc = self.vehicles[vehicle_id]['location']
             # Only store at decision points; compute r_exec-style reward per option
             if (self.value_function and hasattr(self.value_function, 'store_experience')):
@@ -1769,17 +1805,13 @@ class ChargingIntegratedEnvironment(Environment):
                 store_threshold = 5
                 # Service option at assignment decision
                 next_action = getattr(action, 'next_action', None)
-                if isinstance(action, ServiceAction) and hasattr(action, 'request_id') and action.request_id in self.active_requests and rewards[vehicle_id] > store_threshold and next_action is not None:
-                    # Only at real assignment moment (vehicle not already busy)
-                    
-                    req = self.active_requests[action.request_id]
-                    veqid = vehicle_id
-                    earnings = getattr(req, 'final_value', getattr(req, 'value', 0.0))
-                    next_value = getattr(next_action, 'next_value', earnings)
-                    r_exec = rewards[vehicle_id]  # Use actual reward from step
+                if isinstance(action, ServiceAction) and hasattr(action, 'request_id') and next_action is not None and action.dur_reward >store_threshold:
+                    r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+                    next_value = getattr(next_action, 'next_value', r_exec)
+                    req = action.target_location
                     next_battery = batterynow
-                    target_location = req.dropoff
-                    next_location = req.dropoff
+                    target_location = req
+                    next_location = req
                     if isinstance(next_action, ServiceAction) :
                         next_action_type = "assign"
                     elif isinstance(next_action, ChargingAction) :
@@ -1812,7 +1844,7 @@ class ChargingIntegratedEnvironment(Environment):
                         next_value = getattr(next_action, 'next_value', 0)
                         st = self.charging_manager.stations[st_id]
                         station_loc = st.location
-                        r_exec = rewards[vehicle_id]  # Use actual reward from step
+                        r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
                         next_battery = batterynow
                         target_location = station_loc
                         next_location = station_loc
@@ -1850,7 +1882,7 @@ class ChargingIntegratedEnvironment(Environment):
                             next_action_type = "charge"
                         else:
                             next_action_type = "idle"
-                        r_exec = rewards[vehicle_id]  # Use actual reward from step
+                        r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
 
                         self.value_function.store_experience(
                             vehicle_id=vehicle_id,
@@ -1889,8 +1921,8 @@ class ChargingIntegratedEnvironment(Environment):
             active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
             active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
             avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-            # Return minimal reward for stationary period (no action taken)
-            return - avg_request_value*1e-3, - avg_request_value*1e-3
+            self.storeactions[vehicle_id].dur_reward += - avg_request_value*1e-2
+            return - avg_request_value*1e-2, - avg_request_value*1e-2
         
         reward = 0
         dur_reward = 0.0
@@ -1924,13 +1956,14 @@ class ChargingIntegratedEnvironment(Environment):
                     reward = -charging_penalty - np.random.random()*0.2  # Invalid station penalty
             else:
                 reward = -charging_penalty - np.random.random()*0.2  # Invalid station penalty
-            action.dur_reward += reward  # Store for reference
+            self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
             dur_reward = action.dur_reward  # Total reward over charging duration
         elif isinstance(action, ServiceAction):
             # Service action - immediate reward is request.value (same as Gurobi)
             if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
                 # Try to assign the request
                 return -1, -1.0  # Small penalty for failed assignment
+                self.storeactions[vehicle_id].dur_reward += -1.0  # Store for reference
             elif vehicle['assigned_request'] is not None:
                 # Progress towards pickup - check if我们能pickup
                 if self._pickup_passenger(vehicle_id):
@@ -1946,7 +1979,7 @@ class ChargingIntegratedEnvironment(Environment):
                         print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法继续前往pickup位置")
                     else:
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
-                action.dur_reward += reward  # Store for reference
+                self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
             elif vehicle['passenger_onboard'] is not None:
                 earnings = self._dropoff_passenger(vehicle_id)
                 if earnings > 0:
@@ -1962,16 +1995,16 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['charging_target'] = None
                     else:
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
-                action.dur_reward += reward  # Store for reference
-            dur_reward = action.dur_reward  # Total reward over charging duration
-        elif isinstance(action, IdleAction):
-            # Idle action - move towards specified target coordinates using unified method
-            active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
-            active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
-            avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-            reward = self._execute_movement_towards_idle(vehicle_id, vehicle.get('idle_target', None))
-            action.dur_reward += reward  # Store for reference
-            dur_reward = action.dur_reward  # Total reward over charging duration
+                self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
+        
+            elif isinstance(action, IdleAction):
+                # Idle action - move towards specified target coordinates using unified method
+                active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+                reward = self._execute_movement_towards_idle(vehicle_id, vehicle.get('idle_target', None))
+                self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
+                dur_reward = self.storeactions[vehicle_id].dur_reward  # Total reward over charging duration
         return reward, dur_reward
     
     def _should_store_experience(self, action_type: str, reward: float, battery_level: float) -> bool:
@@ -2314,7 +2347,7 @@ class ChargingIntegratedEnvironment(Environment):
         active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
         avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 100.0
         # Small time penalty for movement (consistent with other methods)
-        return (self.movingpenalty  -  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value*1e-3
+        return (self.movingpenalty  -  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value*1e-2
     
     def _update_environment(self):
         """Update environment state"""

@@ -209,6 +209,18 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                             print(f"    Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
                             print(f"    Raw Q-values (no normalization): Idle={idle_q:.3f}, Assign={assign_q:.3f}, Charge={charge_q:.3f}")
                             print(f"    Note: Gurobi uses these raw Q-values directly in optimization objective")
+                            
+                            # 添加经验数据分析
+                            if step > 100 and step % 100 == 0:  # 每100步分析一次
+                                exp_analysis = value_function.analyze_experience_data()
+                                if exp_analysis:
+                                    reward_stats = exp_analysis['reward_stats']
+                                    action_stats = exp_analysis['action_stats']
+                                    print(f"    📊 Experience Data Analysis (last 100 steps):")
+                                    print(f"      Reward Distribution: +{reward_stats['positive_ratio']:.1%} | 0{reward_stats['neutral_ratio']:.1%} | -{reward_stats['negative_ratio']:.1%}")
+                                    print(f"      Mean Rewards: Overall={reward_stats['mean_reward']:.2f}, Assign={action_stats['assign_mean_reward']:.2f}, Charge={action_stats['charge_mean_reward']:.2f}, Idle={action_stats['idle_mean_reward']:.2f}")
+                                    print(f"      Action Success Rates: Assign={action_stats['assign_positive_ratio']:.1%}, Charge={action_stats['charge_positive_ratio']:.1%}, Idle={action_stats['idle_positive_ratio']:.1%}")
+                                    
                         except Exception as e:
                             print(f"  Neural Network Status: Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
                             print(f"    Error getting sample Q-values: {e}")

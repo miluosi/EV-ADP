@@ -412,9 +412,23 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         path_delays = torch.zeros(1, 3, 1, dtype=torch.float32)
         
         # Set path: current -> target -> end (with boundary checking)
-        # Ensure indices are within valid range [0, num_locations-1]
-        safe_vehicle_location = max(0, min(vehicle_location, self.num_locations - 1))
-        safe_target_location = max(0, min(target_location, self.num_locations - 1))
+        # Handle coordinate tuples or integer indices
+        def _convert_location_to_index(location):
+            if isinstance(location, tuple) and len(location) == 2:
+                # Convert coordinate tuple to location index
+                x, y = location
+                grid_size = int(self.num_locations ** 0.5)  # Assuming square grid
+                return y * grid_size + x
+            elif isinstance(location, int):
+                return location
+            else:
+                # Fallback for unexpected types
+                print(f"Warning: Unexpected location type {type(location)}: {location}")
+                return 0
+        
+        # Convert locations to indices and ensure they are within valid range [0, num_locations-1]
+        safe_vehicle_location = max(0, min(_convert_location_to_index(vehicle_location), self.num_locations - 1))
+        safe_target_location = max(0, min(_convert_location_to_index(target_location), self.num_locations - 1))
         
         # Debug: Log if we had to clamp any values
         # if vehicle_location != safe_vehicle_location or target_location != safe_target_location:
@@ -768,6 +782,59 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             'is_idle': True  # 标记这是一个idle经验
         }
         self.experience_buffer.append(experience)
+    
+    def analyze_experience_data(self):
+        """分析经验缓冲区中的奖励分布和动作类型统计"""
+        if len(self.experience_buffer) < 100:
+            return None
+            
+        experiences = list(self.experience_buffer)
+        
+        # 奖励分析
+        rewards = [exp['reward'] for exp in experiences]
+        positive_rewards = [r for r in rewards if r > 0]
+        negative_rewards = [r for r in rewards if r < 0]
+        neutral_rewards = [r for r in rewards if r == 0]
+        
+        reward_stats = {
+            'total_count': len(rewards),
+            'positive_count': len(positive_rewards),
+            'negative_count': len(negative_rewards),
+            'neutral_count': len(neutral_rewards),
+            'positive_ratio': len(positive_rewards) / len(rewards),
+            'negative_ratio': len(negative_rewards) / len(rewards),
+            'neutral_ratio': len(neutral_rewards) / len(rewards),
+            'mean_reward': np.mean(rewards),
+            'mean_positive': np.mean(positive_rewards) if positive_rewards else 0,
+            'mean_negative': np.mean(negative_rewards) if negative_rewards else 0,
+            'std_reward': np.std(rewards),
+            'max_reward': np.max(rewards),
+            'min_reward': np.min(rewards)
+        }
+        
+        # 动作类型分析
+        action_types = [exp['action_type'] for exp in experiences]
+        assign_actions = [exp for exp in experiences if exp['action_type'].startswith('assign')]
+        charge_actions = [exp for exp in experiences if exp['action_type'].startswith('charge')]
+        idle_actions = [exp for exp in experiences if exp['action_type'] == 'idle']
+        
+        action_stats = {
+            'assign_count': len(assign_actions),
+            'charge_count': len(charge_actions), 
+            'idle_count': len(idle_actions),
+            'assign_ratio': len(assign_actions) / len(experiences),
+            'assign_mean_reward': np.mean([exp['reward'] for exp in assign_actions]) if assign_actions else 0,
+            'charge_mean_reward': np.mean([exp['reward'] for exp in charge_actions]) if charge_actions else 0,
+            'idle_mean_reward': np.mean([exp['reward'] for exp in idle_actions]) if idle_actions else 0,
+            'assign_positive_ratio': len([exp for exp in assign_actions if exp['reward'] > 0]) / len(assign_actions) if assign_actions else 0,
+            'charge_positive_ratio': len([exp for exp in charge_actions if exp['reward'] > 0]) / len(charge_actions) if charge_actions else 0,
+            'idle_positive_ratio': len([exp for exp in idle_actions if exp['reward'] > 0]) / len(idle_actions) if idle_actions else 0
+        }
+        
+        return {
+            'reward_stats': reward_stats,
+            'action_stats': action_stats
+        }
     
     def _advanced_sample(self, batch_size: int, method: str = "balanced"):
         """
