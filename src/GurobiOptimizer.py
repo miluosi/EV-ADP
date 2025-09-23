@@ -830,7 +830,8 @@ class GurobiOptimizer:
                         
             else:
                 print(f"Optimization status: {model.status}")
-                # Print constraint violations for debugging
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    assignments[vehicle_id] = f"waiting"
                 if model.status == self.GRB.INFEASIBLE:
                     print("Model is infeasible. Computing IIS...")
                     model.computeIIS()
@@ -951,7 +952,9 @@ class GurobiOptimizer:
                 if best_request:
                     assignments[vehicle_id] = best_request
                     remaining_requests.remove(best_request)
-        
+        for vehicle_id in vehicle_ids:
+            if vehicle_id not in assignments:
+                assignments[vehicle_id] = "idle"
         return assignments
 
 

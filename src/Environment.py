@@ -1560,6 +1560,7 @@ class ChargingIntegratedEnvironment(Environment):
                     vehicle_location = self.vehicles[vehicle_id]['location']
                     vehicle_battery = self.vehicles[vehicle_id]['battery']
                     self.vehicles[vehicle_id]['needs_emergency_charging'] = False  # Reset emergency flag after assignment
+                    self.vehicles[vehicle_id]['is_stationary'] = False  # Reset stationary state if moving to charge
                     if target_request:
                         # Check if it's a charging assignment (string) or request assignment (object)
                         if isinstance(target_request, str) and target_request.startswith("charge_"):
@@ -1583,7 +1584,6 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                             vehicle = self.vehicles[vehicle_id]
-                            vehicle['is_stationary'] = False  # Reset stationary state if moving to charge
                         elif isinstance(target_request, Request) and target_request.request_id in self.active_requests:
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to request {target_request.request_id} at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle regular request assignment  
@@ -1626,7 +1626,6 @@ class ChargingIntegratedEnvironment(Environment):
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             from src.Action import IdleAction
                             vehicle = self.vehicles[vehicle_id]
-                            vehicle['is_stationary'] = False
                             self._assign_idle_vehicle(vehicle_id)
                             idle_target = vehicle.get('idle_target', None)
                             current_coords = vehicle['coordinates']
@@ -1739,6 +1738,8 @@ class ChargingIntegratedEnvironment(Environment):
 
     def _update_q_learning(self, actions, rewards):
         valuefunction = self.value_function
+        if valuefunction is None or not hasattr(valuefunction, 'experience_buffer'):
+            return
         offlinsedatalen = valuefunction.experience_buffer.__len__()
         if self.current_time % 100 == 0:
             print(f"🔄 Updating Q-learning - current offline data size: {offlinsedatalen}")
