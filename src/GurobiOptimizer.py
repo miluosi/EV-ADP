@@ -739,7 +739,8 @@ class GurobiOptimizer:
         for j in range(len(available_requests)):
             for i in range(len(vehicle_ids)):
                 served_requests += request_decision[i][j]
-        
+        wait_q_penalty = -5e+3
+        idld_q_penalty = -5e+3
         for i in range(len(vehicle_ids)):
             # 使用神经网络预测的idle Q值替代固定的idle_vehicle_reward
             vehicle_id = vehicle_ids[i]

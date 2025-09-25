@@ -165,8 +165,6 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             actions = {}
             states_for_training = []
             actions_for_training = []
-
-
             current_requests = list(env.active_requests.values())
             actions, storeactions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
             next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions)
@@ -264,12 +262,12 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         rebalancing_calls = episode_stats.get('total_rebalancing_calls', 0)
         total_assignments = episode_stats.get('total_rebalancing_assignments', 0)
         avg_assignments = episode_stats.get('avg_rebalancing_assignments_per_call', 0)
+        avg_whole = episode_stats.get('avg_rebalancing_assignments_per_whole', 0)
         print(f"Episode {episode + 1} Completed:")
         print(f"  Reward: {episode_reward:.2f}")
         print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
         print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
-
-        print(f"  Rebalancing: Calls={rebalancing_calls}, Total Assignments={total_assignments}, Avg Assignments={avg_assignments:.2f}")
+        print(f"  Rebalancing: Calls={rebalancing_calls}, Total Assignments={total_assignments}, Avg Assignments={avg_assignments:.2f}, Avg Rebalance Whole={avg_whole:.2f}")
 
         # Add neural network Q-value summary
         if use_neural_network:
@@ -1076,7 +1074,8 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [0, 0.1, 0.3, 0.5, 1.0]
+        # adplist = [0]
+        adplist = [0,0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
         #adplist = [0.1]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"

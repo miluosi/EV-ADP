@@ -38,9 +38,9 @@ class Environment(metaclass=ABCMeta):
         self.current_time: float = 0.0
         self.idle_vehicle_requirement = 1
         self.idle_penalty = 0.5
-        self.charging_penalty = 0.2
+        self.charging_penalty = -5
         self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
-        self.min_battery_level = 0.1
+        self.min_battery_level = 0.2
         self.complete_ratio_reward = 0.5
         # Q-learning components for ADP integration
         self.q_table = {}  # Q-table for state-action values
@@ -450,9 +450,9 @@ class ChargingIntegratedEnvironment(Environment):
         self.grid_size = grid_size
         self.minimum_charging_level = 0.2  # Minimum battery level before needing to charge
         # Parameters for reward alignment with Gurobi optimization
-        self.charging_penalty = 0.5  # Penalty for charging action (reduced from 10.0)
+        self.charging_penalty = 0.5  
         self.adp_value = 1.0  # Weight for Q-value contribution
-        self.unserved_penalty = 1.5  # Penalty for unserved requests (reduced from 5.0)
+        self.unserved_penalty = 100
         self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
         self.charge_duration = 2
         self.chargeincrease_per_epoch = 0.5
@@ -486,6 +486,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.battery_consum = 0.005  # Battery consumption per epoch when moving
         # Assignment tracking for rebalancing analysis
         self.rebalancing_assignments_per_step = []  # Store assignments count per step
+        self.rebalancing_whole = []
         self.total_rebalancing_calls = 0
         self.penalty_for_passenger_stranding = -50  
         # Tracking for visualization
@@ -912,7 +913,7 @@ class ChargingIntegratedEnvironment(Environment):
                 'type_name': vehicle_type_name,  # Vehicle type name: 'EV' or 'AEV' (字符串名称)
                 'location': location_index,  # Use location index instead of coordinates
                 'coordinates': (x, y),  # Keep coordinates for visualization
-                'battery': random.uniform(0.3, 0.9),  # 30%-90% battery
+                'battery': random.uniform(0.5, 0.95),  # 50%-90% battery
                 'charging_station': None,
                 'charging_time_left': 0,
                 'total_distance': 0,
@@ -1549,6 +1550,7 @@ class ChargingIntegratedEnvironment(Environment):
                 
                 # Debug: Count assignments made
                 new_assignments = 0
+                re_assignments_len = len(rebalancing_assignments)
                 charging_assignments = 0
                 self.total_rebalancing_calls += 1
                 if len(rebalancing_assignments) != len(vehicles_to_rebalance):
@@ -1583,6 +1585,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                             else:
                                 storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].next_action.next_value = 0
                                 storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                 storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                 storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
@@ -1606,6 +1609,7 @@ class ChargingIntegratedEnvironment(Environment):
                                     self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
                                 else:
                                     storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                    storeactions[vehicle_id].next_action.next_value = self.active_requests[target_request.request_id].final_value
                                     storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                     storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                     self.storeactions[vehicle_id] = None
@@ -1629,6 +1633,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
                             else:
                                 storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].next_action.next_value = 0
                                 storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                 storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                 self.storeactions[vehicle_id] = None
@@ -1650,6 +1655,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['idle_target']
                             else:
                                 storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].next_action.next_value = 0
                                 storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                 storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                 self.storeactions[vehicle_id] = None
@@ -1681,7 +1687,7 @@ class ChargingIntegratedEnvironment(Environment):
                     #print(f" {vehicle_id}  Status - finished Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
                 # Store the count of request assignments for this rebalancing call
                 self.rebalancing_assignments_per_step.append(new_assignments)
-                
+                self.rebalancing_whole.append(re_assignments_len)
                 #print(f"DEBUG Assignment Result: New request assignments: {new_assignments}, Charging assignments: {charging_assignments}, Idle assignments: {len(vehicles_to_rebalance) - new_assignments - charging_assignments}")
         
         # Generate actions for vehicles not involved in rebalancing
@@ -1921,8 +1927,8 @@ class ChargingIntegratedEnvironment(Environment):
             active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
             active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
             avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-            self.storeactions[vehicle_id].dur_reward += - avg_request_value*1e-2
-            return - avg_request_value*1e-2, - avg_request_value*1e-2
+            self.storeactions[vehicle_id].dur_reward += - avg_request_value*0.1
+            return - avg_request_value*0.1, - avg_request_value*0.1
         
         reward = 0
         dur_reward = 0.0
@@ -2139,7 +2145,7 @@ class ChargingIntegratedEnvironment(Environment):
             print(f"⚠️  车辆 {vehicle_id} 在智能移动后电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other movement methods)
-        return (self.movingpenalty  -  np.abs(np.random.normal(0, 0.05)))*distance if distance > 0 else -0.05 
+        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance if distance > 0 else -0.05 
     
 
 
@@ -2270,7 +2276,7 @@ class ChargingIntegratedEnvironment(Environment):
             print(f"⚠️  车辆 {vehicle_id} 前往充电站时电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other movement methods)
-        return (self.movingpenalty  -  np.abs(np.random.normal(0, 0.05)))*distance 
+        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance 
     
     def _execute_movement_towards_idle(self, vehicle_id, target_coords):
         """Execute movement towards idle target coordinates"""
@@ -2347,7 +2353,7 @@ class ChargingIntegratedEnvironment(Environment):
         active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
         avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 100.0
         # Small time penalty for movement (consistent with other methods)
-        return (self.movingpenalty  -  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value*1e-2
+        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value*0.1
     
     def _update_environment(self):
         """Update environment state"""
@@ -2441,6 +2447,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.charge_stats = {station_id: [] for station_id in self.charging_manager.stations}
         # Reset rebalancing assignment tracking
         self.rebalancing_assignments_per_step = []
+        self.rebalancing_whole = []
         self.total_rebalancing_calls = 0
         self.storeactions = {}
         self.storeactions_next = {}
@@ -2531,7 +2538,7 @@ class ChargingIntegratedEnvironment(Environment):
         if self.rebalancing_assignments_per_step:
             total_rebalancing_assignments = sum(self.rebalancing_assignments_per_step)
             avg_rebalancing_assignments = total_rebalancing_assignments / len(self.rebalancing_assignments_per_step)
-        
+            avg_rebalance_whole = sum(self.rebalancing_whole) / len(self.rebalancing_whole) if self.rebalancing_whole else 0
         return {
             'episode_time': self.current_time,
             'total_orders': total_orders,
@@ -2553,7 +2560,9 @@ class ChargingIntegratedEnvironment(Environment):
             'total_rebalancing_calls': self.total_rebalancing_calls,
             'total_rebalancing_assignments': total_rebalancing_assignments,
             'avg_rebalancing_assignments_per_call': avg_rebalancing_assignments,
-            'rebalancing_assignments_per_step': self.rebalancing_assignments_per_step.copy()
+            'avg_rebalancing_assignments_per_whole': avg_rebalance_whole,
+            'rebalancing_assignments_per_step': self.rebalancing_assignments_per_step.copy(),
+            'rebalance_whole': self.rebalancing_whole.copy()
         }
 
     def get_stats(self):
