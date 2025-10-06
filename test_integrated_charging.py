@@ -252,6 +252,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         results['environment_stats'].append(stats)
         results['battery_levels'].append(stats['average_battery'])
         results['completed_requests'] = stats['completed_requests']
+        results['avg_requestvalue'] = stats['completed_orders_req']
         # Collect detailed episode statistics
         episode_stats = env.get_episode_stats()
         episode_stats['episode_number'] = episode + 1
