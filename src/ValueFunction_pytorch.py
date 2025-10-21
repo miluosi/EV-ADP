@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import math
 import gym
@@ -261,7 +262,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
     
     def __init__(self, grid_size: int = 10, num_vehicles: int = 8, 
                  log_dir: str = "logs/charging_nn", device: str = 'cpu',
-                 episode_length: int = 300, max_requests: int = 1000):
+                 episode_length: int = 300, max_requests: int = 1000, env=None):
         super().__init__(log_dir=log_dir, device=device)
         
         self.grid_size = grid_size
@@ -269,6 +270,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         self.episode_length = episode_length  # 实际episode长度
         self.max_requests = max_requests      # 最大预期请求数
         self.num_locations = grid_size * grid_size
+        self.env = env  # 存储环境引用
         
         # Initialize the neural network with increased capacity for complex environment
         self.network = PyTorchPathBasedNetwork(
@@ -294,7 +296,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # Copy weights from main network to target network
         self.target_network.load_state_dict(self.network.state_dict())
-        self.target_update_frequency = 100  # Update target network every 100 steps
+        self.target_update_frequency = 500  # Update target network every 100 steps
         
         # Ensure all parameters require gradients
         total_params = 0
@@ -326,9 +328,43 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         self.q_values_history = []
         self.training_step = 0
         
+        # Debug mode for detailed logging
+        self.debug_mode = False  # 设置为False以避免过多输出，可以通过外部设置为True
+        
+        # 初始化拒绝概率学习网络
+        self._init_rejection_predictor()
+        
         print(f"✓ PyTorchChargingValueFunction initialized with neural network")
         print(f"   - Grid size: {grid_size}x{grid_size}")
         print(f"   - Network parameters: {sum(p.numel() for p in self.network.parameters())}")
+        print(f"   - Rejection predictor parameters: {sum(p.numel() for p in self.rejection_predictor.parameters())}")
+    
+    def _init_rejection_predictor(self):
+        """初始化拒绝概率预测神经网络"""
+        class RejectionPredictor(nn.Module):
+            def __init__(self, input_dim=5, hidden_dim=64):
+                super().__init__()
+                self.network = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden_dim, hidden_dim // 2),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden_dim // 2, 1),
+                    nn.Sigmoid()  # 输出0-1之间的拒绝概率
+                )
+            
+            def forward(self, x):
+                return self.network(x)
+        
+        self.rejection_predictor = RejectionPredictor().to(self.device)
+        self.rejection_optimizer = optim.Adam(self.rejection_predictor.parameters(), lr=1e-3)
+        self.rejection_criterion = nn.BCELoss()
+        
+        # 拒绝数据缓冲区
+        self.rejection_buffer = deque(maxlen=5000)
+        self.rejection_training_losses = []
     
     def get_q_value(self, vehicle_id: int, action_type: str, vehicle_location: int, 
                    target_location: int, current_time: float = 0.0, 
@@ -579,27 +615,162 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                    others_tensor, requests_tensor, battery_tensor, value_tensor)
     
     def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
-                              vehicle_location: int, target_location: int, 
+                              vehicle_location: int, target_reject: int, target_location: int, 
                               current_time: float = 0.0, other_vehicles: int = 0, 
                               num_requests: int = 0, battery_level: float = 1.0,
                               request_value: float = 0.0) -> float:
         """
         Enhanced Q-value for vehicle assignment to request using neural network
-        现在包含更丰富的上下文信息和优化的计算逻辑
+        现在包含更丰富的上下文信息和优化的计算逻辑，以及EV拒绝学习机制
         """
         # 基础Q值计算
         base_q_value = self.get_q_value(vehicle_id, f"assign_{target_id}", 
                                        vehicle_location, target_location, current_time, 
                                        other_vehicles, num_requests, battery_level, request_value)
         
-        # # 增强的上下文调整因子
-        # context_adjustment = self._calculate_context_adjustment(
-        #     vehicle_id, vehicle_location, target_location, battery_level, 
-        #     request_value, other_vehicles, num_requests, current_time
-        # )
+        # 为EV车辆添加距离惩罚和拒绝风险评估
+        # if hasattr(self, 'env') and self.env is not None:
+        #     vehicle = self.env.vehicles.get(vehicle_id)
+        #     if vehicle and vehicle.get('type') == 1:  # EV车辆
+        #         # 计算到接客点的距离（假设target_id对应pickup位置）
+        #         grid_size = self.env.grid_size if hasattr(self.env, 'grid_size') else int(math.sqrt(max(vehicle_location, target_reject)) + 1)
+        #         distance = self._calculate_manhattan_distance(vehicle_location, target_reject, grid_size)
+        #         print(f"Vehicle {vehicle_id} (EV) distance to request {target_id}: {distance}")
+        #         # 距离惩罚：距离越远，Q值越低
+        #         distance_penalty = distance * 0.15  # 可调节的距离惩罚因子
+                
+        #         # 拒绝风险惩罚：基于历史经验学习的拒绝概率
+        #         rejection_penalty = self._calculate_rejection_risk_penalty(vehicle_id, distance)
+                
+        #         base_q_value = base_q_value - distance_penalty - rejection_penalty
+                
         
         # 返回调整后的Q值
         return base_q_value 
+    
+    def batch_get_assignment_q_value(self, batch_inputs):
+        """
+        批量计算多个vehicle-request对的Q值，提高计算效率
+        
+        Args:
+            batch_inputs: List of input dictionaries, each containing:
+                - vehicle_id, target_id, vehicle_location, target_reject, target_location,
+                - current_time, other_vehicles, num_requests, battery_level, request_value
+                
+        Returns:
+            List of Q-values corresponding to each input
+        """
+        if not batch_inputs:
+            return []
+        
+        # 准备批量数据
+        batch_size = len(batch_inputs)
+        
+        # 收集所有输入数据
+        vehicle_ids = []
+        target_ids = []
+        vehicle_locations = []
+        target_locations = []
+        current_times = []
+        other_vehicles_list = []
+        num_requests_list = []
+        battery_levels = []
+        request_values = []
+        
+        for input_data in batch_inputs:
+            vehicle_ids.append(input_data['vehicle_id'])
+            target_ids.append(input_data['target_id'])
+            vehicle_locations.append(input_data['vehicle_location'])
+            target_locations.append(input_data['target_location'])
+            current_times.append(input_data.get('current_time', 0.0))
+            other_vehicles_list.append(input_data.get('other_vehicles', 0))
+            num_requests_list.append(input_data.get('num_requests', 0))
+            battery_levels.append(input_data.get('battery_level', 1.0))
+            request_values.append(input_data.get('request_value', 0.0))
+        
+        # 批量准备神经网络输入
+        try:
+            batch_network_inputs = []
+            for i in range(batch_size):
+                action_type = f"assign_{target_ids[i]}"
+                network_input = self._prepare_network_input_with_battery(
+                    vehicle_locations[i], target_locations[i], current_times[i],
+                    other_vehicles_list[i], num_requests_list[i], action_type,
+                    battery_levels[i], request_values[i]
+                )
+                batch_network_inputs.append(network_input)
+            
+            # 批量转换为张量
+            batch_tensors = self._batch_prepare_tensors(batch_network_inputs)
+            
+            # 使用神经网络进行批量前向传播
+            with torch.no_grad():
+                batch_q_values = self.network(
+                    path_locations=batch_tensors['path_locations'],
+                    path_delays=batch_tensors['path_delays'],
+                    current_time=batch_tensors['current_time'],
+                    other_agents=batch_tensors['other_agents'],
+                    num_requests=batch_tensors['num_requests'],
+                    battery_level=batch_tensors['battery_level'],
+                    request_value=batch_tensors['request_value'],
+                    action_type=None,  # 让网络自动推断
+                    vehicle_id=None,   # 批量处理时不使用vehicle_id embedding
+                    vehicle_type=None  # 批量处理时不使用vehicle_type embedding
+                )
+            
+            # 转换为Python列表
+            q_values = batch_q_values.cpu().numpy().flatten().tolist()
+            
+            return q_values
+            
+        except Exception as e:
+            print(f"Batch Q-value calculation failed: {e}")
+            # 回退到单独计算
+            return [self.get_assignment_q_value(**input_data) for input_data in batch_inputs]
+    
+    def _batch_prepare_tensors(self, batch_network_inputs):
+        """
+        将批量网络输入转换为适合批量处理的张量
+        """
+        batch_size = len(batch_network_inputs)
+        
+        # 初始化批量张量
+        batch_tensors = {}
+        
+        # 获取第一个输入的维度信息
+        first_input = batch_network_inputs[0]
+        if len(first_input) >= 7:  # 包含battery和request_value
+            path_locations_list = []
+            path_delays_list = []
+            current_time_list = []
+            other_agents_list = []
+            num_requests_list = []
+            battery_level_list = []
+            request_value_list = []
+            
+            for network_input in batch_network_inputs:
+                path_locations, path_delays, current_time, other_agents, num_requests, battery_level, request_value = network_input
+                path_locations_list.append(path_locations.squeeze(0))
+                path_delays_list.append(path_delays.squeeze(0))
+                current_time_list.append(current_time.squeeze(0))
+                other_agents_list.append(other_agents.squeeze(0))
+                num_requests_list.append(num_requests.squeeze(0))
+                battery_level_list.append(battery_level.squeeze(0))
+                request_value_list.append(request_value.squeeze(0))
+            
+            # 堆叠为批量张量
+            batch_tensors['path_locations'] = torch.stack(path_locations_list)
+            batch_tensors['path_delays'] = torch.stack(path_delays_list)
+            batch_tensors['current_time'] = torch.stack(current_time_list)
+            batch_tensors['other_agents'] = torch.stack(other_agents_list)
+            batch_tensors['num_requests'] = torch.stack(num_requests_list)
+            batch_tensors['battery_level'] = torch.stack(battery_level_list)
+            batch_tensors['request_value'] = torch.stack(request_value_list)
+        else:
+            # 向后兼容处理
+            raise ValueError("Insufficient input dimensions for batch processing")
+        
+        return batch_tensors
         
     def _calculate_context_adjustment(self, vehicle_id: int, vehicle_location: int, 
                                     target_location: int, battery_level: float,
@@ -699,6 +870,81 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         return self.get_q_value(vehicle_id, f"charge_{station_id}",
                                vehicle_location, station_location, current_time,
                                other_vehicles, num_requests, battery_level)
+    
+    def _calculate_rejection_risk_penalty(self, vehicle_id: int, distance: float) -> float:
+        """
+        基于神经网络从历史拒绝经验学习的拒绝概率计算惩罚
+        使用训练好的神经网络预测拒绝概率，而不是固定的数学公式
+        """
+        # 获取车辆信息
+        if hasattr(self, 'env') and self.env is not None:
+            vehicle = self.env.vehicles.get(vehicle_id)
+            if vehicle is None:
+                return 0.0
+            
+            battery_level = vehicle.get('battery', 1.0)
+            vehicle_type = vehicle.get('type', 1)
+            current_time = self.env.current_time if hasattr(self.env, 'current_time') else 0
+            num_requests = len(self.env.active_requests) if hasattr(self.env, 'active_requests') else 0
+        else:
+            # 回退到默认值
+            battery_level = 1.0
+            vehicle_type = 1 if vehicle_id % 2 == 0 else 2
+            current_time = 0
+            num_requests = 0
+        
+        # 只为EV车辆计算拒绝风险，AEV不拒绝
+        if vehicle_type != 1:  # 不是EV
+            return 0.0
+        
+        # 准备神经网络输入特征
+        features = torch.tensor([
+            distance / 20.0,  # 归一化距离（假设最大距离为20）
+            battery_level,    # 电池电量
+            current_time / 300.0,  # 归一化时间
+            num_requests / 50.0,   # 归一化请求数量
+            1.0  # EV标识（1=EV, 0=AEV）
+        ], dtype=torch.float32).unsqueeze(0).to(self.device)
+        
+        # 使用神经网络预测拒绝概率
+        self.rejection_predictor.eval()
+        with torch.no_grad():
+            rejection_prob = self.rejection_predictor(features).item()
+        
+        # 基于预测的拒绝概率计算惩罚
+        rejection_penalty = rejection_prob * 3.0  # 可调节的拒绝惩罚因子
+        
+        # 如果拒绝数据不足，回退到简单的距离公式
+        if len(self.rejection_buffer) < 50:
+            distance_factor = 0.1
+            fallback_prob = min(0.9, 1 - math.exp(-distance * distance_factor))
+            rejection_penalty = fallback_prob * 2.0
+        
+        return rejection_penalty
+    
+    def _calculate_manhattan_distance(self, location1: int, location2: int, grid_size: int = None) -> float:
+        """
+        计算两个位置之间的曼哈顿距离
+        
+        Args:
+            location1: 位置1（网格索引）
+            location2: 位置2（网格索引）
+            grid_size: 网格大小，如果未提供则使用self.grid_size
+            
+        Returns:
+            曼哈顿距离
+        """
+        if grid_size is None:
+            grid_size = self.grid_size
+            
+        # 将位置索引转换为坐标
+        x1, y1 = location1 % grid_size, location1 // grid_size
+        x2, y2 = location2 % grid_size, location2 // grid_size
+        
+        # 计算曼哈顿距离
+        distance = abs(x1 - x2) + abs(y1 - y2)
+        
+        return float(distance)
     
     def store_experience(self, vehicle_id: int, action_type: str, vehicle_location: int,
                         target_location: int, current_time: float, reward: float,
@@ -834,6 +1080,179 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         return {
             'reward_stats': reward_stats,
             'action_stats': action_stats
+        }
+    
+    def store_rejection_experience(self, vehicle_id: int, request_id: int, vehicle_location: int,
+                                 pickup_location: int, current_time: float, distance: float,
+                                 rejection_reason: str = "distance"):
+        #print("Storing rejection experience...")
+        """
+        存储EV拒绝订单的负面经验，用于训练避免分配给EV远距离或容易被拒绝的订单
+        
+        Args:
+            vehicle_id: 拒绝订单的EV车辆ID
+            request_id: 被拒绝的请求ID
+            vehicle_location: 车辆位置
+            pickup_location: 接客位置
+            current_time: 当前时间
+            distance: 距离（主要的拒绝因素）
+            rejection_reason: 拒绝原因
+        """
+        # 计算负面奖励，距离越远惩罚越大
+        distance_penalty = -1.0 - (distance * 0.2)  # 基础惩罚-1.0，加上距离惩罚
+        
+        # 存储拒绝经验
+        rejection_experience = {
+            'vehicle_id': vehicle_id,
+            'vehicle_type': 1,  # EV
+            'action_type': f'assign_{request_id}',
+            'vehicle_location': vehicle_location,
+            'target_location': pickup_location,
+            'battery_level': 1.0,  # 假设默认电量
+            'current_time': current_time,
+            'reward': distance_penalty,  # 负面奖励
+            'next_vehicle_location': vehicle_location,  # 拒绝后车辆位置不变
+            'next_battery_level': 1.0,
+            'next_action_type': 'idle',  # 拒绝后变为idle状态
+            'other_vehicles': 0,
+            'num_requests': 1,
+            'request_value': 0.0,
+            'next_request_value': 0.0,
+            'is_idle': False,
+            'is_rejection': True,  # 标记为拒绝经验
+            'rejection_reason': rejection_reason,
+            'rejection_distance': distance
+        }
+        
+
+        vehicle = self.env.vehicles.get(vehicle_id)
+        if vehicle is not None:
+            battery_level = vehicle.get('battery', 1.0)
+            num_requests = len(self.env.active_requests) if hasattr(self.env, 'active_requests') else 0
+            
+            rejection_data = {
+                'distance': distance,
+                'battery_level': battery_level,
+                'current_time': current_time,
+                'num_requests': num_requests,
+                'vehicle_type': 1,  # EV
+                'was_rejected': True  # 实际拒绝了
+            }
+            self.rejection_buffer.append(rejection_data)
+    
+    def store_acceptance_experience(self, vehicle_id: int, request_id: int, vehicle_location: int,
+                                  pickup_location: int, current_time: float, distance: float):
+        """
+        存储EV接受订单的正面经验，用于训练拒绝概率预测器
+        这与拒绝经验形成对比，帮助网络学习接受/拒绝的边界
+        """
+        if hasattr(self, 'env') and self.env is not None:
+            vehicle = self.env.vehicles.get(vehicle_id)
+            if vehicle is not None and vehicle.get('type') == 1:  # 只存储EV的接受数据
+                battery_level = vehicle.get('battery', 1.0)
+                num_requests = len(self.env.active_requests) if hasattr(self.env, 'active_requests') else 0
+                
+                acceptance_data = {
+                    'distance': distance,
+                    'battery_level': battery_level,
+                    'current_time': current_time,
+                    'num_requests': num_requests,
+                    'vehicle_type': 1,  # EV
+                    'was_rejected': False  # 实际接受了
+                }
+                
+                self.rejection_buffer.append(acceptance_data)
+                
+                if self.debug_mode:
+                    print(f"Stored acceptance experience: EV {vehicle_id} accepted request {request_id} "
+                          f"(distance={distance:.2f})")
+        
+
+    
+    def train_rejection_predictor(self, batch_size=64):
+        """
+        训练拒绝概率预测神经网络
+        使用存储的拒绝和接受数据进行监督学习
+        """
+        print("Training rejection predictor...")
+        print(f"Rejection buffer size: {len(self.rejection_buffer)}")
+        if len(self.rejection_buffer) < batch_size:
+            return None  # 数据不足，无法训练
+        
+        # 准备训练数据
+        data = list(self.rejection_buffer)
+        random.shuffle(data)
+        
+        # 分离特征和标签
+        features = []
+        labels = []
+        
+        for sample in data:
+            feature = [
+                sample['distance'],
+                sample['battery_level'],
+                sample['current_time'],
+                sample['num_requests'],
+                sample['vehicle_type']
+            ]
+            features.append(feature)
+            labels.append(1.0 if sample['was_rejected'] else 0.0)
+        
+        # 转换为张量
+        X = torch.tensor(features, dtype=torch.float32).to(self.device)
+        y = torch.tensor(labels, dtype=torch.float32).to(self.device)
+        
+        # 小批量训练
+        dataset = TensorDataset(X, y)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for batch_X, batch_y in dataloader:
+            self.rejection_optimizer.zero_grad()
+            
+            # 前向传播
+            predictions = self.rejection_predictor(batch_X).squeeze(-1)  # 只移除最后一个维度
+            # 确保维度匹配
+            if predictions.dim() == 0:  # 如果是标量，添加一个维度
+                predictions = predictions.unsqueeze(0)
+            if batch_y.dim() == 0:  # 如果batch_y是标量，添加一个维度
+                batch_y = batch_y.unsqueeze(0)
+            
+            loss = self.rejection_criterion(predictions, batch_y)
+            
+            # 反向传播
+            loss.backward()
+            self.rejection_optimizer.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+        
+        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        
+        if self.debug_mode:
+            print(f"Rejection predictor training: {len(data)} samples, avg_loss={avg_loss:.4f}")
+        
+        return avg_loss
+    
+    def get_rejection_statistics(self):
+        """获取拒绝经验的统计信息"""
+        rejection_experiences = [exp for exp in self.experience_buffer if exp.get('is_rejection', False)]
+        
+        if not rejection_experiences:
+            return None
+            
+        distances = [exp['rejection_distance'] for exp in rejection_experiences]
+        rewards = [exp['reward'] for exp in rejection_experiences]
+        
+        return {
+            'total_rejections': len(rejection_experiences),
+            'avg_rejection_distance': np.mean(distances),
+            'max_rejection_distance': np.max(distances),
+            'min_rejection_distance': np.min(distances),
+            'avg_rejection_penalty': np.mean(rewards),
+            'rejection_ratio': len(rejection_experiences) / len(self.experience_buffer) if self.experience_buffer else 0
         }
     
     def _advanced_sample(self, batch_size: int, method: str = "balanced"):
@@ -1164,7 +1583,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         return sampled_batch
 
-    def train_step(self, batch_size: int = 64, tau: float = 0.01):  # 软更新系数，推荐0.001~0.01，可调
+    def train_step(self, batch_size: int = 64, tau: float = 0.005):  # 软更新系数，推荐0.001~0.01，可调
         """Perform one training step using stored experiences with proper DQN algorithm"""
         if len(self.experience_buffer) < batch_size * 2:  # Wait for more experiences
             return 0.0
@@ -1424,6 +1843,12 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         self.training_step += 1
         
+        # 每50步训练一次拒绝预测器
+        if self.training_step % 50 == 0:
+            rejection_loss = self.train_rejection_predictor()
+            if rejection_loss is not None:
+                print(f"  Rejection predictor loss: {rejection_loss:.4f}")
+        
         # Print training progress occasionally  
         if self.training_step % 100 == 0:
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -1548,7 +1973,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
 
         if not inputs_list:
             return 0.0
-
+        
         # Downsample to num_samples if necessary
         if len(inputs_list) > num_samples:
             idxs = random.sample(range(len(inputs_list)), num_samples)
@@ -2046,10 +2471,10 @@ class PyTorchPathBasedNetwork(nn.Module):
             # 从路径模式推断action type
             # idle: 路径中第一个位置 == 第二个位置
             # assign/charge: 路径中第一个位置 != 第二个位置
-            is_idle = (path_locations[:, 0] == path_locations[:, 1]).long()
+            is_idle = (path_locations[:, 0] == path_locations[:, 1])  # 保持为布尔张量
             action_type = torch.where(is_idle, 
-                                    torch.ones_like(is_idle),  # idle = 1
-                                    torch.full_like(is_idle, 2))  # assign/charge = 2 (默认assign)
+                                    torch.ones(is_idle.size(), dtype=torch.long, device=is_idle.device),  # idle = 1
+                                    torch.full(is_idle.size(), 2, dtype=torch.long, device=is_idle.device))  # assign/charge = 2
             action_type = action_type.unsqueeze(1)  # [batch_size, 1]
         
         # Get embeddings
@@ -2414,6 +2839,378 @@ def main():
     print("PyTorch Value Function initialized successfully!")
     print(f"Network parameters: {sum(p.numel() for p in value_function.value_network.parameters())}")
     print(f"Device: {device}")
+
+
+# =============================================================================
+# DQN Implementation for Benchmark Comparison
+# =============================================================================
+
+class DQNActionNetwork(nn.Module):
+    """
+    Deep Q-Network for action selection in vehicle dispatch
+    Provides a benchmark for comparison with ILP-ADP approach
+    """
+    def __init__(self, state_dim=64, action_dim=32, hidden_dim=128, device='cpu'):
+        super(DQNActionNetwork, self).__init__()
+        self.device = device
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        # Feature encoders for different input modalities
+        self.vehicle_encoder = nn.Sequential(
+            nn.Linear(8, hidden_dim//2),  # vehicle_id, type, location, battery, etc.
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, hidden_dim//4)
+        )
+        
+        self.request_encoder = nn.Sequential(
+            nn.Linear(6, hidden_dim//2),  # pickup, dropoff, time, value, etc.
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, hidden_dim//4)
+        )
+        
+        self.global_encoder = nn.Sequential(
+            nn.Linear(4, hidden_dim//4),  # num_vehicles, num_requests, time, etc.
+            nn.ReLU(),
+            nn.Linear(hidden_dim//4, hidden_dim//8)
+        )
+        
+        # Main DQN network (Dueling architecture)
+        total_feature_dim = hidden_dim//4 + hidden_dim//4 + hidden_dim//8
+        
+        self.feature_layer = nn.Sequential(
+            nn.Linear(total_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Dueling DQN: separate value and advantage streams
+        self.value_stream = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 1)
+        )
+        
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, action_dim)
+        )
+        
+        self.to(device)
+    
+    def forward(self, vehicle_features, request_features, global_features):
+        """
+        Forward pass through the DQN
+        
+        Args:
+            vehicle_features: Tensor of vehicle state features
+            request_features: Tensor of request features
+            global_features: Tensor of global environment features
+        
+        Returns:
+            Q-values for all possible actions
+        """
+        # Encode different feature types
+        vehicle_encoded = self.vehicle_encoder(vehicle_features)
+        request_encoded = self.request_encoder(request_features)
+        global_encoded = self.global_encoder(global_features)
+        
+        # Concatenate all features
+        combined_features = torch.cat([vehicle_encoded, request_encoded, global_encoded], dim=-1)
+        
+        # Main feature processing
+        features = self.feature_layer(combined_features)
+        
+        # Dueling streams
+        value = self.value_stream(features)
+        advantage = self.advantage_stream(features)
+        
+        # Combine value and advantage (dueling DQN formula)
+        q_values = value + advantage - advantage.mean(dim=-1, keepdim=True)
+        
+        return q_values
+    
+    def get_action(self, vehicle_features, request_features, global_features, epsilon=0.0):
+        """
+        Select action using epsilon-greedy policy
+        
+        Args:
+            vehicle_features: Vehicle state features
+            request_features: Request features
+            global_features: Global environment features
+            epsilon: Exploration probability
+        
+        Returns:
+            Selected action index and Q-values
+        """
+        if random.random() < epsilon:
+            # Random action for exploration
+            action = random.randint(0, self.action_dim - 1)
+            with torch.no_grad():
+                q_values = self.forward(vehicle_features, request_features, global_features)
+            return action, q_values
+        else:
+            # Greedy action selection
+            with torch.no_grad():
+                q_values = self.forward(vehicle_features, request_features, global_features)
+                action = q_values.argmax(dim=-1).item()
+            return action, q_values
+
+
+class DQNExperienceReplay:
+    """Experience replay buffer for DQN training"""
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        """Add experience to buffer"""
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        """Sample random batch from buffer"""
+        batch = random.sample(self.buffer, batch_size)
+        return zip(*batch)
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DQNAgent:
+    """
+    DQN Agent for vehicle dispatch decision making
+    Serves as benchmark comparison for ILP-ADP approach
+    """
+    def __init__(self, state_dim=64, action_dim=32, lr=1e-4, gamma=0.99, 
+                 epsilon_start=1.0, epsilon_end=0.1, epsilon_decay=1000,
+                 target_update=100, device='cpu'):
+        self.device = device
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.epsilon_start = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.target_update = target_update
+        self.steps_done = 0
+        
+        # Networks
+        self.policy_net = DQNActionNetwork(state_dim, action_dim, device=device)
+        self.target_net = DQNActionNetwork(state_dim, action_dim, device=device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        
+        # Optimizer and loss
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.criterion = nn.MSELoss()
+        
+        # Experience replay
+        self.memory = DQNExperienceReplay(capacity=10000)
+        
+        # Training statistics
+        self.training_stats = {
+            'episode_rewards': [],
+            'episode_lengths': [],
+            'avg_q_values': [],
+            'losses': []
+        }
+    
+    def get_epsilon(self):
+        """Calculate current epsilon for exploration"""
+        epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+                 math.exp(-1. * self.steps_done / self.epsilon_decay)
+        return epsilon
+    
+    def select_action(self, vehicle_features, request_features, global_features, training=True):
+        """
+        Select action for given state
+        
+        Args:
+            vehicle_features: Vehicle state tensor
+            request_features: Request features tensor  
+            global_features: Global environment tensor
+            training: Whether in training mode (affects exploration)
+        
+        Returns:
+            action: Selected action index
+            q_values: Q-values for all actions
+        """
+        epsilon = self.get_epsilon() if training else 0.0
+        self.steps_done += 1
+        
+        return self.policy_net.get_action(vehicle_features, request_features, 
+                                        global_features, epsilon)
+    
+    def store_transition(self, state, action, reward, next_state, done):
+        """Store experience in replay buffer"""
+        self.memory.push(state, action, reward, next_state, done)
+    
+    def train_step(self, batch_size=32):
+        """
+        Perform one training step
+        
+        Args:
+            batch_size: Size of training batch
+            
+        Returns:
+            loss: Training loss value
+        """
+        if len(self.memory) < batch_size:
+            return None
+        
+        # Sample batch from memory
+        states, actions, rewards, next_states, dones = self.memory.sample(batch_size)
+        
+        # Convert to tensors
+        batch_states = {
+            'vehicle': torch.stack([s['vehicle'] for s in states]).to(self.device),
+            'request': torch.stack([s['request'] for s in states]).to(self.device),
+            'global': torch.stack([s['global'] for s in states]).to(self.device)
+        }
+        
+        batch_next_states = {
+            'vehicle': torch.stack([s['vehicle'] for s in next_states]).to(self.device),
+            'request': torch.stack([s['request'] for s in next_states]).to(self.device),
+            'global': torch.stack([s['global'] for s in next_states]).to(self.device)
+        }
+        
+        actions = torch.tensor(actions, dtype=torch.long).to(self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(self.device)
+        dones = torch.tensor(dones, dtype=torch.bool).to(self.device)
+        
+        # Current Q-values
+        current_q_values = self.policy_net(
+            batch_states['vehicle'], 
+            batch_states['request'], 
+            batch_states['global']
+        ).gather(1, actions.unsqueeze(1))
+        
+        # Next Q-values from target network
+        with torch.no_grad():
+            next_q_values = self.target_net(
+                batch_next_states['vehicle'],
+                batch_next_states['request'], 
+                batch_next_states['global']
+            ).max(1)[0]
+            target_q_values = rewards + (self.gamma * next_q_values * ~dones)
+        
+        # Compute loss
+        loss = self.criterion(current_q_values.squeeze(), target_q_values)
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
+        
+        self.optimizer.step()
+        
+        # Update target network
+        if self.steps_done % self.target_update == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+        
+        # Store training stats
+        self.training_stats['losses'].append(loss.item())
+        avg_q = current_q_values.mean().item()
+        self.training_stats['avg_q_values'].append(avg_q)
+        
+        return loss.item()
+    
+    def save_model(self, filepath):
+        """Save trained model"""
+        torch.save({
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'target_net_state_dict': self.target_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'training_stats': self.training_stats,
+            'steps_done': self.steps_done
+        }, filepath)
+    
+    def load_model(self, filepath):
+        """Load trained model"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.training_stats = checkpoint['training_stats']
+        self.steps_done = checkpoint['steps_done']
+
+
+def create_dqn_state_features(environment, vehicle_id, current_time=0.0):
+    """
+    Convert environment state to DQN input features
+    
+    Args:
+        environment: Environment instance
+        vehicle_id: ID of the vehicle
+        current_time: Current simulation time
+    
+    Returns:
+        dict: State features for DQN input
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Get vehicle information
+    vehicle = environment.vehicles.get(vehicle_id, {})
+    vehicle_location = vehicle.get('location', 0)
+    vehicle_type = vehicle.get('type', 1)
+    battery_level = vehicle.get('battery', 1.0)
+    is_idle = vehicle.get('idle', True)
+    
+    # Vehicle features: [id, type, location, battery, is_idle, x_coord, y_coord, capacity]
+    vehicle_features = torch.tensor([
+        vehicle_id / 100.0,  # Normalized vehicle ID
+        vehicle_type / 2.0,  # Normalized vehicle type (1 or 2)
+        vehicle_location / float(environment.NUM_LOCATIONS if hasattr(environment, 'NUM_LOCATIONS') else 50),
+        battery_level,
+        1.0 if is_idle else 0.0,
+        (vehicle_location % 10) / 10.0,  # X coordinate (assuming grid layout)
+        (vehicle_location // 10) / 10.0,  # Y coordinate
+        environment.MAX_CAPACITY / 10.0 if hasattr(environment, 'MAX_CAPACITY') else 1.0
+    ], dtype=torch.float32).to(device)
+    
+    # Request features (using active requests if available)
+    active_requests = getattr(environment, 'active_requests', [])
+    if active_requests:
+        # Use first request as representative
+        req = active_requests[0]
+        pickup_loc = getattr(req, 'pickup_location', 0)
+        dropoff_loc = getattr(req, 'dropoff_location', 0)
+        request_value = getattr(req, 'value', 1.0)
+        request_time = getattr(req, 'time', current_time)
+        distance = abs(pickup_loc - vehicle_location)
+        urgency = max(0.0, 1.0 - (current_time - request_time) / 100.0)
+    else:
+        pickup_loc, dropoff_loc, request_value, request_time, distance, urgency = 0, 0, 0, current_time, 0, 0
+    
+    # Request features: [pickup, dropoff, value, time, distance, urgency]
+    request_features = torch.tensor([
+        pickup_loc / float(environment.NUM_LOCATIONS if hasattr(environment, 'NUM_LOCATIONS') else 50),
+        dropoff_loc / float(environment.NUM_LOCATIONS if hasattr(environment, 'NUM_LOCATIONS') else 50),
+        request_value / 100.0,  # Normalized request value
+        (current_time % 1440) / 1440.0,  # Normalized time (assuming daily cycle)
+        distance / float(environment.NUM_LOCATIONS if hasattr(environment, 'NUM_LOCATIONS') else 50),
+        urgency
+    ], dtype=torch.float32).to(device)
+    
+    # Global features: [num_vehicles, num_requests, current_time, avg_battery]
+    num_vehicles = len(environment.vehicles) if hasattr(environment, 'vehicles') else 1
+    num_requests = len(active_requests)
+    avg_battery = sum(v.get('battery', 1.0) for v in environment.vehicles.values()) / num_vehicles if hasattr(environment, 'vehicles') and environment.vehicles else 1.0
+    
+    global_features = torch.tensor([
+        num_vehicles / 100.0,  # Normalized number of vehicles
+        num_requests / 50.0,   # Normalized number of requests
+        (current_time % 1440) / 1440.0,  # Normalized time
+        avg_battery
+    ], dtype=torch.float32).to(device)
+    
+    return {
+        'vehicle': vehicle_features,
+        'request': request_features,
+        'global': global_features
+    }
 
 
 if __name__ == "__main__":

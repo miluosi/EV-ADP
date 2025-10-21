@@ -5,8 +5,8 @@ class Request(object):
     It represents a single customer's *request* for a ride
     """
 
-    MAX_PICKUP_DELAY: float = 100.0  # Reduced from 300.0 to match episode length
-    MAX_DROPOFF_DELAY: float = 600.0
+    MAX_PICKUP_DELAY: float = 20
+    MAX_DROPOFF_DELAY: float = 50.0
 
     def __init__(self,
                  request_id: int,

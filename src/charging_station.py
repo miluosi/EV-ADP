@@ -110,3 +110,11 @@ class ChargingStationManager:
     def get_all_stations_status(self) -> List[Dict]:
         """Get status of all stations"""
         return [station.get_station_status() for station in self.stations.values()]
+    
+    def update_all_stations(self) -> None:
+        """Update all charging stations (for environment simulation)"""
+        # 简单的更新逻辑 - 可以扩展为更复杂的状态更新
+        for station in self.stations.values():
+            # 这里可以添加时间相关的更新逻辑
+            # 例如：队列处理、充电进度更新等
+            pass

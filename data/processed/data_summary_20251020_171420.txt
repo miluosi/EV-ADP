@@ -1,0 +1,36 @@
+NYC Taxi Data Processing Summary
+========================================
+Processing Time: 2025-10-20 17:14:20.530268
+Data Shape: (20000, 27)
+Columns: ['VendorID', 'tpep_pickup_datetime', 'tpep_dropoff_datetime', 'passenger_count', 'trip_distance', 'RatecodeID', 'store_and_fwd_flag', 'PULocationID', 'DOLocationID', 'payment_type', 'fare_amount', 'extra', 'mta_tax', 'tip_amount', 'tolls_amount', 'improvement_surcharge', 'total_amount', 'congestion_surcharge', 'Airport_fee', 'cbd_congestion_fee', 'pickup_hour', 'pickup_weekday', 'trip_duration', 'pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude']
+
+Data Statistics:
+--------------------
+Trip Distance - Mean: 3.12km, Std: 4.11km
+Fare Amount - Mean: $17.63, Std: $15.40
+
+Hourly Distribution:
+  Hour  0:  458 trips
+  Hour  1:  314 trips
+  Hour  2:  195 trips
+  Hour  3:  129 trips
+  Hour  4:   87 trips
+  Hour  5:   88 trips
+  Hour  6:  261 trips
+  Hour  7:  530 trips
+  Hour  8:  738 trips
+  Hour  9:  895 trips
+  Hour 10:  938 trips
+  Hour 11: 1054 trips
+  Hour 12: 1161 trips
+  Hour 13: 1190 trips
+  Hour 14: 1239 trips
+  Hour 15: 1308 trips
+  Hour 16: 1294 trips
+  Hour 17: 1433 trips
+  Hour 18: 1400 trips
+  Hour 19: 1227 trips
+  Hour 20: 1213 trips
+  Hour 21: 1185 trips
+  Hour 22:  959 trips
+  Hour 23:  704 trips

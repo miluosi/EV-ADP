@@ -1,0 +1,27 @@
+{
+  "test_summary": {
+    "timestamp": "2025-10-20T14:43:20.668806",
+    "passed_tests": 7,
+    "total_tests": 7,
+    "success_rate": 1.0,
+    "status": "PASSED"
+  },
+  "environment_config": {
+    "num_vehicles": 20,
+    "num_charging_stations": 10
+  },
+  "detailed_results": {
+    "full_episode": {
+      "total_reward": 131.0,
+      "avg_reward": 6.55,
+      "episode_length": 20,
+      "final_stats": {
+        "total_requests": 5,
+        "completed_requests": 20,
+        "total_revenue": 0,
+        "charging_events": 0,
+        "vehicle_utilization": []
+      }
+    }
+  }
+}

@@ -427,7 +427,7 @@ class ChargingIntegratedEnvironment(Environment):
     Integrated charging environment class, inheriting from src.Environment
     """
 
-    def __init__(self, num_vehicles=5, num_stations=3, grid_size=30, use_intense_requests=True, assignmentgurobi=True, random_seed=None):  # Increased grid size
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True, assignmentgurobi=True, random_seed=None):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -452,7 +452,7 @@ class ChargingIntegratedEnvironment(Environment):
         # Parameters for reward alignment with Gurobi optimization
         self.charging_penalty = 0.5  
         self.adp_value = 1.0  # Weight for Q-value contribution
-        self.unserved_penalty = 100
+        self.unserved_penalty = 50
         self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
         self.charge_duration = 2
         self.chargeincrease_per_epoch = 0.5
@@ -467,6 +467,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.movingpenalty = -5e-3
         # Vehicle states
         self.rebalance_battery_threshold = 0.3
+        self.heuristic_battery_threshold = 0.5  # Battery threshold for heuristic rebalancing
         self.vehicles = {}
         self.storeactions = {}
         
@@ -483,7 +484,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.request_counter = 0
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
         self.use_intense_requests = use_intense_requests  # Whether to use concentrated request generation
-        self.battery_consum = 0.005  # Battery consumption per epoch when moving
+        self.battery_consum = 0.015  # Battery consumption per epoch when moving
         # Assignment tracking for rebalancing analysis
         self.rebalancing_assignments_per_step = []  # Store assignments count per step
         self.rebalancing_whole = []
@@ -653,10 +654,7 @@ class ChargingIntegratedEnvironment(Environment):
             return idle_v
 
     def evaluate_service_option(self, vehicle_id: int, request) -> float:
-        """Estimate completion Q for serving a request (option value):
-        Q_opt ≈ R_exec + gamma^tau * V(s_after).
-        Minimal R_exec: movement penalties + final_value; battery feasibility check.
-        """
+
         # Resolve request object from id
         if isinstance(request, (int, str)) and request in self.active_requests:
             request = self.active_requests[request]
@@ -671,8 +669,9 @@ class ChargingIntegratedEnvironment(Environment):
         other_idle = len([v for vid, v in self.vehicles.items() if vid != vehicle_id and v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None])
         v_after = self.value_function.get_assignment_q_value(
                 vehicle_id=vehicle_id,
-                target_id=request.id,
+                target_id=request.request_id,
                 vehicle_location=cur_loc,
+                target_reject=request.pickup,
                 target_location=request.dropoff,
                 current_time=self.current_time,
                 other_vehicles=max(0, other_idle),
@@ -682,9 +681,141 @@ class ChargingIntegratedEnvironment(Environment):
         
         return  v_after
 
+    def batch_evaluate_service_options(self, vehicle_request_pairs):
+        """
+        批量计算多个vehicle-request对的拒绝感知调整Q值，提高计算效率
+        现在集成神经网络预测的拒绝率: Q_value - immediate_reward * rejection_probability
+        
+        Args:
+            vehicle_request_pairs: List of (vehicle_id, request) tuples
+            
+        Returns:
+            List of rejection-aware adjusted Q-values corresponding to each vehicle-request pair
+        """
+        if not vehicle_request_pairs:
+            return []
+        
+        # 准备批量输入数据
+        batch_inputs = []
+        valid_pairs = []
+        
+        for vehicle_id, request in vehicle_request_pairs:
+            # 检查vehicle和request的有效性
+            veh = self.vehicles.get(vehicle_id)
+            if veh is None or request is None:
+                continue
+                
+            # 如果request是ID，解析为对象
+            if isinstance(request, (int, str)) and request in self.active_requests:
+                request = self.active_requests[request]
+            if request is None:
+                continue
+                
+            cur_loc = veh['location']
+            cur_bat = veh['battery']
+            num_reqs = len(self.active_requests)
+            other_idle = len([v for vid, v in self.vehicles.items() 
+                             if vid != vehicle_id and v['assigned_request'] is None 
+                             and v['passenger_onboard'] is None and v['charging_station'] is None])
+            
+            # 准备神经网络输入
+            input_data = {
+                'vehicle_id': vehicle_id,
+                'target_id': request.request_id,
+                'vehicle_location': cur_loc,
+                'target_reject': request.pickup,
+                'target_location': request.dropoff,
+                'current_time': self.current_time,
+                'other_vehicles': max(0, other_idle),
+                'num_requests': num_reqs,
+                'battery_level': cur_bat,
+            }
+            
+            batch_inputs.append(input_data)
+            valid_pairs.append((vehicle_id, request))
+        
+        if not batch_inputs:
+            return []
+        
+        # 批量计算基础Q值
+        try:
+            base_q_values = []
+            if hasattr(self.value_function, 'batch_get_assignment_q_value'):
+                # 如果value function支持批量计算
+                base_q_values = self.value_function.batch_get_assignment_q_value(batch_inputs)
+            else:
+                # 否则使用优化的单独计算
+                for input_data in batch_inputs:
+                    q_value = self.value_function.get_assignment_q_value(**input_data)
+                    base_q_values.append(q_value)
+            
+            # 批量计算拒绝感知调整值
+            adjusted_q_values = []
+            for i, (vehicle_id, request) in enumerate(valid_pairs):
+                base_q = base_q_values[i] if i < len(base_q_values) else 0.0
+                
+                # 计算拒绝感知调整: Q_value - immediate_reward * rejection_probability
+                adjusted_q = self._calculate_rejection_aware_adjustment(
+                    vehicle_id, request, base_q
+                )
+                adjusted_q_values.append(adjusted_q)
+            
+            return adjusted_q_values
+            
+        except Exception as e:
+            print(f"Batch Q-value calculation failed: {e}")
+            # 回退到逐个计算
+            return [self.evaluate_service_option(vehicle_id, request) 
+                    for vehicle_id, request in valid_pairs]
+    
+    def _calculate_rejection_aware_adjustment(self, vehicle_id, request, base_q_value):
+        """
+        计算拒绝感知的Q值调整: Q_value - immediate_reward * rejection_probability
+        
+        Args:
+            vehicle_id: 车辆ID
+            request: 请求对象
+            base_q_value: 基础Q值
+            
+        Returns:
+            float: 调整后的Q值
+        """
+        vehicle = self.vehicles.get(vehicle_id)
+        if vehicle is None:
+            return base_q_value
+        
+        # 计算立即收益
+        immediate_reward = getattr(request, 'final_value', getattr(request, 'value', 0.0))
+        
+        # 计算移动成本
+        cur_loc = vehicle['location']
+        pickup_x = request.pickup % self.grid_size
+        pickup_y = request.pickup // self.grid_size
+        dropoff_x = request.dropoff % self.grid_size
+        dropoff_y = request.dropoff // self.grid_size
+        vehicle_x = cur_loc % self.grid_size
+        vehicle_y = cur_loc // self.grid_size
+        
+        d1 = abs(vehicle_x - pickup_x) + abs(vehicle_y - pickup_y)
+        d2 = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+        moving_cost = getattr(self, 'movingpenalty', -0.1) * (d1 + d2)
+        
+        # 净立即收益
+        net_immediate_reward = immediate_reward + moving_cost
+        
+        # 获取拒绝概率
+        rejection_prob = self._calculate_rejection_probability(vehicle_id, request)
+        
+        # 计算调整后的Q值: Q值 - 立即收益 * 拒绝概率
+        # 如果拒绝概率高，从Q值中减去更多的立即收益
+        adjusted_q = base_q_value - (net_immediate_reward * rejection_prob)
+        
+        return adjusted_q
+
     def evaluate_charging_option(self, vehicle_id: int, station) -> float:
         """Estimate completion Q for going to charge at a station (option value)."""
         # Resolve station object/id
+        
         station_obj = None
         station_id = None
         if hasattr(station, 'id'):
@@ -718,6 +849,7 @@ class ChargingIntegratedEnvironment(Environment):
     def evaluate_idle_option(self, vehicle_id: int,target_loc) -> float:
         """Estimate completion Q for idling/waiting (option value)."""
         veh = self.vehicles.get(vehicle_id)
+        
         if veh is None:
             return 0.0
 
@@ -949,19 +1081,39 @@ class ChargingIntegratedEnvironment(Environment):
         vehicle_coords = vehicle['coordinates']
         pickup_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
         distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
+
+        distance_factor = 0.3
         
-        # Exponential distribution for rejection probability
-        # Base rejection rate increases exponentially with distance
-        base_rate = 0.01  # 5% base rejection rate for distance 0
-        distance_factor = 0.5  # Exponential growth factor
-        
-        rejection_prob = base_rate * np.exp(distance * distance_factor)
+        rejection_prob = 1 - np.exp(-distance * distance_factor)
         # Cap at 90% maximum rejection probability
         return min(0.9, rejection_prob)
     
+
+    def _calculate_rejection_probabilityreal(self, vehicle_id, request):
+        """Calculate the probability that an EV rejects a request based on distance"""
+        vehicle = self.vehicles[vehicle_id]
+        
+        # AEV never rejects
+        if vehicle['type'] == 2:  # AEV
+            return 0.0
+        
+        # Calculate distance to pickup location
+        vehicle_coords = vehicle['coordinates']
+        pickup_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
+        distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
+
+        distance_factor = 0.3 +0.5*np.random.rand() if self.current_time < self.episode_length/2 else 0.3 +np.random.rand()
+        if distance_factor <= 0:
+            return 0.0
+        else:
+            rejection_prob = 1 - np.exp(-distance * distance_factor)
+        return min(0.9, rejection_prob)
+
+
+    
     def _should_reject_request(self, vehicle_id, request):
         """Determine if a vehicle should reject a request"""
-        rejection_prob = self._calculate_rejection_probability(vehicle_id, request)
+        rejection_prob = self._calculate_rejection_probabilityreal(vehicle_id, request)
         return random.random() < rejection_prob
     
 
@@ -977,15 +1129,22 @@ class ChargingIntegratedEnvironment(Environment):
             # Generate between 1 and 10 requests with higher probability for fewer requests
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
-            if rand_val < 0.5:
-                num_requests = random.randint(4, 8)
-            elif rand_val < 0.8:
-                num_requests = random.randint(8, 10)
+            if rand_val < 0.8:
+                num_requests = random.randint(int(self.num_vehicles), self.num_vehicles*2)
+            elif rand_val < 0.95:
+                num_requests = random.randint(self.num_vehicles*2, int(self.num_vehicles*3))
             else:
-                num_requests = random.randint(10,12)
-            
-            for _ in range(num_requests):
+                num_requests = random.randint(int(self.num_vehicles*3), int(self.num_vehicles*4))
+
+            for request_idx in range(num_requests):
                 self.request_counter += 1
+                
+                # 为每个请求设置不同的随机种子，确保位置分布的随机性
+                # 使用当前时间、请求计数器和循环索引组合作为种子
+                request_seed = (self.request_generation_seed if hasattr(self, 'request_generation_seed') and self.request_generation_seed is not None else 12345) + \
+                              self.current_time * 1000 + self.request_counter * 10 + request_idx
+                random.seed(request_seed)
+                np.random.seed(request_seed)
                 
                 # Random pickup and dropoff locations
                 pickup_x = random.randint(0, self.grid_size - 1)
@@ -999,6 +1158,8 @@ class ChargingIntegratedEnvironment(Environment):
                 # Ensure pickup and dropoff are different
                 attempts = 0
                 while dropoff_location == pickup_location and attempts < 5:
+                    random.seed(request_seed+attempts)
+                    np.random.seed(request_seed+attempts)
                     dropoff_x = random.randint(0, self.grid_size - 1)
                     dropoff_y = random.randint(0, self.grid_size - 1)
                     dropoff_location = dropoff_y * self.grid_size + dropoff_x
@@ -1008,7 +1169,7 @@ class ChargingIntegratedEnvironment(Environment):
                 travel_time = max(abs(pickup_x - dropoff_x), abs(pickup_y - dropoff_y))
                 
                 # Create request with dynamic pricing based on demand
-                base_value = 20
+                base_value = 25
                 distance_value = travel_time * (2 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
                 final_value = base_value * surge_factor + distance_value
@@ -1019,7 +1180,8 @@ class ChargingIntegratedEnvironment(Environment):
                     destination=dropoff_location,
                     current_time=self.current_time,
                     travel_time=travel_time,
-                    value=final_value
+                    value=final_value,
+                    final_value=final_value
                 )
                 
                 self.active_requests[self.request_counter] = request
@@ -1059,11 +1221,12 @@ class ChargingIntegratedEnvironment(Environment):
             # 50% chance for 1-3 requests, 30% for 4-6, 20% for 7-10
             rand_val = random.random()
             if rand_val < 0.8:
-                num_requests = random.randint(15, 20)
+                num_requests = random.randint(int(self.num_vehicles), self.num_vehicles*2)
             elif rand_val < 0.95:
-                num_requests = random.randint(20, 25)
+                num_requests = random.randint(self.num_vehicles*2, int(self.num_vehicles*3))
             else:
-                num_requests = random.randint(25, 30)
+                num_requests = random.randint(int(self.num_vehicles*3), int(self.num_vehicles*4))
+
 
             # Define 3 hotspot centers in the grid
             hotspots = [
@@ -1077,9 +1240,15 @@ class ChargingIntegratedEnvironment(Environment):
             # Probability weights for each hotspot (should sum to 1.0)
             probability_weights = [0.2, 0.1, 0.2, 0.25, 0.25]  # 20% for bottom-left, 10% for bottom-right, 20% for center, 25% for top-left, 25% for top-right
             selected_hotspot_idx_reward = [35, 15, 20, 15, 35]  # Reward weights for each hotspot
-            for _ in range(num_requests):
+            for request_idx in range(num_requests):
                 self.request_counter += 1
                 
+                # 为每个请求设置不同的随机种子，确保位置分布的随机性
+                # 使用当前时间、请求计数器和循环索引组合作为种子
+                request_seed = (self.request_generation_seed if hasattr(self, 'request_generation_seed') and self.request_generation_seed is not None else 12345) + \
+                              self.current_time * 1000 + self.request_counter * 10 + request_idx
+                random.seed(request_seed)
+                np.random.seed(request_seed)
                 # Select hotspot based on probability weights
                 rand_val = random.random()
                 cumulative_prob = 0
@@ -1129,6 +1298,8 @@ class ChargingIntegratedEnvironment(Environment):
                 # Ensure pickup and dropoff are different
                 attempts = 0
                 while dropoff_location == pickup_location and attempts < 5:
+                    random.seed(request_seed + attempts)
+                    np.random.seed(request_seed + attempts)
                     random_dropoffx = random.randint(0, self.grid_size - 1)
                     random_dropoffy = random.randint(0, self.grid_size - 1)
                     dropoff_location = random_dropoffy * self.grid_size + random_dropoffx
@@ -1189,12 +1360,32 @@ class ChargingIntegratedEnvironment(Environment):
                 if self._should_reject_request(vehicle_id, request):
                     vehicle['rejected_requests'] += 1
                     vehicle['assigned_request'] = request_id
+                    self.rejected_requests.append(request)
+                    
+                    
+                    if vehicle['type'] == 1 and hasattr(self, 'value_function') and self.value_function is not None:
+                        # Calculate distance for rejection experience
+                        vehicle_coords = vehicle['coordinates']
+                        pickup_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
+                        distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
+                        
+                        # Store rejection experience in value function
+                        self.value_function.store_rejection_experience(
+                            vehicle_id=vehicle_id,
+                            request_id=request_id,
+                            vehicle_location=vehicle['location'],
+                            pickup_location=request.pickup,
+                            current_time=self.current_time,
+                            distance=distance,
+                            rejection_reason="distance"
+                        )
+                    
                     #print("assign_request_to_vehicle: Vehicle {} request {} at step {}".format(vehicle_id, request_id, self.current_time))
-                    return True
+                    return False
                 # Request accepted
                 vehicle['assigned_request'] = request_id
-                #print("assign_request_to_vehicle: Vehicle {} ACCEPTED request {} at step {}".format(vehicle_id, request_id, self.current_time))
-                #print(f"DEBUG: Vehicle {vehicle_id} ASSIGNED to request {request_id} at step {self.current_time}")
+                if vehicle['type']==1:
+                    self.ev_requests.append(request)
                 return True
         else:
             print("wrong assign_request_to_vehicle: Vehicle {} or request {} not found at step {}".format(vehicle_id, request_id, self.current_time))
@@ -1298,7 +1489,7 @@ class ChargingIntegratedEnvironment(Environment):
                 # Complete the request
                 completed_request = self.active_requests.pop(vehicle['passenger_onboard'])
                 self.completed_requests.append(completed_request)
-                
+                self.request_value_sum += completed_request.final_value
                 # Calculate earnings
                 earnings = completed_request.final_value
                 vehicle['passenger_onboard'] = None
@@ -1593,7 +1784,6 @@ class ChargingIntegratedEnvironment(Environment):
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id].dur_reward = 0
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                            vehicle = self.vehicles[vehicle_id]
                         elif isinstance(target_request, Request) and target_request.request_id in self.active_requests:
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to request {target_request.request_id} at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle regular request assignment  
@@ -1616,6 +1806,57 @@ class ChargingIntegratedEnvironment(Environment):
                                     self.storeactions[vehicle_id] = actions[vehicle_id]
                                     self.storeactions[vehicle_id].dur_reward = 0
                                     self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                            else:
+                                request = target_request
+                                vehicle = self.vehicles[vehicle_id]
+                                vehicle['is_stationary'] = True
+                                vehicle['stationary_duration'] = 1  # Continue decision in next time
+                                
+                                # Calculate penalty reward
+                                active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+                                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+                                penalty_reward = - avg_request_value * 0.1 - request.final_value * 0.5
+                                
+                                # Generate service action (not idle) but vehicle doesn't move
+                                from src.Action import ServiceAction
+                                current_coords = vehicle['coordinates']
+                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                                if storeactions[vehicle_id] is None:
+                                    storeactions[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions[vehicle_id].dur_reward = -request.final_value * 0.5
+                                    self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
+                                else:
+                                    storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                    storeactions[vehicle_id].next_action.next_value = penalty_reward
+                                    storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                    storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                    self.storeactions[vehicle_id] = None
+                                    self.storeactions[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions[vehicle_id].dur_reward = -request.final_value * 0.5
+                                #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
+                                # vehicle = self.vehicles[vehicle_id]
+                                # vehicle['is_stationary'] = True
+                                # vehicle['stationary_duration'] = getattr(target_request, 'duration', 1)  # Default 2 steps
+                                # # Generate idle action to keep vehicle stationary
+                                # from src.Action import IdleAction
+                                # current_coords = vehicle['coordinates']
+                                # actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location,vehicle_battery,req_num = quest_num_now)  # Stay in place
+                                # if storeactions[vehicle_id] is None:
+                                #     storeactions[vehicle_id] = actions[vehicle_id]
+                                #     self.storeactions[vehicle_id] = actions[vehicle_id]
+                                #     self.storeactions[vehicle_id].dur_reward = 0
+                                #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
+                                # else:
+                                #     storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                #     storeactions[vehicle_id].next_action.next_value = 0
+                                #     storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                #     storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                #     self.storeactions[vehicle_id] = None
+                                #     self.storeactions[vehicle_id] = actions[vehicle_id]
+                                #     self.storeactions[vehicle_id].dur_reward = 0
+                                #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
                         elif isinstance(target_request, str) and target_request == "waiting":
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to waiting at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle waiting state - mark vehicle as stationary for next simulation
@@ -1842,6 +2083,39 @@ class ChargingIntegratedEnvironment(Environment):
                         next_request_value = next_value
                     )
 
+                # Service action when vehicle is stationary (rejection case)
+                elif isinstance(action, ServiceAction) and self.vehicles[vehicle_id].get('is_stationary', False):
+                    next_action = getattr(action, 'next_action', None)
+                    if next_action is not None:
+                        r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+                        next_value = getattr(next_action, 'next_value', r_exec)
+                        next_battery = batterynow
+                        target_location = veh_curloc
+                        next_location = veh_curloc  # Vehicle doesn't move when stationary
+                        if isinstance(next_action, ServiceAction):
+                            next_action_type = "assign"
+                        elif isinstance(next_action, ChargingAction):
+                            next_action_type = "charge"
+                        else:
+                            next_action_type = "idle"
+                        # Store experience for stationary service action (rejection case)
+                        self.value_function.store_experience(
+                            vehicle_id=vehicle_id,
+                            action_type=f"assign_{action.request_id}",
+                            vehicle_location=current_location,
+                            target_location=target_location,
+                            current_time=self.current_time,
+                            reward=r_exec,
+                            next_vehicle_location=next_location,
+                            battery_level=current_battery,
+                            next_battery_level=next_battery,
+                            other_vehicles=other_vehicles,
+                            num_requests=num_requests,
+                            request_value=r_exec,
+                            next_action_type=next_action_type,
+                            next_request_value=next_value
+                        )
+
                 # Charging option at decision
                 elif isinstance(action, ChargingAction) and hasattr(action, 'charging_station_id'):
                     st_id = action.charging_station_id
@@ -1914,21 +2188,7 @@ class ChargingIntegratedEnvironment(Environment):
         vehicle = self.vehicles[vehicle_id]
         
         # Check if vehicle is in stationary state
-        if vehicle.get('is_stationary', False):
-            # Reduce stationary duration
-            vehicle['stationary_duration'] = 1
-            
-            # If stationary duration is finished, remove stationary status
-            if vehicle['stationary_duration'] <= 0:
-                vehicle['is_stationary'] = False
-                vehicle['stationary_duration'] = 0
-            
-
-            active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
-            active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
-            avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-            self.storeactions[vehicle_id].dur_reward += - avg_request_value*0.1
-            return - avg_request_value*0.1, - avg_request_value*0.1
+        
         
         reward = 0
         dur_reward = 0.0
@@ -1966,10 +2226,24 @@ class ChargingIntegratedEnvironment(Environment):
             dur_reward = action.dur_reward  # Total reward over charging duration
         elif isinstance(action, ServiceAction):
             # Service action - immediate reward is request.value (same as Gurobi)
-            if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
-                # Try to assign the request
-                return -1, -1.0  # Small penalty for failed assignment
-                self.storeactions[vehicle_id].dur_reward += -1.0  # Store for reference
+            # Check if vehicle is in stationary state (rejection case)
+            if vehicle.get('is_stationary', False):
+                # Vehicle rejected the request - apply penalty and don't move
+                active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+                
+                penalty_reward = -avg_request_value * 0.1 - avg_request_value * 0.5
+                self.storeactions[vehicle_id].dur_reward += penalty_reward
+                            
+                return -avg_request_value * 0.01, penalty_reward  # Penalty for rejection
+            elif vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
+                active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+                
+                self.storeactions[vehicle_id].dur_reward += -avg_request_value*0.1
+                return -avg_request_value*0.1, -avg_request_value*0.1  # Penalty for invalid service action
             elif vehicle['assigned_request'] is not None:
                 # Progress towards pickup - check if我们能pickup
                 if self._pickup_passenger(vehicle_id):
@@ -2003,14 +2277,43 @@ class ChargingIntegratedEnvironment(Environment):
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
                 self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
         
-            elif isinstance(action, IdleAction):
-                # Idle action - move towards specified target coordinates using unified method
+        elif isinstance(action, IdleAction):
+            if vehicle.get('is_stationary', False):
+                vehicle['stationary_duration'] = 1
+        
+                # If stationary duration is finished, remove stationary status
+                if vehicle['stationary_duration'] <= 0:
+                    vehicle['is_stationary'] = False
+                    vehicle['stationary_duration'] = 0
+                
+
+                active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+                self.storeactions[vehicle_id].dur_reward += - avg_request_value
+                return - avg_request_value*0.01, - avg_request_value
+            else:
                 active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
                 active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
                 avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
                 reward = self._execute_movement_towards_idle(vehicle_id, vehicle.get('idle_target', None))
                 self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
                 dur_reward = self.storeactions[vehicle_id].dur_reward  # Total reward over charging duration
+        # if vehicle.get('is_stationary', False):
+        #     # Reduce stationary duration
+        #     vehicle['stationary_duration'] = 1
+            
+        #     # If stationary duration is finished, remove stationary status
+        #     if vehicle['stationary_duration'] <= 0:
+        #         vehicle['is_stationary'] = False
+        #         vehicle['stationary_duration'] = 0
+            
+
+        #     active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+        #     active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+        #     avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+        #     self.storeactions[vehicle_id].dur_reward += - avg_request_value*0.01
+        #     return - avg_request_value*0.01, - avg_request_value*0.01
         return reward, dur_reward
     
     def _should_store_experience(self, action_type: str, reward: float, battery_level: float) -> bool:
@@ -2353,7 +2656,7 @@ class ChargingIntegratedEnvironment(Environment):
         active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
         avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 100.0
         # Small time penalty for movement (consistent with other methods)
-        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value*0.1
+        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value
     
     def _update_environment(self):
         """Update environment state"""
@@ -2412,16 +2715,30 @@ class ChargingIntegratedEnvironment(Environment):
 
         # Distribute unserved penalty among all vehicles
         for request_id in expired_requests:
-            request = self.active_requests[request_id]
-            self.rejected_requests.append(request)
-            del self.active_requests[request_id]
+            # 检查订单是否正在被车辆服务（assigned或onboard）
+            request_being_served = False
+            for vehicle_id, vehicle in self.vehicles.items():
+                if (vehicle['assigned_request'] == request_id or 
+                    vehicle['passenger_onboard'] == request_id):
+                    request_being_served = True
+                    break
+            
+            # 只删除不在服务中的过期订单
+            if not request_being_served:
+                request = self.active_requests[request_id]
+                #self.rejected_requests.append(request)
+                del self.active_requests[request_id]
         
         # Distribute unserved penalty among all vehicles
-        for vehicle_id, vehicle in self.vehicles.items():
-            if self.vehicles[vehicle_id]['assigned_request'] and self.vehicles[vehicle_id]['assigned_request'] in expired_requests:
-                vehicle['assigned_request'] = None 
-            if self.vehicles[vehicle_id]['passenger_onboard'] and self.vehicles[vehicle_id]['passenger_onboard'] in expired_requests:
-                vehicle['passenger_onboard'] = None
+        # for vehicle_id, vehicle in self.vehicles.items():
+        #     if self.vehicles[vehicle_id]['assigned_request'] and self.vehicles[vehicle_id]['assigned_request'] in expired_requests:
+        #         # 只有当订单真的被删除时才清空车辆状态
+        #         if self.vehicles[vehicle_id]['assigned_request'] not in self.active_requests:
+        #             vehicle['assigned_request'] = None 
+        #     if self.vehicles[vehicle_id]['passenger_onboard'] and self.vehicles[vehicle_id]['passenger_onboard'] in expired_requests:
+        #         # 只有当订单真的被删除时才清空车辆状态
+        #         if self.vehicles[vehicle_id]['passenger_onboard'] not in self.active_requests:
+        #             vehicle['passenger_onboard'] = None
             # if self.vehicles[vehicle_id]['passenger_onboard'] and self.vehicles[vehicle_id]['battery'] <= self.min_battery_level:
             #     # Handle passenger stranding due to low battery
             #     request_id = vehicle['passenger_onboard']
@@ -2433,15 +2750,17 @@ class ChargingIntegratedEnvironment(Environment):
             #         request = self.active_requests[request_id]
             #         self.rejected_requests.append(request)
             #         del self.active_requests[request_id]
-
+    
             
     def reset(self):
         """重置环境"""
         self.current_time = 0
         # Reset request system
+        self.request_value_sum = 0
         self.active_requests = {}
         self.completed_requests = []
         self.rejected_requests = []
+        self.ev_requests = []
         self.request_counter = 0
         self.charge_finished = 0
         self.charge_stats = {station_id: [] for station_id in self.charging_manager.stations}
@@ -2462,7 +2781,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Calculate total rejected requests (unique orders that were rejected)
         total_rejected = len(self.rejected_requests)
-        
+        total_ev_request = len(self.ev_requests)
         # Calculate average charging station utilization
         if not hasattr(self, 'charging_manager') or not self.charging_manager.stations:
             #print("DEBUG: No charging manager or stations found!")
@@ -2522,6 +2841,7 @@ class ChargingIntegratedEnvironment(Environment):
         # Count active and completed requests
         active_orders = len(self.active_requests)
         completed_orders = len(self.completed_requests)
+        avg_request_value1 = self.request_value_sum/completed_orders if completed_orders > 0 else 0
         total_orders = active_orders + completed_orders + total_rejected
         accepted_orders = active_orders + completed_orders
         
@@ -2543,9 +2863,11 @@ class ChargingIntegratedEnvironment(Environment):
             'episode_time': self.current_time,
             'total_orders': total_orders,
             'accepted_orders': accepted_orders,
-            'rejected_orders': total_rejected,
             'active_orders': active_orders,
+            'rejected_orders': total_rejected,
+            'ev_accept': total_ev_request,
             'completed_orders': completed_orders,
+            'avg_request_value': avg_request_value1,
             'avg_battery_level': avg_battery,
             'finished_charge': self.charge_finished,
             'charge_stats': self.charge_stats,
@@ -2600,3 +2922,300 @@ class ChargingIntegratedEnvironment(Environment):
             'ev_rejection_rate': ev_rejected / max(1, ev_rejected + len(self.completed_requests)) if ev_vehicles else 0,
             'aev_rejection_rate': aev_rejected / max(1, aev_rejected + len(self.completed_requests)) if aev_vehicles else 0
         }
+
+    def simulate_motion_dqn(self, dqn_agent=None, current_requests: List[Request] = None, training=True):
+        """
+        DQN-based simulation for vehicle dispatch as benchmark comparison to ILP-ADP
+        
+        Args:
+            dqn_agent: DQN agent for decision making
+            current_requests: List of current requests to handle
+            training: Whether in training mode (affects exploration)
+        
+        Returns:
+            dict: Simulation results including rewards, actions taken, and performance metrics
+        """
+        try:
+            # Try to import DQN components (optional dependency)
+            from .ValueFunction_pytorch import DQNAgent, create_dqn_state_features
+        except ImportError:
+            print("Warning: DQN components not available. Please ensure ValueFunction_pytorch.py has DQN classes.")
+            return None
+        
+        # Initialize DQN agent if not provided
+        if dqn_agent is None:
+            device = 'cuda' if hasattr(self, 'device') else 'cpu'
+            dqn_agent = DQNAgent(
+                state_dim=64,
+                action_dim=32,  # Adjust based on your action space
+                device=device
+            )
+        
+        simulation_results = {
+            'total_reward': 0.0,
+            'actions_taken': [],
+            'vehicle_utilization': {},
+            'request_completion_rate': 0.0,
+            'average_response_time': 0.0,
+            'dqn_decisions': [],
+            'ilp_comparison': None
+        }
+        
+        # Process each vehicle decision
+        for vehicle_id, vehicle in self.vehicles.items():
+            if not vehicle.get('idle', True):
+                continue  # Skip busy vehicles
+            
+            # Create state features for DQN
+            state_features = create_dqn_state_features(self, vehicle_id, self.current_time)
+            
+            # Get action from DQN
+            action, q_values = dqn_agent.select_action(
+                state_features['vehicle'],
+                state_features['request'], 
+                state_features['global'],
+                training=training
+            )
+            
+            # Map DQN action to environment action
+            env_action = self._map_dqn_action_to_env(action, vehicle_id, current_requests)
+            
+            # Execute action and get reward
+            reward = self._execute_dqn_action(vehicle_id, env_action, current_requests)
+            
+            # Store results
+            simulation_results['total_reward'] += reward
+            simulation_results['actions_taken'].append({
+                'vehicle_id': vehicle_id,
+                'action': action,
+                'env_action': env_action,
+                'reward': reward,
+                'q_values': q_values.cpu().numpy().tolist() if hasattr(q_values, 'cpu') else q_values
+            })
+            
+            # Store experience for training if in training mode
+            if training and hasattr(dqn_agent, 'store_transition'):
+                # Get next state after action
+                next_state_features = create_dqn_state_features(self, vehicle_id, self.current_time)
+                
+                # Store transition
+                dqn_agent.store_transition(
+                    state_features,
+                    action,
+                    reward,
+                    next_state_features,
+                    done=False  # Episode continues
+                )
+        
+        # Calculate performance metrics
+        self._calculate_dqn_performance_metrics(simulation_results, current_requests)
+        
+        # Train DQN if in training mode
+        if training and hasattr(dqn_agent, 'train_step'):
+            loss = dqn_agent.train_step(batch_size=32)
+            if loss is not None:
+                simulation_results['training_loss'] = loss
+        
+        return simulation_results
+    
+    def _map_dqn_action_to_env(self, dqn_action, vehicle_id, current_requests):
+        """
+        Map DQN action index to environment action
+        
+        Args:
+            dqn_action: Action index from DQN
+            vehicle_id: ID of the vehicle
+            current_requests: Available requests
+        
+        Returns:
+            dict: Environment action
+        """
+        # Define comprehensive action mapping for vehicle dispatch:
+        # Actions 0-9: Assign to request (if available)
+        # Actions 10-19: Move to location for rebalancing/repositioning
+        # Actions 20-24: Charge at station (EVs only)
+        # Actions 25-27: Wait for better requests
+        # Actions 28-31: Idle/do nothing
+        
+        if current_requests and dqn_action < min(10, len(current_requests)):
+            # Assign to request (接受订单)
+            request = current_requests[dqn_action]
+            return {
+                'type': 'assign',
+                'request_id': getattr(request, 'id', dqn_action),
+                'pickup_location': getattr(request, 'pickup_location', 0),
+                'dropoff_location': getattr(request, 'dropoff_location', 0)
+            }
+        elif 10 <= dqn_action < 20:
+            # Rebalance to strategic location (重新平衡)
+            target_location = (dqn_action - 10) * (self.NUM_LOCATIONS // 10)
+            return {
+                'type': 'rebalance',
+                'target_location': min(target_location, self.NUM_LOCATIONS - 1)
+            }
+        elif 20 <= dqn_action < 25:
+            # Charge at station (充电) - only for EVs
+            return {
+                'type': 'charge',
+                'station_id': dqn_action - 20
+            }
+        elif 25 <= dqn_action < 28:
+            # Wait for better requests (等待更好的订单)
+            wait_duration = (dqn_action - 25 + 1) * 5  # 5, 10, or 15 minutes
+            return {
+                'type': 'wait',
+                'duration': wait_duration,
+                'reason': 'better_requests'
+            }
+        else:
+            # Idle (空闲)
+            return {
+                'type': 'idle'
+            }
+    
+    def _execute_dqn_action(self, vehicle_id, action, current_requests):
+        """
+        Execute DQN action in environment and return reward
+        
+        Args:
+            vehicle_id: ID of the vehicle
+            action: Action to execute
+            current_requests: Available requests
+        
+        Returns:
+            float: Reward for the action
+        """
+        vehicle = self.vehicles.get(vehicle_id)
+        if not vehicle:
+            return -1.0  # Invalid vehicle
+        
+        action_type = action.get('type', 'idle')
+        base_reward = 0.0
+        
+        if action_type == 'assign' and current_requests:
+            # Assign vehicle to request
+            request_id = action.get('request_id')
+            pickup_location = action.get('pickup_location', 0)
+            dropoff_location = action.get('dropoff_location', 0)
+            
+            # Calculate distance-based reward
+            vehicle_location = vehicle.get('location', 0)
+            pickup_distance = abs(vehicle_location - pickup_location)
+            trip_distance = abs(pickup_location - dropoff_location)
+            
+            # Reward based on efficiency
+            base_reward = 10.0 - pickup_distance * 0.5 + trip_distance * 0.3
+            
+            # Update vehicle state
+            vehicle['assigned_request'] = request_id
+            vehicle['target_location'] = pickup_location
+            vehicle['idle'] = False
+            
+            # Battery penalty for EVs
+            if vehicle.get('type') == 1:  # EV
+                battery_cost = (pickup_distance + trip_distance) * 0.1
+                vehicle['battery'] = max(0.0, vehicle['battery'] - battery_cost)
+                if vehicle['battery'] < 0.2:
+                    base_reward -= 5.0  # Low battery penalty
+        
+        elif action_type == 'rebalance':
+            # Move to rebalance location
+            target_location = action.get('target_location', 0)
+            vehicle_location = vehicle.get('location', 0)
+            distance = abs(vehicle_location - target_location)
+            
+            # Small negative reward for rebalancing
+            base_reward = -1.0 - distance * 0.1
+            
+            # Update vehicle location
+            vehicle['location'] = target_location
+            
+        elif action_type == 'charge' and vehicle.get('type') == 1:  # EV only
+            # Charge vehicle (充电)
+            if vehicle.get('battery', 1.0) < 0.8:
+                vehicle['battery'] = min(1.0, vehicle['battery'] + 0.3)
+                base_reward = 2.0  # Positive reward for needed charging
+            else:
+                base_reward = -1.0  # Penalty for unnecessary charging
+                
+            vehicle['charging_station'] = action.get('station_id', 0)
+            vehicle['idle'] = False  # Vehicle is busy charging
+            
+        elif action_type == 'wait':
+            # Wait for better requests (等待更好的订单)
+            wait_duration = action.get('duration', 5)
+            
+            # Calculate reward based on wait strategy
+            if current_requests and len(current_requests) > 2:
+                # Penalty for waiting when many requests are available
+                base_reward = -2.0
+            elif not current_requests:
+                # Small positive reward for waiting when no requests
+                base_reward = 0.5
+            else:
+                # Neutral reward for strategic waiting
+                base_reward = -0.2
+            
+            # Update vehicle state
+            vehicle['wait_time'] = vehicle.get('wait_time', 0) + wait_duration
+            vehicle['idle'] = True
+            vehicle['waiting_for_requests'] = True
+            
+        else:  # idle
+            # Small penalty for idling (空闲)
+            base_reward = -0.5
+            vehicle['idle'] = True
+            vehicle['waiting_for_requests'] = False
+        
+        return base_reward
+    
+    def _calculate_dqn_performance_metrics(self, results, current_requests):
+        """
+        Calculate performance metrics for DQN simulation
+        
+        Args:
+            results: Simulation results dictionary to update
+            current_requests: List of current requests
+        """
+        # Vehicle utilization
+        active_vehicles = sum(1 for v in self.vehicles.values() if not v.get('idle', True))
+        total_vehicles = len(self.vehicles)
+        results['vehicle_utilization'] = active_vehicles / max(1, total_vehicles)
+        
+        # Request metrics
+        if hasattr(self, 'completed_requests') and hasattr(self, 'active_requests'):
+            total_requests = len(self.completed_requests) + len(current_requests or [])
+            completed_requests = len(self.completed_requests)
+            results['request_completion_rate'] = completed_requests / max(1, total_requests)
+        else:
+            results['request_completion_rate'] = 0.0
+        
+        # Average battery level for EVs
+        ev_vehicles = [v for v in self.vehicles.values() if v.get('type') == 1]
+        if ev_vehicles:
+            avg_battery = sum(v.get('battery', 1.0) for v in ev_vehicles) / len(ev_vehicles)
+            results['average_battery_level'] = avg_battery
+        else:
+            results['average_battery_level'] = 1.0
+        
+        # Action distribution with all action types
+        actions = [a['action'] for a in results['actions_taken']]
+        if actions:
+            results['action_distribution'] = {
+                'assign': sum(1 for a in actions if a < 10) / len(actions),              # 接受订单
+                'rebalance': sum(1 for a in actions if 10 <= a < 20) / len(actions),    # 重新平衡
+                'charge': sum(1 for a in actions if 20 <= a < 25) / len(actions),       # 充电
+                'wait': sum(1 for a in actions if 25 <= a < 28) / len(actions),         # 等待
+                'idle': sum(1 for a in actions if a >= 28) / len(actions)               # 空闲
+            }
+        else:
+            results['action_distribution'] = {
+                'assign': 0, 'rebalance': 0, 'charge': 0, 'wait': 0, 'idle': 1
+            }
+        
+        # Additional metrics for wait behavior
+        waiting_vehicles = sum(1 for v in self.vehicles.values() 
+                             if v.get('waiting_for_requests', False))
+        results['vehicles_waiting'] = waiting_vehicles
+        results['wait_utilization'] = waiting_vehicles / max(1, total_vehicles)
+

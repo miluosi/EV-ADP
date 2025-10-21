@@ -1,0 +1,14 @@
+{
+  "test_summary": {
+    "timestamp": "2025-10-20T14:33:46.863065",
+    "passed_tests": 2,
+    "total_tests": 7,
+    "success_rate": 0.2857142857142857,
+    "status": "FAILED"
+  },
+  "environment_config": {
+    "num_vehicles": 20,
+    "num_charging_stations": 10
+  },
+  "detailed_results": {}
+}
