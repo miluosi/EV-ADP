@@ -71,6 +71,7 @@ class ServiceAction(Action):
         self.request_id = request_id
         self.action_type = "service"
         self.dur_reward = 0
+        self.target_location = None  # 用于存储服务后的目标位置
         self.vehicle_loc = vehicle_loc
         self.vehicle_battery = vehicle_battery
         self.next_action = next_action  # 用于存储服务后的后续动作

@@ -1825,7 +1825,7 @@ class ChargingIntegratedEnvironment(Environment):
                                     storeactions[vehicle_id] = actions[vehicle_id]
                                     self.storeactions[vehicle_id] = actions[vehicle_id]
                                     self.storeactions[vehicle_id].dur_reward = -request.final_value * 0.5
-                                    self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
+                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].pickup
                                 else:
                                     storeactions[vehicle_id].next_action = actions[vehicle_id]
                                     storeactions[vehicle_id].next_action.next_value = penalty_reward
@@ -1834,6 +1834,7 @@ class ChargingIntegratedEnvironment(Environment):
                                     self.storeactions[vehicle_id] = None
                                     self.storeactions[vehicle_id] = actions[vehicle_id]
                                     self.storeactions[vehicle_id].dur_reward = -request.final_value * 0.5
+                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].pickup
                                 #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
                                 # vehicle = self.vehicles[vehicle_id]
                                 # vehicle['is_stationary'] = True
@@ -2089,7 +2090,7 @@ class ChargingIntegratedEnvironment(Environment):
                         r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
                         next_value = getattr(next_action, 'next_value', r_exec)
                         next_battery = batterynow
-                        target_location = veh_curloc
+                        target_location = action.target_location
                         next_location = veh_curloc  # Vehicle doesn't move when stationary
                         if isinstance(next_action, ServiceAction):
                             next_action_type = "assign"

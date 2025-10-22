@@ -1378,11 +1378,11 @@ def main():
         num_episodes = 100
         print(f"📊 使用配置参数: episodes={num_episodes}")
         
-        batch_size = training_config.get('batch_size', 256)
-        adpvalue = 0
-        assignmentgurobi =False
-        # # for charge_th in charge_threshold:
-        results, env = run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256)
+        # batch_size = training_config.get('batch_size', 256)
+        # adpvalue = 0
+        # assignmentgurobi =False
+        # # # for charge_th in charge_threshold:
+        # results, env = run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256)
 
         #     # 分析结果
         # analysis = analyze_results(results)
@@ -1420,8 +1420,8 @@ def main():
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
         # adplist = [0]
-        adplist = [0,0.1,0.3,0.5,0.7,0.9,1]
-        #adplist = [0.1]
+        # adplist = [0.1,0.3,0.5,0.7,0.9,1]
+        adplist = [0.1]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
