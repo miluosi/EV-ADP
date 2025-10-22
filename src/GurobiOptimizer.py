@@ -843,7 +843,7 @@ class GurobiOptimizer:
 
             # Penalty for unserved requests
         unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)
-        # objective_terms -= avg_request_value * (len(available_requests) - served_requests)
+        objective_terms -= avg_request_value * (len(available_requests) - served_requests)
         
         model.setObjective(objective_terms, self.GRB.MAXIMIZE)
         
