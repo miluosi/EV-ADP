@@ -754,7 +754,7 @@ class GurobiOptimizer:
                     moving_cost = getattr(self.env, 'movingpenalty', -0.1) * (d1 + d2)
                     immediate = req_val 
                     rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
-                    objective_terms += immediate* request_decision[i][j]
+                    objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
                 else:
                     # 使用批量计算的Q值和拒绝感知的调整价值
                     base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
@@ -843,7 +843,7 @@ class GurobiOptimizer:
 
             # Penalty for unserved requests
         unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)
-        objective_terms -= avg_request_value * (len(available_requests) - served_requests)
+        objective_terms -= 0.01*avg_request_value * (len(available_requests) - served_requests)
         
         model.setObjective(objective_terms, self.GRB.MAXIMIZE)
         

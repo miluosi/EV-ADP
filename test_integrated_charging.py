@@ -1372,7 +1372,7 @@ def main():
     training_config = get_training_config()
     env_config = config_manager.get_environment_config()
     
-    use_intense_requests = False
+    use_intense_requests = True
     try:
         # 从配置获取训练参数
         num_episodes = 100
