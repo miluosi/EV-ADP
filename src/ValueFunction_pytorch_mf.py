@@ -1679,10 +1679,14 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         return sampled_batch
 
+    def train_step(self, batch_size: int = 64, tau: float = 0.005):  # 软更新系数，推荐0.001~0.01，可调
+        """Perform one training step using stored experiences with proper DQN algorithm"""
+        if len(self.experience_buffer) < batch_size * 2:  # Wait for more experiences
+            return 0.0
         
     def train_step(self, batch_size: int = 64, tau: float = 0.005):  # 软更新系数，推荐0.001~0.01，可调
         """Perform one training step using stored experiences with proper DQN algorithm"""
-        if len(self.experience_buffer) < batch_size   :  # Wait for more experiences
+        if len(self.experience_buffer) < batch_size * 2:  # Wait for more experiences
             return 0.0
         
 
@@ -3077,6 +3081,739 @@ class DQNExperienceReplay:
     
     def __len__(self):
         return len(self.buffer)
+
+
+# =============================================================================
+# Mean Field Reinforcement Learning (MFRL) Implementation
+# =============================================================================
+
+class MeanFieldExperienceReplay:
+    """Experience replay buffer for Mean Field Q-Learning with neighbor action distributions"""
+    def __init__(self, capacity=50000):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, mean_action, reward, next_state, next_mean_action, done):
+        """
+        Add experience to buffer with mean field information
+        
+        Args:
+            state: Current state features
+            action: Action taken by the agent
+            mean_action: Mean action distribution of neighboring agents
+            reward: Reward received
+            next_state: Next state features
+            next_mean_action: Next mean action distribution
+            done: Whether episode is done
+        """
+        self.buffer.append((state, action, mean_action, reward, next_state, next_mean_action, done))
+    
+    def sample(self, batch_size):
+        """Sample random batch from buffer"""
+        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
+        return zip(*batch)
+    
+    def __len__(self):
+        return len(self.buffer)
+
+
+class MeanFieldQNetwork(nn.Module):
+    """
+    Mean Field Q-Network: Q(s, a, μ)
+    
+    The Q-value depends on:
+    - s: agent's state
+    - a: agent's action  
+    - μ: mean action distribution of neighboring agents (mean field)
+    
+    Reference: "Mean Field Multi-Agent Reinforcement Learning" (Yang et al., 2018)
+    """
+    def __init__(self, state_dim=64, action_dim=32, mean_field_dim=32, hidden_dim=256, device='cpu'):
+        super(MeanFieldQNetwork, self).__init__()
+        self.device = device
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.mean_field_dim = mean_field_dim
+        
+        # Vehicle state encoder
+        self.vehicle_encoder = nn.Sequential(
+            nn.Linear(8, hidden_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, hidden_dim//4)
+        )
+        
+        # Request features encoder
+        self.request_encoder = nn.Sequential(
+            nn.Linear(6, hidden_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, hidden_dim//4)
+        )
+        
+        # Global state encoder
+        self.global_encoder = nn.Sequential(
+            nn.Linear(4, hidden_dim//4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//4, hidden_dim//8)
+        )
+        
+        # Mean field encoder - processes the action distribution of neighbors
+        # Input: action_dim dimensional vector (probability distribution over actions)
+        self.mean_field_encoder = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, mean_field_dim)
+        )
+        
+        # Action embedding
+        self.action_embedding = nn.Embedding(action_dim, hidden_dim//4)
+        
+        # Combined feature dimension
+        total_feature_dim = hidden_dim//4 + hidden_dim//4 + hidden_dim//8 + mean_field_dim + hidden_dim//4
+        
+        # Main Q-network with mean field integration
+        self.q_network = nn.Sequential(
+            nn.Linear(total_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Dueling architecture
+        self.value_stream = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, 1)
+        )
+        
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim//2, action_dim)
+        )
+        
+        self.to(device)
+    
+    def forward(self, vehicle_features, request_features, global_features, mean_field, action=None):
+        """
+        Forward pass computing Q(s, a, μ)
+        
+        Args:
+            vehicle_features: [batch, 8] - vehicle state
+            request_features: [batch, 6] - request features
+            global_features: [batch, 4] - global state
+            mean_field: [batch, action_dim] - mean action distribution of neighbors
+            action: [batch] - specific action (optional, for single Q-value output)
+            
+        Returns:
+            Q-values: [batch, action_dim] if action is None, else [batch, 1]
+        """
+        # Encode different feature types
+        vehicle_encoded = self.vehicle_encoder(vehicle_features)      # [batch, hidden//4]
+        request_encoded = self.request_encoder(request_features)      # [batch, hidden//4]
+        global_encoded = self.global_encoder(global_features)         # [batch, hidden//8]
+        mean_field_encoded = self.mean_field_encoder(mean_field)      # [batch, mean_field_dim]
+        
+        if action is not None:
+            # Single action Q-value: Q(s, a, μ)
+            action_embedded = self.action_embedding(action)           # [batch, hidden//4]
+            
+            combined = torch.cat([
+                vehicle_encoded, request_encoded, global_encoded,
+                mean_field_encoded, action_embedded
+            ], dim=-1)
+            
+            features = self.q_network(combined)
+            value = self.value_stream(features)
+            return value
+        else:
+            # All action Q-values: Q(s, ·, μ)
+            batch_size = vehicle_features.size(0)
+            q_values_all = []
+            
+            for a in range(self.action_dim):
+                action_tensor = torch.full((batch_size,), a, dtype=torch.long, device=self.device)
+                action_embedded = self.action_embedding(action_tensor)
+                
+                combined = torch.cat([
+                    vehicle_encoded, request_encoded, global_encoded,
+                    mean_field_encoded, action_embedded
+                ], dim=-1)
+                
+                features = self.q_network(combined)
+                value = self.value_stream(features)
+                q_values_all.append(value)
+            
+            return torch.cat(q_values_all, dim=-1)  # [batch, action_dim]
+    
+    def forward_dueling(self, vehicle_features, request_features, global_features, mean_field):
+        """
+        Forward pass with dueling architecture for all actions
+        More efficient than computing each action separately
+        """
+        # Encode features
+        vehicle_encoded = self.vehicle_encoder(vehicle_features)
+        request_encoded = self.request_encoder(request_features)
+        global_encoded = self.global_encoder(global_features)
+        mean_field_encoded = self.mean_field_encoder(mean_field)
+        
+        # Use average action embedding for base features
+        avg_action_embed = self.action_embedding.weight.mean(dim=0).unsqueeze(0).expand(
+            vehicle_features.size(0), -1
+        )
+        
+        combined = torch.cat([
+            vehicle_encoded, request_encoded, global_encoded,
+            mean_field_encoded, avg_action_embed
+        ], dim=-1)
+        
+        features = self.q_network(combined)
+        
+        # Dueling streams
+        value = self.value_stream(features)           # [batch, 1]
+        advantage = self.advantage_stream(features)   # [batch, action_dim]
+        
+        # Q = V + A - mean(A)
+        q_values = value + advantage - advantage.mean(dim=-1, keepdim=True)
+        
+        return q_values
+
+
+class MeanFieldAgent:
+    """
+    Mean Field Q-Learning Agent
+    
+    Key concepts:
+    - Each agent's Q-function: Q(s, a, μ) where μ is the mean field (avg neighbor actions)
+    - Mean field approximation: Instead of modeling all N-1 agents, model their average action
+    - Neighbor definition: Agents within a certain distance or in the same zone
+    
+    Algorithm:
+    1. At each step, compute mean action distribution of neighbors
+    2. Update Q(s, a, μ) using Bellman equation with mean field
+    3. Select action via softmax policy based on Q values
+    """
+    def __init__(self, state_dim=64, action_dim=32, mean_field_dim=32,
+                 lr=1e-4, gamma=0.99, tau=0.005,
+                 epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=2000,
+                 neighbor_radius=5.0, boltzmann_temp=1.0,
+                 device='cpu'):
+        """
+        Initialize Mean Field Agent
+        
+        Args:
+            state_dim: State feature dimension
+            action_dim: Number of possible actions
+            mean_field_dim: Dimension of mean field embedding
+            lr: Learning rate
+            gamma: Discount factor
+            tau: Soft update coefficient for target network
+            epsilon_start: Initial exploration rate
+            epsilon_end: Final exploration rate
+            epsilon_decay: Exploration decay steps
+            neighbor_radius: Radius to determine neighboring agents
+            boltzmann_temp: Temperature for Boltzmann policy
+            device: Compute device
+        """
+        self.device = device
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.tau = tau
+        self.epsilon_start = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.neighbor_radius = neighbor_radius
+        self.boltzmann_temp = boltzmann_temp
+        self.steps_done = 0
+        
+        # Mean Field Q-Networks
+        self.policy_net = MeanFieldQNetwork(state_dim, action_dim, mean_field_dim, device=device)
+        self.target_net = MeanFieldQNetwork(state_dim, action_dim, mean_field_dim, device=device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        
+        # Optimizer
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        
+        # Experience replay
+        self.memory = MeanFieldExperienceReplay(capacity=50000)
+        
+        # Track action distributions for each agent
+        self.agent_action_probs = {}  # {agent_id: action_distribution}
+        
+        # Training statistics
+        self.training_stats = {
+            'episode_rewards': [],
+            'episode_lengths': [],
+            'avg_q_values': [],
+            'losses': [],
+            'mean_field_entropy': []
+        }
+    
+    def get_epsilon(self):
+        """Calculate current epsilon for exploration"""
+        return self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+               math.exp(-1. * self.steps_done / self.epsilon_decay)
+    
+    def compute_mean_field(self, environment, agent_id, agent_locations=None):
+        """
+        Compute mean action distribution of neighboring agents (mean field μ)
+        
+        Args:
+            environment: Environment instance
+            agent_id: Current agent's ID
+            agent_locations: Dict of {agent_id: (x, y)} locations, optional
+            
+        Returns:
+            mean_field: [action_dim] tensor - average action distribution of neighbors
+        """
+        # Get all agent locations if not provided
+        if agent_locations is None:
+            agent_locations = {}
+            for vid, vehicle in environment.vehicles.items():
+                loc = vehicle.get('location', 0)
+                x = loc % 10  # Assuming 10x10 grid
+                y = loc // 10
+                agent_locations[vid] = (x, y)
+        
+        # Get current agent location
+        current_vehicle = environment.vehicles.get(agent_id, {})
+        current_loc = current_vehicle.get('location', 0)
+        current_x = current_loc % 10
+        current_y = current_loc // 10
+        
+        # Find neighboring agents within radius
+        neighbor_ids = []
+        for vid, (x, y) in agent_locations.items():
+            if vid != agent_id:
+                distance = math.sqrt((x - current_x)**2 + (y - current_y)**2)
+                if distance <= self.neighbor_radius:
+                    neighbor_ids.append(vid)
+        
+        # Compute mean action distribution
+        if len(neighbor_ids) == 0:
+            # No neighbors: uniform distribution
+            mean_field = torch.ones(self.action_dim, device=self.device) / self.action_dim
+        else:
+            # Average the action distributions of all neighbors
+            action_probs_sum = torch.zeros(self.action_dim, device=self.device)
+            for nid in neighbor_ids:
+                if nid in self.agent_action_probs:
+                    action_probs_sum += self.agent_action_probs[nid]
+                else:
+                    # Unknown neighbor: uniform distribution
+                    action_probs_sum += torch.ones(self.action_dim, device=self.device) / self.action_dim
+            
+            mean_field = action_probs_sum / len(neighbor_ids)
+        
+        return mean_field
+    
+    def compute_action_distribution(self, q_values, temperature=None):
+        """
+        Compute action distribution using Boltzmann (softmax) policy
+        
+        Args:
+            q_values: [action_dim] Q-values for all actions
+            temperature: Softmax temperature (higher = more exploration)
+            
+        Returns:
+            action_probs: [action_dim] probability distribution over actions
+        """
+        if temperature is None:
+            temperature = self.boltzmann_temp
+        
+        # Softmax with temperature
+        q_scaled = q_values / temperature
+        action_probs = F.softmax(q_scaled, dim=-1)
+        
+        return action_probs
+    
+    def update_agent_action_probs(self, agent_id, action_probs):
+        """Update stored action distribution for an agent"""
+        self.agent_action_probs[agent_id] = action_probs.detach()
+    
+    def select_action(self, state_features, mean_field, training=True):
+        """
+        Select action using epsilon-greedy with mean field Q-values
+        
+        Args:
+            state_features: Dict with 'vehicle', 'request', 'global' tensors
+            mean_field: [action_dim] mean action distribution of neighbors
+            training: Whether in training mode
+            
+        Returns:
+            action: Selected action index
+            q_values: Q-values for all actions
+            action_probs: Action probability distribution
+        """
+        epsilon = self.get_epsilon() if training else 0.0
+        self.steps_done += 1
+        
+        with torch.no_grad():
+            # Ensure tensors have batch dimension
+            vehicle = state_features['vehicle'].unsqueeze(0) if state_features['vehicle'].dim() == 1 else state_features['vehicle']
+            request = state_features['request'].unsqueeze(0) if state_features['request'].dim() == 1 else state_features['request']
+            global_f = state_features['global'].unsqueeze(0) if state_features['global'].dim() == 1 else state_features['global']
+            mf = mean_field.unsqueeze(0) if mean_field.dim() == 1 else mean_field
+            
+            # Get Q-values for all actions
+            q_values = self.policy_net.forward_dueling(vehicle, request, global_f, mf)
+            q_values = q_values.squeeze(0)  # [action_dim]
+            
+            # Compute action distribution (for mean field update)
+            action_probs = self.compute_action_distribution(q_values)
+        
+        # Epsilon-greedy selection
+        if training and random.random() < epsilon:
+            action = random.randint(0, self.action_dim - 1)
+        else:
+            action = q_values.argmax().item()
+        
+        return action, q_values, action_probs
+    
+    def store_transition(self, state, action, mean_field, reward, next_state, next_mean_field, done):
+        """Store experience with mean field information"""
+        self.memory.push(state, action, mean_field, reward, next_state, next_mean_field, done)
+    
+    def train_step(self, batch_size=64):
+        """
+        Perform one training step using Mean Field Q-Learning
+        
+        Update rule (from Yang et al., 2018):
+        Q(s, a, μ) ← r + γ * E_{a'~π(·|s',μ')}[Q(s', a', μ')]
+        
+        Args:
+            batch_size: Training batch size
+            
+        Returns:
+            loss: Training loss value
+        """
+        if len(self.memory) < batch_size:
+            return None
+        
+        # Sample batch
+        states, actions, mean_fields, rewards, next_states, next_mean_fields, dones = self.memory.sample(batch_size)
+        
+        # Convert to tensors
+        batch_states = {
+            'vehicle': torch.stack([s['vehicle'] for s in states]).to(self.device),
+            'request': torch.stack([s['request'] for s in states]).to(self.device),
+            'global': torch.stack([s['global'] for s in states]).to(self.device)
+        }
+        
+        batch_next_states = {
+            'vehicle': torch.stack([s['vehicle'] for s in next_states]).to(self.device),
+            'request': torch.stack([s['request'] for s in next_states]).to(self.device),
+            'global': torch.stack([s['global'] for s in next_states]).to(self.device)
+        }
+        
+        actions_tensor = torch.tensor(actions, dtype=torch.long, device=self.device)
+        mean_fields_tensor = torch.stack([mf.clone().detach() for mf in mean_fields]).to(self.device)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float, device=self.device)
+        next_mean_fields_tensor = torch.stack([mf.clone().detach() for mf in next_mean_fields]).to(self.device)
+        dones_tensor = torch.tensor(dones, dtype=torch.bool, device=self.device)
+        
+        # Current Q-values: Q(s, a, μ)
+        current_q = self.policy_net(
+            batch_states['vehicle'],
+            batch_states['request'],
+            batch_states['global'],
+            mean_fields_tensor,
+            action=actions_tensor
+        ).squeeze(-1)
+        
+        # Target Q-values using Double DQN with mean field
+        with torch.no_grad():
+            # Get next Q-values from policy network (for action selection)
+            next_q_policy = self.policy_net.forward_dueling(
+                batch_next_states['vehicle'],
+                batch_next_states['request'],
+                batch_next_states['global'],
+                next_mean_fields_tensor
+            )
+            
+            # Select best actions using policy network
+            next_actions = next_q_policy.argmax(dim=-1)
+            
+            # Evaluate with target network
+            next_q_target = self.target_net(
+                batch_next_states['vehicle'],
+                batch_next_states['request'],
+                batch_next_states['global'],
+                next_mean_fields_tensor,
+                action=next_actions
+            ).squeeze(-1)
+            
+            # TD target
+            target_q = rewards_tensor + self.gamma * next_q_target * (~dones_tensor).float()
+        
+        # Compute loss
+        loss = F.mse_loss(current_q, target_q)
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+        self.optimizer.step()
+        
+        # Soft update target network
+        self._soft_update_target()
+        
+        # Track statistics
+        self.training_stats['losses'].append(loss.item())
+        self.training_stats['avg_q_values'].append(current_q.mean().item())
+        
+        # Track mean field entropy (measure of action diversity)
+        mf_entropy = -torch.sum(mean_fields_tensor * torch.log(mean_fields_tensor + 1e-10), dim=-1).mean()
+        self.training_stats['mean_field_entropy'].append(mf_entropy.item())
+        
+        return loss.item()
+    
+    def _soft_update_target(self):
+        """Soft update target network parameters"""
+        for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+            target_param.data.copy_(self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
+    
+    def save_model(self, filepath):
+        """Save model checkpoint"""
+        torch.save({
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'target_net_state_dict': self.target_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'training_stats': self.training_stats,
+            'steps_done': self.steps_done,
+            'agent_action_probs': {k: v.cpu() for k, v in self.agent_action_probs.items()}
+        }, filepath)
+    
+    def load_model(self, filepath):
+        """Load model checkpoint"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.training_stats = checkpoint.get('training_stats', self.training_stats)
+        self.steps_done = checkpoint.get('steps_done', 0)
+        self.agent_action_probs = {k: v.to(self.device) for k, v in checkpoint.get('agent_action_probs', {}).items()}
+
+
+def create_mf_state_features(environment, vehicle_id, current_time=0.0):
+    """
+    Convert environment state to Mean Field agent input features
+    Same format as DQN but explicitly separated for MFRL
+    
+    Args:
+        environment: Environment instance
+        vehicle_id: ID of the vehicle
+        current_time: Current simulation time
+    
+    Returns:
+        dict: State features for MFRL input
+    """
+    # Reuse DQN state feature creation
+    return create_dqn_state_features(environment, vehicle_id, current_time)
+
+
+class MeanFieldTrainer:
+    """
+    Trainer class for Mean Field Reinforcement Learning
+    Manages the training loop and mean field updates across all agents
+    """
+    def __init__(self, environment, num_agents, action_dim=32, 
+                 neighbor_radius=5.0, device='cpu'):
+        """
+        Initialize Mean Field Trainer
+        
+        Args:
+            environment: Environment instance
+            num_agents: Number of agents in the system
+            action_dim: Action space dimension
+            neighbor_radius: Radius for neighbor detection
+            device: Compute device
+        """
+        self.environment = environment
+        self.num_agents = num_agents
+        self.action_dim = action_dim
+        self.neighbor_radius = neighbor_radius
+        self.device = device
+        
+        # Create Mean Field agent (shared policy)
+        self.mf_agent = MeanFieldAgent(
+            state_dim=64,
+            action_dim=action_dim,
+            mean_field_dim=32,
+            neighbor_radius=neighbor_radius,
+            device=device
+        )
+        
+        # Track agent states and mean fields
+        self.agent_states = {}      # {agent_id: state_features}
+        self.agent_mean_fields = {} # {agent_id: mean_field_tensor}
+        self.agent_actions = {}     # {agent_id: last_action}
+        
+        # Episode statistics
+        self.episode_stats = {
+            'rewards': [],
+            'mean_field_entropy': [],
+            'completed_orders': [],
+            'q_values': []
+        }
+    
+    def compute_all_mean_fields(self):
+        """
+        Compute mean field for all agents based on current action distributions
+        
+        Returns:
+            Dict[int, Tensor]: Mean field for each agent
+        """
+        # Get agent locations
+        agent_locations = {}
+        for vid, vehicle in self.environment.vehicles.items():
+            loc = vehicle.get('location', 0)
+            grid_size = getattr(self.environment, 'GRID_SIZE', 10)
+            x = loc % grid_size
+            y = loc // grid_size
+            agent_locations[vid] = (x, y)
+        
+        # Compute mean field for each agent
+        mean_fields = {}
+        for agent_id in self.environment.vehicles.keys():
+            mean_fields[agent_id] = self.mf_agent.compute_mean_field(
+                self.environment, agent_id, agent_locations
+            )
+        
+        return mean_fields
+    
+    def select_actions_for_all_agents(self, current_time=0.0, training=True):
+        """
+        Select actions for all agents using mean field Q-learning
+        
+        Args:
+            current_time: Current simulation time
+            training: Whether in training mode
+            
+        Returns:
+            Dict[int, int]: Actions for each agent
+        """
+        # First, compute mean fields for all agents
+        mean_fields = self.compute_all_mean_fields()
+        self.agent_mean_fields = mean_fields
+        
+        actions = {}
+        action_probs_all = {}
+        q_values_all = {}
+        
+        for agent_id in self.environment.vehicles.keys():
+            # Get state features
+            state = create_mf_state_features(self.environment, agent_id, current_time)
+            self.agent_states[agent_id] = state
+            
+            # Get mean field
+            mean_field = mean_fields[agent_id]
+            
+            # Select action
+            action, q_values, action_probs = self.mf_agent.select_action(
+                state, mean_field, training=training
+            )
+            
+            actions[agent_id] = action
+            action_probs_all[agent_id] = action_probs
+            q_values_all[agent_id] = q_values
+            
+            # Update agent's action distribution (for next round's mean field)
+            self.mf_agent.update_agent_action_probs(agent_id, action_probs)
+        
+        self.agent_actions = actions
+        
+        return actions, q_values_all, action_probs_all
+    
+    def store_transitions(self, rewards, next_mean_fields, dones):
+        """
+        Store transitions for all agents
+        
+        Args:
+            rewards: Dict[int, float] - rewards for each agent
+            next_mean_fields: Dict[int, Tensor] - next mean fields
+            dones: Dict[int, bool] - done flags for each agent
+        """
+        for agent_id in self.agent_states.keys():
+            if agent_id not in rewards:
+                continue
+            
+            state = self.agent_states[agent_id]
+            action = self.agent_actions.get(agent_id, 0)
+            mean_field = self.agent_mean_fields.get(agent_id)
+            reward = rewards[agent_id]
+            next_state = create_mf_state_features(
+                self.environment, agent_id, self.environment.current_time
+            )
+            next_mean_field = next_mean_fields.get(agent_id)
+            done = dones.get(agent_id, False)
+            
+            if mean_field is not None and next_mean_field is not None:
+                self.mf_agent.store_transition(
+                    state, action, mean_field, reward,
+                    next_state, next_mean_field, done
+                )
+    
+    def train_step(self, batch_size=64):
+        """Perform one training step"""
+        return self.mf_agent.train_step(batch_size)
+    
+    def get_training_stats(self):
+        """Get training statistics"""
+        return {
+            **self.mf_agent.training_stats,
+            **self.episode_stats
+        }
+    
+    def save_model(self, filepath):
+        """Save model"""
+        self.mf_agent.save_model(filepath)
+    
+    def load_model(self, filepath):
+        """Load model"""
+        self.mf_agent.load_model(filepath)
+
+
+def map_mf_action_to_environment_action(action_idx, environment, vehicle_id, action_dim=32):
+    """
+    Map Mean Field action index to environment action
+    
+    Action space mapping (same as DQN):
+    - 0-9: Assign to request 0-9
+    - 10-19: Rebalance to zone 0-9
+    - 20-24: Go to charging station 0-4
+    - 25-28: Wait at current zone quadrant
+    - 29-31: Idle actions
+    
+    Args:
+        action_idx: Action index from MF agent
+        environment: Environment instance
+        vehicle_id: Vehicle ID
+        action_dim: Total action dimension
+        
+    Returns:
+        action_type: 'assign', 'rebalance', 'charge', 'wait', or 'idle'
+        action_target: Target ID (request_id, zone_id, station_id, etc.)
+    """
+    if action_idx < 10:
+        # Assign to request
+        return 'assign', action_idx
+    elif action_idx < 20:
+        # Rebalance to zone
+        return 'rebalance', action_idx - 10
+    elif action_idx < 25:
+        # Go to charging station
+        return 'charge', action_idx - 20
+    elif action_idx < 29:
+        # Wait at zone quadrant
+        return 'wait', action_idx - 25
+    else:
+        # Idle
+        return 'idle', 0
 
 
 class DQNAgent:

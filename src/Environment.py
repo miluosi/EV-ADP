@@ -14,6 +14,7 @@ from gurobipy import GRB  # type: ignore
 import re
 import random
 import numpy as np
+import math
 from .charging_station import ChargingStationManager, ChargingStation
 from .Action import Action, ChargingAction, ServiceAction, IdleAction
 from src.GurobiOptimizer import GurobiOptimizer
@@ -38,7 +39,7 @@ class Environment(metaclass=ABCMeta):
         self.current_time: float = 0.0
         self.idle_vehicle_requirement = 1
         self.idle_penalty = 0.5
-        self.charging_penalty = -5
+        self.charging_penalty = -1.0
         self.chargeincrease_per_epoch = 0.1  # Battery increase per epoch when charging
         self.min_battery_level = 0.2
         self.complete_ratio_reward = 0.5
@@ -427,7 +428,7 @@ class ChargingIntegratedEnvironment(Environment):
     Integrated charging environment class, inheriting from src.Environment
     """
 
-    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True, assignmentgurobi=True, random_seed=None):  # Increased grid size
+    def __init__(self, num_vehicles=5, num_stations=3, grid_size=15, use_intense_requests=True, assignmentgurobi=True, random_seed=None,decision_mode="integrated"):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -436,7 +437,7 @@ class ChargingIntegratedEnvironment(Environment):
         START_EPOCH = 0.0  # Start time
         STOP_EPOCH = 100.0  # Stop time
         DATA_DIR = "data"  # Data directory (not used in this implementation)
-        
+        self.use_intense_requests = use_intense_requests
         # 设置随机数种子以确保可重复性
         self.initial_random_seed = random_seed  # 保存初始种子用于车辆初始化
         self.request_generation_seed = random_seed  # 请求生成的种子，可以单独设置
@@ -448,18 +449,23 @@ class ChargingIntegratedEnvironment(Environment):
         self.num_vehicles = num_vehicles
         self.num_stations = num_stations
         self.grid_size = grid_size
+        self.num_zones = getattr(self, 'num_zones', 4)
         self.minimum_charging_level = 0.2  # Minimum battery level before needing to charge
         # Parameters for reward alignment with Gurobi optimization
-        self.charging_penalty = 0.5  
+        self.charging_penalty = 2 
         self.adp_value = 1.0  # Weight for Q-value contribution
         self.unserved_penalty = 50
         self.idle_vehicle_requirement = 1  # Minimum idle vehicles required
         self.charge_duration = 2
         self.chargeincrease_per_epoch = 0.5
         self.chargeincrease_whole = self.chargeincrease_per_epoch * self.charge_duration
-        self.min_battery_level = 0.2
+        self.min_battery_level = 0.1
         self.charge_finished = 0.0
+        self.penalty_reject_requestnum = 2
+        self.penalty_time = 5
         self.charge_stats = {}
+        self.decision_mode = "integrated"  # "integrated" or "sequential"
+        self.decision_mode_set = {"integrated", "aev_first","ev_first"}
         # Initialize charging station manager
         self.charging_manager = ChargingStationManager()
         self._setup_charging_stations()
@@ -470,16 +476,31 @@ class ChargingIntegratedEnvironment(Environment):
         self.heuristic_battery_threshold = 0.5  # Battery threshold for heuristic rebalancing
         self.vehicles = {}
         self.storeactions = {}
+        self.storeactions_ev = {}
         self.whole_req = 0
-        self._setup_vehicles()
+        # Total generated requests counter (used in _update_environment/get_episode_stats)
+        self.whole_req_num = 0
+        self.hotspot_locations = []
+        self.initialise_environment()
+        print(self.hotspot_locations)
         self.ev_requests = []
         # Environment state
         self.current_time = 0
         self.episode_length = 200
+
+
+        self.idle_charging_num = {station_id: 0 for station_id in range(self.num_stations)}
+        self.current_online = 0
+
         
+        
+        
+        
+        self.hotspot_locations_num = self.num_zones
         # Request system
         self.active_requests = {}  # Active passenger requests
         self.completed_requests = []  # Completed requests for analysis
+        self.completed_requests_ev = []  # Completed EV requests for analysis
         self.rejected_requests = []  # Rejected requests for analysis
         self.request_counter = 0
         self.request_generation_rate = 0.8  # Increased to 60% for more active environment
@@ -496,11 +517,291 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Charging station usage tracking for episode-wide statistics
         self.charging_usage_history = []  # Track charging station usage over time
+
+        # =============================
+        # Zone system (rsimulation_detail)
+        # =============================
+        # Node (location_id) -> zone_id mapping and zone definitions.
+        # Default: partition grid into sqrt(Z) x sqrt(Z) blocks.
+        self.loc_to_zone = {}
+        self.zone_to_locs = {}
+        self.zoneinfo = {"1": "Surge", "2": "HighDemand", "3": "CityCenter", "4": "Normal"}
+        self.surge_zone_locs = set()
+        self.high_demand_zone_locs = set()
+        self.city_center_zone_locs = set()
+        self._init_zones()
+
+        # =============================
+        # EV behavior (rsimulation_detail-inspired)
+        # =============================
+        # Idle time tracking: last completion -> next acceptance.
+        self.ev_last_completed_time = {}
+        self.ev_last_accepted_time = {}
+        self.ev_current_idle_start_time = {}
+        self.ev_idle_durations = []
+
+        # Consecutive rejection penalty: 2 consecutive rejections triggers cooldown.
+        self.ev_consecutive_rejections = {}
+        self.ev_penalty_until_time = {}
+        self.ev_penalty_duration = 5  # epochs; can be tuned externally
+
+        # Probabilistic decision model parameters (kept simple/robust).
+        self.ev_charge_soc_threshold = 0.25
+        self.ev_charge_soc_slope = 12.0
+        self.ev_station_choice_beta = 1.0
+        self.relocation_beta = 1.0
+
+        # =============================
+        # rsimulation_detail nested-logit models
+        # =============================
+        from src.charging_models import ChargingProbabilityCalculator, RelocationManager
+        self.charging_calculator = ChargingProbabilityCalculator(grid_size=self.grid_size)
+        self.relocation_manager = RelocationManager(grid_size=self.grid_size)
+        # Update relocation manager with initial zone sets
+        self.relocation_manager.update_zone_info(
+            surge_ids=list(self.surge_zone_locs),
+            hd_ids=list(self.high_demand_zone_locs),
+            city_center_ids=list(self.city_center_zone_locs)
+        )
         
         # Initialize ValueFunction for Q-value calculation (will be set externally)
         self.value_function = None
-        
+        self.value_function_ev = None
         print(f"✓ Initialized integrated environment: {num_vehicles} vehicles, {num_stations} charging stations")
+
+    # =============================
+    # EV metrics & penalty helpers
+    # =============================
+    def _is_ev(self, vehicle_id: int) -> bool:
+        v = self.vehicles.get(vehicle_id)
+        return bool(v is not None and v.get('type', 0) == 1)
+
+    def _in_ev_penalty(self, vehicle_id: int) -> bool:
+        if not self._is_ev(vehicle_id):
+            return False
+        until_t = float(self.ev_penalty_until_time.get(vehicle_id, -1.0))
+        return float(self.current_time) < until_t
+
+    def _record_ev_acceptance(self, vehicle_id: int):
+        if not self._is_ev(vehicle_id):
+            return
+        now = float(self.current_time)
+        self.ev_last_accepted_time[vehicle_id] = now
+        idle_start = self.ev_current_idle_start_time.get(vehicle_id)
+        if idle_start is not None:
+            self.ev_idle_durations.append(max(0.0, now - float(idle_start)))
+        self.ev_current_idle_start_time[vehicle_id] = None
+        self.ev_consecutive_rejections[vehicle_id] = 0
+
+    def _record_ev_completion(self, vehicle_id: int):
+        if not self._is_ev(vehicle_id):
+            return
+        now = float(self.current_time)
+        self.ev_last_completed_time[vehicle_id] = now
+        self.ev_current_idle_start_time[vehicle_id] = now
+
+    def _record_ev_rejection(self, vehicle_id: int):
+        if not self._is_ev(vehicle_id):
+            return
+        cnt = int(self.ev_consecutive_rejections.get(vehicle_id, 0)) + 1
+        self.ev_consecutive_rejections[vehicle_id] = cnt
+        if cnt >= 2:
+            self.ev_penalty_until_time[vehicle_id] = float(self.current_time) + float(self.ev_penalty_duration)
+            self.ev_consecutive_rejections[vehicle_id] = 0
+
+    # =============================
+    # EV probabilistic decisions
+    # =============================
+    def _sigmoid(self, x: float) -> float:
+        # numerically safe sigmoid
+        if x >= 0:
+            z = math.exp(-x)
+            return 1.0 / (1.0 + z)
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+    def compute_ev_charge_probability(self, vehicle_id: int) -> Tuple[float, Dict[int, float]]:
+        """Return (p_charge, station_probs) for an EV using nested-logit model.
+
+        Calls ChargingProbabilityCalculator from rsimulation_detail.
+        Returns: (p_charge, {station_id: probability})
+        """
+        if not self._is_ev(vehicle_id) or not hasattr(self, 'charging_manager'):
+            return 0.0, {}
+
+        vehicle = self.vehicles[vehicle_id]
+        vehicle_loc = int(vehicle.get('location', 0))
+        # SOC in [0,1] but calculator expects [0,100]
+        soc_percent = float(vehicle.get('battery', 0.0)) * 100.0
+
+        # Build charging station list for calculator
+        stations_data = []
+        for sid, station in self.charging_manager.stations.items():
+            # Estimate time: queue_length * charge_duration + service_time
+            queue_len = len(getattr(station, 'charging_queue', []))
+            estimated_time = (queue_len * self.charge_duration) + self.charge_duration
+            stations_data.append({
+                'id': int(station.location),
+                'estimated_time': float(estimated_time)
+            })
+
+        if not stations_data:
+            return 0.0, {}
+
+        # Call nested-logit calculator
+        result = self.charging_calculator.calculate_probabilities(
+            origin_id=vehicle_loc,
+            dest_id=vehicle_loc,  # Idle EV: assume dest=origin for now
+            current_soc=soc_percent,
+            charging_stations=stations_data
+        )
+
+        p_charge = float(result['action_charge'])
+        # Map station location_id back to station_id (sid)
+        station_probs = {}
+        for loc_id, prob in result['station_probs'].items():
+            # Find station_id matching this location
+            for sid, station in self.charging_manager.stations.items():
+                if int(station.location) == int(loc_id):
+                    station_probs[int(sid)] = float(prob)
+                    break
+        return p_charge, station_probs
+
+    def compute_ev_relocation_probability(self, vehicle_id: int) -> Dict[str, float]:
+        """Return probabilities over relocation actions after refusing to charge.
+
+        Calls RelocationManager from rsimulation_detail (Ashkrof et al. 2024).
+        Actions: Wait / Surge / HighDemand / Cruise.
+        """
+        if not self._is_ev(vehicle_id):
+            return {'Wait': 1.0}
+
+        vehicle = self.vehicles[vehicle_id]
+        vehicle_loc = int(vehicle.get('location', 0))
+        completed_orders = len([r for r in self.completed_requests if r.request_id in getattr(vehicle, 'completed_order_ids', [])])
+
+        # Ensure idle_start_time is valid
+        idle_start = self.ev_current_idle_start_time.get(vehicle_id)
+        if idle_start is None:
+            idle_start = self.current_time
+        
+        agent_state = {
+            'location': vehicle_loc,
+            'completed_trips': completed_orders,
+            'current_wait_time': float(self.current_time - idle_start)
+        }
+        global_state = {
+            'current_surge_price': 0.0,  # Can be dynamic if environment tracks surge pricing
+            'is_weekend': 0  # Can be set from datetime if available
+        }
+
+        # Update relocation_manager zone sets (in case they changed)
+        self.relocation_manager.update_zone_info(
+            surge_ids=list(self.surge_zone_locs),
+            hd_ids=list(self.high_demand_zone_locs),
+            city_center_ids=list(self.city_center_zone_locs)
+        )
+
+        utils, targets = self.relocation_manager.calculate_relocation_utilities(agent_state, global_state)
+        # Softmax
+        u_vec = np.array(list(utils.values()))
+        exp_u = np.exp(u_vec - np.max(u_vec))
+        probs_array = exp_u / np.sum(exp_u)
+        probs = dict(zip(utils.keys(), probs_array))
+        return probs
+
+    def sample_ev_relocation_target(self, vehicle_id: int, action_type: str):
+        """Sample a target node (location_id) for a relocation action.
+        
+        action_type: 'Wait', 'Surge', 'HighDemand', 'Cruise'
+        """
+        vehicle = self.vehicles.get(vehicle_id, {})
+        cur_loc = int(vehicle.get('location', 0))
+        if action_type == 'Wait':
+            return cur_loc
+
+        # Use relocation_manager's nearest zone logic
+        agent_state = {'location': cur_loc, 'completed_trips': 0, 'current_wait_time': 0.0}
+        global_state = {'current_surge_price': 0.0, 'is_weekend': 0}
+        _, targets = self.relocation_manager.calculate_relocation_utilities(agent_state, global_state)
+
+        if action_type == 'Surge':
+            # 在Surge区域内随机选择一个位置
+            if self.surge_zone_locs:
+                return int(random.choice(list(self.surge_zone_locs)))
+            # 如果Surge区域为空，使用relocation_manager的目标
+            elif targets.get('Surge') is not None:
+                return int(targets['Surge'])
+            return cur_loc
+        elif action_type == 'HighDemand':
+            # 在HighDemand区域内随机选择一个位置
+            if self.high_demand_zone_locs:
+                return int(random.choice(list(self.high_demand_zone_locs)))
+            # 如果HighDemand区域为空，使用relocation_manager的目标
+            elif targets.get('HighDemand') is not None:
+                return int(targets['HighDemand'])
+            return cur_loc
+        elif action_type == 'Cruise':
+            # Random neighbor within same zone
+            zid = self.get_zone_id(cur_loc)
+            candidate_locs = self.get_zone_locations(zid)
+            if candidate_locs:
+                return int(random.choice(candidate_locs))
+        return cur_loc
+
+    def _init_zones(self):
+        """Initialize default zone partition and node<->zone membership."""
+        self.loc_to_zone = {}
+        self.zone_to_locs = {}
+
+        grid_size = int(getattr(self, 'grid_size', 1))
+        num_zones = int(getattr(self, 'num_zones', 4))
+        if grid_size <= 0:
+            return
+
+        # Use near-square zone layout.
+        zones_per_side = max(1, int(round(math.sqrt(num_zones))))
+        block_w = max(1, int(math.ceil(grid_size / zones_per_side)))
+        block_h = block_w
+
+        def _zone_id_for_xy(x: int, y: int) -> int:
+            zx = min(zones_per_side - 1, x // block_w)
+            zy = min(zones_per_side - 1, y // block_h)
+            return zy * zones_per_side + zx
+
+        for loc in range(grid_size * grid_size):
+            x = loc % grid_size
+            y = loc // grid_size
+            zid = _zone_id_for_xy(x, y)
+            self.loc_to_zone[loc] = zid
+            self.zone_to_locs.setdefault(zid, []).append(loc)
+        
+        # 根据 zoneinfo 定义填充各区域的位置集合
+        # zoneinfo: {"1": "Surge", "2": "HighDemand", "3": "CityCenter", "4": "Normal"}
+        for zid, zone_type in self.zoneinfo.items():
+            zone_id_int = int(zid) - 1  # zoneinfo keys are 1-indexed, zone_to_locs keys are 0-indexed
+            if zone_id_int in self.zone_to_locs:
+                if zone_type == "Surge":
+                    self.surge_zone_locs.update(self.zone_to_locs[zone_id_int])
+                elif zone_type == "HighDemand":
+                    self.high_demand_zone_locs.update(self.zone_to_locs[zone_id_int])
+                elif zone_type == "CityCenter":
+                    self.city_center_zone_locs.update(self.zone_to_locs[zone_id_int])
+
+
+    
+    
+    def get_zone_id(self, location_id: int) -> int:
+        """Return zone id for a node/location."""
+        if not self.loc_to_zone:
+            self._init_zones()
+        return int(self.loc_to_zone.get(int(location_id), 0))
+
+    def get_zone_locations(self, zone_id: int):
+        """Return all node ids belonging to a zone."""
+        if not self.zone_to_locs:
+            self._init_zones()
+        return list(self.zone_to_locs.get(int(zone_id), []))
     
     def set_random_seed(self, seed):
         """
@@ -555,7 +856,13 @@ class ChargingIntegratedEnvironment(Environment):
         """Set the value function for Q-value calculation"""
         self.value_function = value_function
         print(f"✓ Value function set: {type(value_function).__name__}")
-    
+    def set_value_function_ev(self, value_function):
+        """Set the value function for Q-value calculation"""
+        self.value_function_ev = value_function
+        print(f"✓ Value function ev  set: {type(value_function).__name__}")
+        
+        
+        
     def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
                               vehicle_location: int, target_location: int) -> float:
         """Get Q-value for vehicle assignment using ValueFunction if available"""
@@ -681,7 +988,7 @@ class ChargingIntegratedEnvironment(Environment):
         
         return  v_after
 
-    def batch_evaluate_service_options(self, vehicle_request_pairs):
+    def batch_evaluate_service_options(self, vehicle_request_pairs, ifEVQvalue = False):
         """
         批量计算多个vehicle-request对的拒绝感知调整Q值，提高计算效率
         现在集成神经网络预测的拒绝率: Q_value - immediate_reward * rejection_probability
@@ -742,7 +1049,10 @@ class ChargingIntegratedEnvironment(Environment):
             base_q_values = []
             if hasattr(self.value_function, 'batch_get_assignment_q_value'):
                 # 如果value function支持批量计算
-                base_q_values = self.value_function.batch_get_assignment_q_value(batch_inputs)
+                if ifEVQvalue:
+                    base_q_values = self.value_function_ev.batch_get_assignment_q_value(batch_inputs)
+                else:
+                    base_q_values = self.value_function.batch_get_assignment_q_value(batch_inputs)
             else:
                 # 否则使用优化的单独计算
                 for input_data in batch_inputs:
@@ -768,6 +1078,44 @@ class ChargingIntegratedEnvironment(Environment):
             return [self.evaluate_service_option(vehicle_id, request) 
                     for vehicle_id, request in valid_pairs]
     
+    
+    
+  
+    
+    
+    def heuristic_find_nearest_v(self,reassignvehicles):
+        """启发式寻找最近的车辆"""
+        hotspot_locations = self.hotspot_locations[:self.hotspot_locations_num]
+        nearest_vehicle = None
+        for loc in hotspot_locations:
+            available_vehicles = {}
+            for vehicle_id, vehicle in reassignvehicles.items():
+                loc = vehicle['location']
+                battery_level = vehicle['battery']
+                batt_loss = self._manhattan_distance_loc_time(loc, loc) * self.battery_consum
+                if battery_level - batt_loss >= self.rebalance_battery_threshold:
+                    available_vehicles[vehicle_id] = vehicle
+            min_distance = float('inf')
+            for vehicle_id, vehicle in available_vehicles.items():
+                vehicle_loc = vehicle['location']
+                distance = self._manhattan_distance_loc(vehicle_loc, loc)
+                if distance < min_distance and distance !=0:
+                    min_distance = distance
+                    nearest_vehicle = vehicle_id
+        if nearest_vehicle is not None:
+            return nearest_vehicle
+        else:
+            loc = hotspot_locations[randint(0, len(hotspot_locations)-1)]
+            available_vehicles = {}
+            for vehicle_id, vehicle in reassignvehicles.items():
+                loc = vehicle['location']
+                battery_level = vehicle['battery']
+                batt_loss = self._manhattan_distance_loc_time(loc, loc) * self.battery_consum
+                if battery_level - batt_loss >= self.rebalance_battery_threshold:
+                    available_vehicles[vehicle_id] = vehicle
+            if available_vehicles:
+                return list(available_vehicles.keys())[0]
+
     def _calculate_rejection_aware_adjustment(self, vehicle_id, request, base_q_value):
         """
         计算拒绝感知的Q值调整: Q_value - immediate_reward * rejection_probability
@@ -1033,7 +1381,7 @@ class ChargingIntegratedEnvironment(Environment):
             y = random.randint(0, self.grid_size-1)
             location_index = y * self.grid_size + x
             
-            if i % 2 == 0:
+            if i < 5:
                 vehicle_type = 1  # EV (Electric Vehicle)
                 vehicle_type_name = 'EV'
             else:
@@ -1060,8 +1408,14 @@ class ChargingIntegratedEnvironment(Environment):
                 'target_location': None,
                 'charging_target': None,  # Target location for idling
                 'idle_target': None,  # Target location for idling
+                'idle_timer': 0,  # Timer for idle duration
+                'continual_reject': 0,
+                'penalty_timer': 0, 
                 'needs_emergency_charging': False,  # Whether the vehicle needs emergency charging
             }
+            # Initialize storeactions for each vehicle
+            self.storeactions[i] = None
+            self.storeactions_ev[i] = None
         
         # 恢复原来的随机状态
         random.setstate(current_random_state)
@@ -1076,17 +1430,21 @@ class ChargingIntegratedEnvironment(Environment):
         # AEV never rejects
         if vehicle['type'] == 2:  # AEV
             return 0.0
-        
-        # Calculate distance to pickup location
+        asc = 0.5
+        eplison_t = np.random.normal(-0.5, 1, 1)
+        beta_id = 0.03
+        beta_distance = -0.05
+        idle_time = 2
         vehicle_coords = vehicle['coordinates']
         pickup_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
         distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
-
-        distance_factor = 0.3
-        
-        rejection_prob = 1 - np.exp(-distance * distance_factor)
-        # Cap at 90% maximum rejection probability
-        return min(0.9, rejection_prob)
+        idle_time = vehicle.get('idle_timer',0)
+        acc = asc + beta_id * idle_time + beta_distance * distance 
+        rejection_prob  = np.exp(acc) / (1 + np.exp(acc))
+        if distance <= 0:
+            return 0.0
+        else:
+            return min(0.999, rejection_prob)
     
 
     def _calculate_rejection_probabilityreal(self, vehicle_id, request):
@@ -1096,18 +1454,21 @@ class ChargingIntegratedEnvironment(Environment):
         # AEV never rejects
         if vehicle['type'] == 2:  # AEV
             return 0.0
-        
-        # Calculate distance to pickup location
+        asc = 0.5
+        eplison_t = np.random.normal(-0.5, 1, 1)
+        beta_id = 0.03
+        beta_distance = -0.05
+        idle_time = 2
         vehicle_coords = vehicle['coordinates']
         pickup_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
         distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
-
-        distance_factor = 0.3 +0.5*np.random.rand() if self.current_time < self.episode_length/2 else 0.3 +np.random.rand()
-        if distance_factor <= 0:
+        idle_time = vehicle.get('idle_timer',0)
+        acc = asc + beta_id * idle_time + beta_distance * distance + eplison_t
+        rejection_prob  = np.exp(acc) / (1 + np.exp(acc))
+        if distance <= 0:
             return 0.0
         else:
-            rejection_prob = 1 - np.exp(-distance * distance_factor)
-        return min(0.9, rejection_prob)
+            return min(0.999, rejection_prob)
 
 
     
@@ -1171,6 +1532,14 @@ class ChargingIntegratedEnvironment(Environment):
                 base_value = 25
                 distance_value = travel_time * (2 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
+                point_loc = pickup_y * self.grid_size + pickup_x
+                zone_loc = self.loc_to_zone.get(point_loc, None)
+                if zone_loc==1:
+                    distance_value += 5  # Downtown has higher surge
+                elif zone_loc==2:
+                    distance_value -= 2  # Suburban has moderate surge
+                elif zone_loc==3:
+                    distance_value -= 2  # Outskirts have lower surge
                 final_value = base_value * surge_factor + distance_value
                 
                 request = Request(
@@ -1269,29 +1638,10 @@ class ChargingIntegratedEnvironment(Environment):
                 pickup_location = pickup_y * self.grid_size + pickup_x
 
                 available_hotspot_indices = [i for i in range(len(hotspots)) if i != selected_hotspot_idx]
-                # if available_hotspot_indices:
-                #     # Get weights for available hotspots and normalize them
-                #     available_weights = [probability_weights[i] for i in available_hotspot_indices]
-                #     total_weight = sum(available_weights)
-                #     normalized_weights = [w / total_weight for w in available_weights]
-                    
-                #     # Select dropoff hotspot based on normalized weights
-                #     rand_val = random.random()
-                #     cumulative_prob = 0
-                #     selected_dropoff_idx = 0
-                #     for i, weight in enumerate(normalized_weights):
-                #         cumulative_prob += weight
-                #         if rand_val <= cumulative_prob:
-                #             selected_dropoff_idx = available_hotspot_indices[i]
-                #             break
+
                 random_dropoffx = random.randint(0, self.grid_size - 1)
                 random_dropoffy = random.randint(0, self.grid_size - 1)
-                # dropofff_hotspot = hotspots[selected_hotspot_idx_1]
-                # dropoff_x = max(0, min(self.grid_size - 1, 
-                #                     dropoff_hotspot[0] + random.randint(-hotspot_radius, hotspot_radius)))
-                # dropoff_y = max(0, min(self.grid_size - 1, 
-                #                     dropoff_hotspot[1] + random.randint(-hotspot_radius, hotspot_radius)))
-                
+
                 dropoff_location = random_dropoffy * self.grid_size + random_dropoffx
                 
                 # Ensure pickup and dropoff are different
@@ -1312,7 +1662,17 @@ class ChargingIntegratedEnvironment(Environment):
                 base_value = 10
                 distance_value = travel_time * (1 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.01  # More requests = higher prices
-                final_value = base_value * surge_factor + distance_value + selected_hotspot_idx_reward[selected_hotspot_idx]
+                point_loc = pickup_y * self.grid_size + pickup_x
+                zone_loc = self.loc_to_zone.get(point_loc, None)
+                if zone_loc==1:
+                    distance_value += 5  # Downtown has higher surge
+                elif zone_loc==2:
+                    distance_value -= 2  # Suburban has moderate surge
+                elif zone_loc==3:
+                    distance_value -= 2  # Outskirts have lower surge
+                final_value = base_value * surge_factor + distance_value+ selected_hotspot_idx_reward[selected_hotspot_idx]
+                
+
                 
                 request = Request(
                     request_id=self.request_counter,
@@ -1353,11 +1713,28 @@ class ChargingIntegratedEnvironment(Environment):
         if request_id in self.active_requests and vehicle_id in self.vehicles:
             vehicle = self.vehicles[vehicle_id]
             request = self.active_requests[request_id]
+
+            # Check if this request is already assigned to another vehicle or onboard
+            for other_vid, other_veh in self.vehicles.items():
+                if other_vid != vehicle_id:
+                    if other_veh['assigned_request'] == request_id:
+                        if self.current_time % 50 == 0:
+                            print(f"⚠️  Cannot assign request {request_id} to vehicle {vehicle_id}: already assigned to vehicle {other_vid}")
+                        return False
+                    if other_veh['passenger_onboard'] == request_id:
+                        if self.current_time % 50 == 0:
+                            print(f"⚠️  Cannot assign request {request_id} to vehicle {vehicle_id}: already onboard vehicle {other_vid}")
+                        return False
+
+            # EV penalty period: do not allow receiving orders.
+            if self._in_ev_penalty(vehicle_id):
+                return False
             
             if vehicle['assigned_request'] is None or vehicle['passenger_onboard'] is None:
                 # Check if the vehicle rejects the request
                 if self._should_reject_request(vehicle_id, request):
                     vehicle['rejected_requests'] += 1
+                    self._record_ev_rejection(vehicle_id)
                     vehicle['assigned_request'] = request_id
                     self.rejected_requests.append(request)
                     
@@ -1380,9 +1757,10 @@ class ChargingIntegratedEnvironment(Environment):
                         )
                     
                     #print("assign_request_to_vehicle: Vehicle {} request {} at step {}".format(vehicle_id, request_id, self.current_time))
-                    return False
+                    return False  # Request rejected
                 # Request accepted
                 vehicle['assigned_request'] = request_id
+                self._record_ev_acceptance(vehicle_id)
                 if vehicle['type']==1:
                     self.ev_requests.append(request)
                 return True
@@ -1423,7 +1801,7 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle['assigned_request'] = None
             vehicle['passenger_onboard'] = None
             vehicle['charging_target'] = None
-            print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法完成pickup - 订单未完成")
+            #print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法完成pickup - 订单未完成")
             # 将未完成的订单重新放回active_requests等待其他车辆
             if vehicle['assigned_request'] is not None:
                 request_id = vehicle['assigned_request']
@@ -1435,6 +1813,8 @@ class ChargingIntegratedEnvironment(Environment):
             # Check if the assigned request still exists
             if vehicle['assigned_request'] not in self.active_requests:
                 # Request has expired or been removed, clear the assignment
+                if self.current_time % 50 == 0:
+                    print(f"🚫 Vehicle {vehicle_id} assigned_request {vehicle['assigned_request']} expired/removed (not in active_requests)")
                 vehicle['assigned_request'] = None
                 return False
                 
@@ -1442,13 +1822,70 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle_coords = vehicle['coordinates']
             pickup_coords = (request.pickup % self.grid_size, request.pickup // self.grid_size)
             
-            # Check if vehicle is at pickup location
+            # Debug info every 50 steps
+            if self.current_time % 50 == 0:
+                distance = abs(vehicle_coords[0] - pickup_coords[0]) + abs(vehicle_coords[1] - pickup_coords[1])
+                request_age = self.current_time - (request.pickup_deadline - request.MAX_PICKUP_DELAY)
+                is_expired = self.current_time > request.pickup_deadline
+                print(f"🚗 Vehicle {vehicle_id} moving to pickup: at {vehicle_coords}, target {pickup_coords}, distance={distance}, request_age={request_age:.0f}, expired={is_expired}")
+            
+            # Check if vehicle is at pickup location - allow pickup even if request expired (vehicle already committed)
             if vehicle_coords == pickup_coords:
-                vehicle['passenger_onboard'] = vehicle['assigned_request']
-                vehicle['assigned_request'] = None
-                return True
+                # Double-check: make sure no other vehicle has already picked up this passenger
+                request_id = vehicle['assigned_request']
+                already_picked_up = False
+                for other_vid, other_veh in self.vehicles.items():
+                    if other_vid != vehicle_id and other_veh['passenger_onboard'] == request_id:
+                        already_picked_up = True
+                        print(f"⚠️  Vehicle {vehicle_id} arrived at pickup but request {request_id} already picked up by vehicle {other_vid}")
+                        break
+                
+                if not already_picked_up:
+                    vehicle['passenger_onboard'] = vehicle['assigned_request']
+                    vehicle['assigned_request'] = None
+                    if self.current_time % 25 == 0 or self.current_time > request.pickup_deadline:
+                        expired_status = "EXPIRED" if self.current_time > request.pickup_deadline else ""
+                        print(f"✅ Vehicle {vehicle_id} picked up passenger (request {vehicle['passenger_onboard']}) at {vehicle_coords} {expired_status}")
+                    return True
+                else:
+                    # Clear the assignment since another vehicle got there first
+                    vehicle['assigned_request'] = None
+                    return False
         return False
     
+
+
+    def findchargerange_v(self):
+        return_index = {}
+        for j in self.charging_manager.stations.values():
+            return_index[j.id] = []
+            station_x = j.location % self.grid_size
+            station_y = j.location // self.grid_size
+            for vehicle_id, v in self.vehicles.items():
+                vehicle_x = v['coordinates'][0]
+                vehicle_y = v['coordinates'][1]
+                distance = abs(vehicle_x - station_x) + abs(vehicle_y - station_y)
+                if distance <= 5:
+                    return_index[j.id].append(vehicle_id)
+        return return_index
+
+    def findchargerange_c(self):
+        return_index = {}
+        for vehicle_id, v in self.vehicles.items():
+            return_index[vehicle_id] = 0
+            vehicle_x = v['coordinates'][0]
+            vehicle_y = v['coordinates'][1]
+            v['in_chargerange'] = []
+            sumcapa = 0
+            for j in self.charging_manager.stations.values():
+                station_x = j.location % self.grid_size
+                station_y = j.location // self.grid_size
+                distance = abs(vehicle_x - station_x) + abs(vehicle_y - station_y)
+                if distance <= 5:
+                    sumcapa += j.max_capacity - len(j.current_vehicles)
+            return_index[vehicle_id] = sumcapa
+        return return_index
+
     def _dropoff_passenger(self, vehicle_id):
         """Vehicle drops off passenger at destination"""
         vehicle = self.vehicles[vehicle_id]
@@ -1460,7 +1897,7 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle['assigned_request'] = None
             vehicle['passenger_onboard'] = None
             vehicle['charging_target'] = None
-            print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法完成dropoff - 乘客滞留")
+            #print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法完成dropoff - 乘客滞留")
             # 乘客滞留在车上，订单未完成
             if vehicle['passenger_onboard'] is not None:
                 request_id = vehicle['passenger_onboard']
@@ -1488,10 +1925,15 @@ class ChargingIntegratedEnvironment(Environment):
                 # Complete the request
                 completed_request = self.active_requests.pop(vehicle['passenger_onboard'])
                 self.completed_requests.append(completed_request)
+                if self.vehicles[vehicle_id]['type']==1:
+                    self.completed_requests_ev.append(completed_request)
                 self.request_value_sum += completed_request.final_value
                 # Calculate earnings
                 earnings = completed_request.final_value
                 vehicle['passenger_onboard'] = None
+
+                # EV idle time starts after completion
+                self._record_ev_completion(vehicle_id)
                 
                 return earnings
         return 0
@@ -1514,7 +1956,16 @@ class ChargingIntegratedEnvironment(Environment):
         """Initialize environment - implementing abstract method"""
         self.current_time = 0
         self._setup_vehicles()
-        return self.get_initial_states()
+        
+
+        for i in range(self.num_zones):
+            zone_centerx = (self.grid_size // (int(np.sqrt(self.num_zones))))//2 + (i % int(np.sqrt(self.num_zones))) * (self.grid_size // (int(np.sqrt(self.num_zones))))
+            zone_centery = (self.grid_size // (int(np.sqrt(self.num_zones))))//2 + (i // int(np.sqrt(self.num_zones))) * (self.grid_size // (int(np.sqrt(self.num_zones))))
+            self.hotspot_locations.append((zone_centerx, zone_centery))
+
+        
+        
+
     
     def get_request_batch(self):
         """Get request batch - implementing abstract method"""
@@ -1539,6 +1990,16 @@ class ChargingIntegratedEnvironment(Environment):
                 requests.append(charging_request)
         
         return requests
+
+    def generate_requests(self):
+        """Public wrapper for request generation.
+
+        Some workflows expect `env.generate_requests()`; the internal implementation
+        uses `_generate_intense_requests()` / `_generate_random_requests()`.
+        """
+        if getattr(self, 'use_intense_requests', False):
+            return self._generate_intense_requests()
+        return self._generate_random_requests()
     
     def get_travel_time(self, source, destination):
         """Get travel time between locations - implementing abstract method"""
@@ -1585,7 +2046,7 @@ class ChargingIntegratedEnvironment(Environment):
         ]
         return np.array(state)
     
-    def step(self, actions, storeactions):
+    def step(self, actions, storeactions,storeactions_ev = None):
         """执行一步环境交互"""
         rewards = {}
         dur_rewards = {}
@@ -1628,15 +2089,23 @@ class ChargingIntegratedEnvironment(Environment):
         # self.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
 
         # 执行Q-learning更新
-        self._update_q_learning(storeactions)
-        
+        self._update_q_learning(storeactions, False)
+        self._update_q_learning(storeactions_ev, True)
         # Record charging station usage for this time step
         self._record_charging_usage()
 
         # 检查是否结束
         done = self.current_time >= self.episode_length
 
-        return next_states, rewards, dur_rewards, done, {'charging_events': charging_events}
+        ev_idle_mean = float(np.mean(self.ev_idle_durations)) if getattr(self, 'ev_idle_durations', None) else 0.0
+        ev_idle_count = int(len(self.ev_idle_durations)) if getattr(self, 'ev_idle_durations', None) else 0
+        ev_in_penalty = int(sum(1 for vid in self.vehicles.keys() if self._in_ev_penalty(vid)))
+        return next_states, rewards, dur_rewards, done, {
+            'charging_events': charging_events,
+            'ev_idle_mean': ev_idle_mean,
+            'ev_idle_count': ev_idle_count,
+            'ev_in_penalty': ev_in_penalty,
+        }
     
     def _record_charging_usage(self):
         """Record charging station usage for current time step"""
@@ -1684,27 +2153,73 @@ class ChargingIntegratedEnvironment(Environment):
         
         # Initialize storeactions for all vehicles to prevent KeyError
         storeactions = {vid: self.storeactions.get(vid) for vid in self.vehicles.keys()}
-        
+        storeactions_ev = {vid: self.storeactions_ev.get(vid) for vid in self.vehicles.keys()}
         # For ChargingIntegratedEnvironment, we handle rebalancing differently
         # Convert our vehicle states to a format compatible with Gurobi optimization
+        from src.Action import ChargingAction, ServiceAction, IdleAction
 
-        if rebalance and self.vehicles:
+        charging_ev = []
+        for vehicle_id, vehicle in self.vehicles.items():
+            if self._is_ev(vehicle_id) and vehicle.get('charging_station') is None and vehicle.get('assigned_request') is None and vehicle.get('passenger_onboard') is None and vehicle.get('idle_target') is None and vehicle.get('target_location') is None:
+                p_charge, station_probs = self.compute_ev_charge_probability(vehicle_id)
+                if station_probs and (random.random() < p_charge) or vehicle['battery']<=0.2:
+                    # Choose charging station by probability
+                    r = random.random()
+                    acc = 0.0
+                    chosen_station = next(iter(station_probs.keys()))
+                    for sid, prob in station_probs.items():
+                        acc += float(prob)
+                        if r <= acc:
+                            chosen_station = int(sid)
+                            break
+                    # Extract vehicle state for action creation
+                    vehicle_location = vehicle['location']
+                    vehicle_battery = vehicle['battery']
+                    self._move_vehicle_to_charging_station(vehicle_id, chosen_station)
+                    actions[vehicle_id] = ChargingAction([], chosen_station, self.charge_duration, vehicle_location, vehicle_battery)
+                    if self.storeactions_ev[vehicle_id] is None:
+                        target_coords = self.vehicles[vehicle_id]['target_location']
+                        storeactions_ev[vehicle_id] = actions[vehicle_id]
+                        self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                        self.storeactions_ev[vehicle_id].dur_reward = 0
+                        self.storeactions_ev[vehicle_id].current_time = self.current_time
+                        self.storeactions_ev[vehicle_id].target_location = target_coords
+                    else:
+                        target_coords = self.vehicles[vehicle_id]['target_location']
+                        storeactions_ev[vehicle_id].next_action = actions[vehicle_id]
+                        storeactions_ev[vehicle_id].next_action.next_value = 0
+                        storeactions_ev[vehicle_id].vehicle_loc_post = vehicle_location
+                        storeactions_ev[vehicle_id].vehicle_battery_post = vehicle_battery
+                        old_current_time = getattr(storeactions_ev[vehicle_id], 'current_time', self.current_time)
+                        self.storeactions_ev[vehicle_id] = None
+                        self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                        self.storeactions_ev[vehicle_id].dur_reward = 0
+                        self.storeactions_ev[vehicle_id].dur_time = self.current_time - old_current_time
+                        self.storeactions_ev[vehicle_id].current_time = self.current_time
+                        self.storeactions_ev[vehicle_id].target_location = target_coords
+        leftover_vehicleslist = [vid for vid in self.vehicles.keys() if vid not in actions]
+        
+        if rebalance and leftover_vehicleslist:
             # Get vehicles that need rebalancing (not currently assigned to tasks or charging)
             vehicles_to_rebalance = []
             
             # First priority: True idle vehicles (strict condition)
             idle_vehicles_1 = [vehicle_id for vehicle_id, v in self.vehicles.items() 
-                              if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None and v['target_location'] is None]
-            
+                              if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None and v['target_location'] is None and  v['penalty_timer']==0]
+            idle_vehicles_2  = [vehicle_id for vehicle_id, v in self.vehicles.items() 
+                              if v['needs_emergency_charging']]
+
+            idle_vehicles_1 = idle_vehicles_1 + idle_vehicles_2
             for vehicle_id, vehicle in self.vehicles.items():
                 # Include strict idle vehicles first
-                if vehicle_id in idle_vehicles_1:
-                    vehicles_to_rebalance.append(vehicle_id)
-                # Also include vehicles that need emergency rebalancing
-                elif (vehicle['battery'] <= self.rebalance_battery_threshold and vehicle['passenger_onboard'] == None and vehicle['assigned_request'] == None) or vehicle['is_stationary'] or vehicle['needs_emergency_charging']:
-                    # print(f"DEBUG preAssignment: Vehicle {vehicle_id} flagged for emergency rebalancing at step {self.current_time}, battery: {vehicle['battery']:.2f}")
-                    # print(f"   Status - Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
-                    vehicles_to_rebalance.append(vehicle_id)
+                if vehicle_id in leftover_vehicleslist:
+                    if vehicle_id in idle_vehicles_1:
+                        vehicles_to_rebalance.append(vehicle_id)
+                    # Also include vehicles that need emergency rebalancing
+                    elif (vehicle['battery'] <= self.rebalance_battery_threshold and vehicle['passenger_onboard'] == None and vehicle['assigned_request'] == None) :
+                        # print(f"DEBUG preAssignment: Vehicle {vehicle_id} flagged for emergency rebalancing at step {self.current_time}, battery: {vehicle['battery']:.2f}")
+                        # print(f"   Status - Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
+                        vehicles_to_rebalance.append(vehicle_id)
             for vehicle_id in vehicles_to_rebalance:
                 if self.vehicles[vehicle_id]['assigned_request'] is not None  and vehicle_id in vehicles_to_rebalance:
                     vehicles_to_rebalance.remove(vehicle_id)
@@ -1717,6 +2232,7 @@ class ChargingIntegratedEnvironment(Environment):
             for vehicle_id in vehicles_to_rebalance:
                 vehicle = self.vehicles[vehicle_id]
                 # print(f" {vehicle_id}  Status - Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
+            print(f"🔄 Rebalancing Step {self.current_time}: Total vehicles to rebalance: {len(vehicles_to_rebalance)}")
             if len(vehicles_to_rebalance) > 0:
                 # Use GurobiOptimizer for rebalancing
                 if not hasattr(self, 'gurobi_optimizer'):
@@ -1728,7 +2244,9 @@ class ChargingIntegratedEnvironment(Environment):
                 #print(f"DEBUG Assignment: Step {self.current_time}, Total vehicles to rebalance: {len(vehicles_to_rebalance)}, Strict idle vehicles: {len(idle_vehicles_1)}, Available requests: {available_requests_count}")
                 
                 if self.assignmentgurobi:
-                    rebalancing_assignments = self.gurobi_optimizer.optimize_vehicle_rebalancing_reject(vehicles_to_rebalance)
+                    rebalancing_assignments = self.gurobi_optimizer.optimize_vehicle_rebalancing_integrated(vehicles_to_rebalance)
+                    # print("length of rebalancing assignments:", len(rebalancing_assignments))
+                    # print("length of vehicles to rebalance:", len(vehicles_to_rebalance))
                 else:
                     available_requests = []
                     if hasattr(self, 'active_requests') and self.active_requests:
@@ -1772,6 +2290,7 @@ class ChargingIntegratedEnvironment(Environment):
                                 storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].current_time = self.current_time
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                             else:
                                 storeactions[vehicle_id].next_action = actions[vehicle_id]
@@ -1779,84 +2298,120 @@ class ChargingIntegratedEnvironment(Environment):
                                 storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                 storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
                                 storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
+                                # Save the old current_time before replacing the action
+                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
+                                self.storeactions[vehicle_id].current_time = self.current_time
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
                         elif isinstance(target_request, Request) and target_request.request_id in self.active_requests:
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to request {target_request.request_id} at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle regular request assignment  
                             if self._assign_request_to_vehicle(vehicle_id, target_request.request_id):
                                 new_assignments += 1
+                                vehicle['idle_timer'] = 0  # Reset idle timer on new assignment
+                                vehicle['continual_reject'] = 0  # Reset continual reject counter on new assignment
+                                vehicle['penalty_timer'] = 0  # Clear any penalty timer on new assignment
+                                vehicle['idle_target'] = None  # Clear idle target on new assignment
                                 # Generate service action
                                 from src.Action import ServiceAction
                                 actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
-                                if storeactions[vehicle_id] is None:
-                                    storeactions[vehicle_id] = actions[vehicle_id]
-                                    self.storeactions[vehicle_id] = actions[vehicle_id]
-                                    self.storeactions[vehicle_id].dur_reward = 0
-                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                                if vehicle['type'] == 1:
+                                    if storeactions_ev[vehicle_id] is None:
+                                        storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions_ev[vehicle_id].dur_reward = 0
+
+                                        self.storeactions_ev[vehicle_id].current_time = self.current_time
+                                        self.storeactions_ev[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                                    else:
+                                        storeactions_ev[vehicle_id].next_action = actions[vehicle_id]
+                                        storeactions_ev[vehicle_id].next_action.next_value = self.active_requests[target_request.request_id].final_value
+                                        storeactions_ev[vehicle_id].vehicle_loc_post = vehicle_location
+                                        storeactions_ev[vehicle_id].vehicle_battery_post = vehicle_battery
+                                        # Save the old current_time before replacing the action
+                                        old_current_time = getattr(storeactions_ev[vehicle_id], 'current_time', self.current_time)
+                                        self.storeactions_ev[vehicle_id] = None
+                                        self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions_ev[vehicle_id].dur_reward = 0
+                                        self.storeactions_ev[vehicle_id].dur_time = self.current_time - old_current_time
+                                        self.storeactions_ev[vehicle_id].current_time = self.current_time
+                                        self.storeactions_ev[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
                                 else:
-                                    storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                    storeactions[vehicle_id].next_action.next_value = self.active_requests[target_request.request_id].final_value
-                                    storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                    storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                    self.storeactions[vehicle_id] = None
-                                    self.storeactions[vehicle_id] = actions[vehicle_id]
-                                    self.storeactions[vehicle_id].dur_reward = 0
-                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                                    if storeactions[vehicle_id] is None:
+                                        storeactions[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions[vehicle_id].dur_reward = 0
+                                        self.storeactions[vehicle_id].current_time = self.current_time
+                                        self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                                    else:
+                                        storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                        storeactions[vehicle_id].next_action.next_value = self.active_requests[target_request.request_id].final_value
+                                        storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                        storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                        # Save the old current_time before replacing the action
+                                        old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
+                                        self.storeactions[vehicle_id] = None
+                                        self.storeactions[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions[vehicle_id].dur_reward = 0
+                                        self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
+                                        self.storeactions[vehicle_id].current_time = self.current_time
+                                        self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
                             else:
-                                request = target_request
-                                vehicle = self.vehicles[vehicle_id]
-                                vehicle['is_stationary'] = True
-                                vehicle['stationary_duration'] = 1  # Continue decision in next time
+                                vehicle['continual_reject'] += 1
+                                if vehicle['continual_reject'] >= self.penalty_reject_requestnum:
+                                    vehicle['penalty_timer'] = self.ev_penalty_duration
                                 
-                                # Calculate penalty reward
-                                active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
-                                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
-                                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-                                penalty_reward = - avg_request_value * 0.1 - request.final_value * 0.5
-                                
-                                # Generate service action (not idle) but vehicle doesn't move
-                                from src.Action import ServiceAction
-                                current_coords = vehicle['coordinates']
-                                actions[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location, vehicle_battery, req_num=quest_num_now)
-                                if storeactions[vehicle_id] is None:
-                                    storeactions[vehicle_id] = actions[vehicle_id]
-                                    self.storeactions[vehicle_id] = actions[vehicle_id]
-                                    self.storeactions[vehicle_id].dur_reward = -request.final_value * 0.5
-                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].pickup
-                                else:
-                                    storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                    storeactions[vehicle_id].next_action.next_value = penalty_reward
-                                    storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                    storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                    self.storeactions[vehicle_id] = None
-                                    self.storeactions[vehicle_id] = actions[vehicle_id]
-                                    self.storeactions[vehicle_id].dur_reward = -request.final_value * 0.5
-                                    self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].pickup
-                                #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
-                                # vehicle = self.vehicles[vehicle_id]
-                                # vehicle['is_stationary'] = True
-                                # vehicle['stationary_duration'] = getattr(target_request, 'duration', 1)  # Default 2 steps
-                                # # Generate idle action to keep vehicle stationary
-                                # from src.Action import IdleAction
-                                # current_coords = vehicle['coordinates']
-                                # actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location,vehicle_battery,req_num = quest_num_now)  # Stay in place
-                                # if storeactions[vehicle_id] is None:
-                                #     storeactions[vehicle_id] = actions[vehicle_id]
-                                #     self.storeactions[vehicle_id] = actions[vehicle_id]
-                                #     self.storeactions[vehicle_id].dur_reward = 0
-                                #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
-                                # else:
-                                #     storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                #     storeactions[vehicle_id].next_action.next_value = 0
-                                #     storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                #     storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                #     self.storeactions[vehicle_id] = None
-                                #     self.storeactions[vehicle_id] = actions[vehicle_id]
-                                #     self.storeactions[vehicle_id].dur_reward = 0
-                                #     self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
+                                # EV拒单后的relocation决策
+                                if self._is_ev(vehicle_id):
+                                    rel_probs = self.compute_ev_relocation_probability(vehicle_id)
+                                    r = random.random()
+                                    acc = 0.0
+                                    rel_action = 'Wait'  # Default action is to wait
+                                    for action_name, prob in rel_probs.items():
+                                        acc += float(prob)
+                                        if r <= acc:
+                                            rel_action = action_name
+                                            break
+                                    from src.Action import IdleAction
+                                    current_coords = vehicle['coordinates']
+                                    
+                                    if rel_action == 'Wait':
+                                        # 停在原地
+                                        target_coords = current_coords
+                                    else:
+                                        # 选择目标位置
+                                        target_loc = self.sample_ev_relocation_target(vehicle_id, rel_action)
+                                        target_coords = (target_loc % self.grid_size, target_loc // self.grid_size)
+                                    
+                                    vehicle['idle_target'] = target_coords
+                                    actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                                    
+                                    if self.storeactions_ev[vehicle_id] is None:
+                                        storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions_ev[vehicle_id] = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                                        active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
+                                        active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
+                                        avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
+                                        penalty_reward = - avg_request_value * 0.1
+                                        self.storeactions_ev[vehicle_id].dur_reward = penalty_reward
+                                        self.storeactions_ev[vehicle_id].current_time = self.current_time
+                                        self.storeactions_ev[vehicle_id].target_location = target_coords
+                                    else:
+                                        storeactions_ev[vehicle_id].next_action = ServiceAction([], target_request.request_id, vehicle_location,vehicle_battery,req_num = quest_num_now)
+                                        storeactions_ev[vehicle_id].next_action.next_value = 0
+                                        storeactions_ev[vehicle_id].vehicle_loc_post = vehicle_location
+                                        storeactions_ev[vehicle_id].vehicle_battery_post = vehicle_battery
+                                        old_current_time = getattr(storeactions_ev[vehicle_id], 'current_time', self.current_time)
+                                        self.storeactions_ev[vehicle_id] = None
+                                        self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                        self.storeactions_ev[vehicle_id].dur_reward = 0
+                                        self.storeactions_ev[vehicle_id].dur_time = self.current_time - old_current_time
+                                        self.storeactions_ev[vehicle_id].current_time = self.current_time
+                                        self.storeactions_ev[vehicle_id].target_location = target_coords
+
                         elif isinstance(target_request, str) and target_request == "waiting":
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to waiting at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle waiting state - mark vehicle as stationary for next simulation
@@ -1871,38 +2426,105 @@ class ChargingIntegratedEnvironment(Environment):
                                 storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].current_time = self.current_time
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
                             else:
                                 storeactions[vehicle_id].next_action = actions[vehicle_id]
                                 storeactions[vehicle_id].next_action.next_value = 0
                                 storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                 storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                # Save the old current_time before replacing the action
+                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
+                                self.storeactions[vehicle_id].current_time = self.current_time
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['location']
-                        elif isinstance(target_request, str) and target_request == "idle":
+                        elif isinstance(target_request, str) and target_request.startswith("idle_at_"):
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
+                            zone_id_str = target_request.replace("idle_at_", "")
+                            zone_id = int(zone_id_str)
+                            hotspot_coords = self.hotspot_locations[zone_id]
+                            hot_x = hotspot_coords[0]
+                            hot_y = hotspot_coords[1]
+
                             from src.Action import IdleAction
                             vehicle = self.vehicles[vehicle_id]
-                            self._assign_idle_vehicle(vehicle_id)
-                            idle_target = vehicle.get('idle_target', None)
+                            # 不需要调用_assign_idle_vehicle，因为我们手动设置idle_target
+                            vehicle['is_stationary'] = False  # Reset stationary state if moving to idle target
+                            idle_target = (hot_x, hot_y)
+                            vehicle['assigned_request'] = None
+                            vehicle['passenger_onboard'] = None
+                            vehicle['charging_station'] = None
+                            vehicle['target_location'] = None
+                            vehicle['idle_target'] = idle_target
                             current_coords = vehicle['coordinates']
                             actions[vehicle_id] = IdleAction([], current_coords, idle_target, vehicle_location, vehicle_battery,req_num = quest_num_now)
                             if storeactions[vehicle_id] is None:
                                 storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
                                 self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].current_time = self.current_time
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['idle_target']
                             else:
                                 storeactions[vehicle_id].next_action = actions[vehicle_id]
                                 storeactions[vehicle_id].next_action.next_value = 0
                                 storeactions[vehicle_id].vehicle_loc_post = vehicle_location
                                 storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                # Save the old current_time before replacing the action
+                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
                                 self.storeactions[vehicle_id] = None
                                 self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
+                                self.storeactions[vehicle_id].current_time = self.current_time
+                                self.storeactions[vehicle_id].dur_reward =0
                                 self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['idle_target']
+                        elif isinstance(target_request, str) and target_request.startswith("reloc"):
+                            if self._is_ev(vehicle_id):
+                                rel_probs = self.compute_ev_relocation_probability(vehicle_id)
+                                r = random.random()
+                                acc = 0.0
+                                rel_action = 'Wait'  # Default action is to wait
+                                for action_name, prob in rel_probs.items():
+                                    acc += float(prob)
+                                    if r <= acc:
+                                        rel_action = action_name
+                                        break
+                                from src.Action import IdleAction
+                                current_coords = vehicle['coordinates']
+                                
+                                if rel_action == 'Wait':
+                                    # 停在原地
+                                    target_coords = current_coords
+                                else:
+                                    # 选择目标位置
+                                    target_loc = self.sample_ev_relocation_target(vehicle_id, rel_action)
+                                    target_coords = (target_loc % self.grid_size, target_loc // self.grid_size)
+                                
+                                vehicle['idle_target'] = target_coords
+                                actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                                
+                                if self.storeactions_ev[vehicle_id] is None:
+                                    storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions_ev[vehicle_id].dur_reward = 0
+                                    self.storeactions_ev[vehicle_id].current_time = self.current_time
+                                    self.storeactions_ev[vehicle_id].target_location = target_coords
+                                else:
+                                    storeactions_ev[vehicle_id].next_action = actions[vehicle_id]
+                                    storeactions_ev[vehicle_id].next_action.next_value = 0
+                                    storeactions_ev[vehicle_id].vehicle_loc_post = vehicle_location
+                                    storeactions_ev[vehicle_id].vehicle_battery_post = vehicle_battery
+                                    old_current_time = getattr(storeactions_ev[vehicle_id], 'current_time', self.current_time)
+                                    self.storeactions_ev[vehicle_id] = None
+                                    self.storeactions_ev[vehicle_id] = actions[vehicle_id]
+                                    self.storeactions_ev[vehicle_id].dur_reward = 0
+                                    self.storeactions_ev[vehicle_id].dur_time = self.current_time - old_current_time
+                                    self.storeactions_ev[vehicle_id].current_time = self.current_time
+                                    self.storeactions_ev[vehicle_id].target_location = target_coords
+                            
+                            
                         else:
                             print(f"DEBUG: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             self._assign_idle_vehicle(vehicle_id)
@@ -1912,7 +2534,27 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle['is_stationary'] = False  # Reset stationary state if moving to idle target
                             current_coords = vehicle['coordinates']
                             target_coords = vehicle.get('idle_target', current_coords)  # Use assigned target
-                            actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery)
+                            actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                            
+                            # 添加storeactions处理
+                            if storeactions[vehicle_id] is None:
+                                storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].current_time = self.current_time
+                                self.storeactions[vehicle_id].target_location = vehicle.get('idle_target', vehicle['location'])
+                            else:
+                                storeactions[vehicle_id].next_action = actions[vehicle_id]
+                                storeactions[vehicle_id].next_action.next_value = 0
+                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
+                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
+                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
+                                self.storeactions[vehicle_id] = None
+                                self.storeactions[vehicle_id] = actions[vehicle_id]
+                                self.storeactions[vehicle_id].dur_reward = 0
+                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
+                                self.storeactions[vehicle_id].current_time = self.current_time
+                                self.storeactions[vehicle_id].target_location = vehicle.get('idle_target', vehicle['location'])
                            
                     else:
                         # No assignment for this vehicle - generate idle action
@@ -1957,14 +2599,18 @@ class ChargingIntegratedEnvironment(Environment):
                     actions[vehicle_id] = ServiceAction([], vehicle['passenger_onboard'], vehicle_location, vehicle_battery)
                 elif vehicle['charging_target'] is not None:
                     actions[vehicle_id] = ChargingAction([], vehicle['charging_target'], self.charge_duration, vehicle_location, vehicle_battery)
-                else:
-                    self._assign_idle_vehicle(vehicle_id)
-                    idle_target = vehicle.get('idle_target', None)
+                elif vehicle.get('target_location') is not None:
+                    # Vehicle has a target location - generate idle action to move there
                     current_coords = vehicle['coordinates']
-                    # Handle case where _assign_idle_vehicle failed to set idle_target
-                    if idle_target is None:
-                        idle_target = current_coords  # Stay in place
-                    actions[vehicle_id] = IdleAction([], current_coords, idle_target, vehicle_location, vehicle_battery)
+                    target_coords = vehicle['target_location']
+                    # Convert target_location to coordinates if it's a location index
+                    if isinstance(target_coords, int):
+                        target_coords = (target_coords % self.grid_size, target_coords // self.grid_size)
+                    actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery)
+                else:
+                    # No specific state - generate idle action at current location
+                    current_coords = vehicle['coordinates']
+                    actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location, vehicle_battery)
         if len(actions) != len(self.vehicles):
             print(f"❌ CRITICAL ERROR: Action count mismatch at step {self.current_time}!")
             print(f"   Total vehicles: {len(self.vehicles)}, Actions generated: {len(actions)}")
@@ -1973,6 +2619,12 @@ class ChargingIntegratedEnvironment(Environment):
             
             # Find missing vehicles
             missing_vehicles = [vid for vid in self.vehicles.keys() if vid not in actions]
+            print("   Vehicles missing actions:")
+            for vehicle_id in missing_vehicles:
+                print(f"     - Vehicle ID: {vehicle_id}")
+            print("   Detailed vehicle statuses for missing actions:")
+            for action in actions.items():
+                print(f"     - Vehicle ID with action: {action[0]}")
             print(f"   Missing actions for vehicles: {missing_vehicles}")
             
             # Show status of missing vehicles
@@ -1998,41 +2650,77 @@ class ChargingIntegratedEnvironment(Environment):
             #print(f"Vehicle {vehicle_id} action: {actions[vehicle_id]}")
             vehicle = self.vehicles[vehicle_id]
             #print(f" {vehicle_id}  Status - finished Assigned: {vehicle['assigned_request']}, Onboard: {vehicle['passenger_onboard']}, Charging: {vehicle['charging_station']}, Target: {vehicle['target_location']}, Stationary: {vehicle['is_stationary']}")
-        return actions, storeactions
+        
+        return actions, storeactions, storeactions_ev
 
-    def _update_q_learning(self, actions):
+    def _update_q_learning(self, actions, ifev = False):
         valuefunction = self.value_function
+        valuefunction_ev = self.value_function_ev
         if valuefunction is None or not hasattr(valuefunction, 'experience_buffer'):
             return
         
-        offlinsedatalen = valuefunction.experience_buffer.__len__()
-        if self.current_time % 100 == 0:
-            print(f"🔄 Updating Q-learning - current offline data size: {offlinsedatalen}")
-            exp_analysis = self.value_function.analyze_experience_data()
-            if exp_analysis:
-                reward_stats = exp_analysis['reward_stats']
-                action_stats = exp_analysis['action_stats']
-                print(f" Assign: {action_stats['assign_count']}, chargelength: {action_stats['charge_count']}, idlelength: {action_stats['idle_count']}")
-                print(f"    📊 Experience Data Analysis (last 100 steps):")
-                print(f"      Reward Distribution: +{reward_stats['positive_ratio']} | 0{reward_stats['neutral_ratio']} | -{reward_stats['negative_ratio']}")
-                print(f"      Mean Rewards: Overall={reward_stats['mean_reward']}, Assign={action_stats['assign_mean_reward']}, Charge={action_stats['charge_mean_reward']}, Idle={action_stats['idle_mean_reward']}")
-                print(f"      Action Success Rates: Assign={action_stats['assign_positive_ratio']:.1%}, Charge={action_stats['charge_positive_ratio']:.1%}, Idle={action_stats['idle_positive_ratio']:.1%}")
-            else:
-                print("    ⚠️ No experience data available for analysis yet")
+        
+        if ifev:
+            offlinsedatalen = valuefunction_ev.experience_buffer.__len__()
+            if self.current_time % 100 == 0:
+                print(f"🔄 Updating EV Q-learning - current offline data size: {offlinsedatalen}")
+                exp_analysis = self.value_function_ev.analyze_experience_data()
+                if exp_analysis:
+                    reward_stats = exp_analysis['reward_stats']
+                    action_stats = exp_analysis['action_stats']
+                    print(f" Assign: {action_stats['assign_count']}, chargelength: {action_stats['charge_count']}, idlelength: {action_stats['idle_count']}")
+                    print(f"    📊 Experience Data Analysis (last 100 steps):")
+                    print(f"      Reward Distribution: +{reward_stats['positive_ratio']} | 0{reward_stats['neutral_ratio']} | -{reward_stats['negative_ratio']}")
+                    print(f"      Mean Rewards: Overall={reward_stats['mean_reward']}, Assign={action_stats['assign_mean_reward']}, Charge={action_stats['charge_mean_reward']}, Idle={action_stats['idle_mean_reward']}")
+                    print(f"      Action Success Rates: Assign={action_stats['assign_positive_ratio']:.1%}, Charge={action_stats['charge_positive_ratio']:.1%}, Idle={action_stats['idle_positive_ratio']:.1%}")
+                else:
+                    print("    ⚠️ No experience data available for analysis yet")
+        else:
+            offlinsedatalen = valuefunction.experience_buffer.__len__()
+            if self.current_time % 100 == 0:
+                print(f"🔄 Updating Q-learning - current offline data size: {offlinsedatalen}")
+                exp_analysis = self.value_function.analyze_experience_data()
+                if exp_analysis:
+                    reward_stats = exp_analysis['reward_stats']
+                    action_stats = exp_analysis['action_stats']
+                    print(f" Assign: {action_stats['assign_count']}, chargelength: {action_stats['charge_count']}, idlelength: {action_stats['idle_count']}")
+                    print(f"    📊 Experience Data Analysis (last 100 steps):")
+                    print(f"      Reward Distribution: +{reward_stats['positive_ratio']} | 0{reward_stats['neutral_ratio']} | -{reward_stats['negative_ratio']}")
+                    print(f"      Mean Rewards: Overall={reward_stats['mean_reward']}, Assign={action_stats['assign_mean_reward']}, Charge={action_stats['charge_mean_reward']}, Idle={action_stats['idle_mean_reward']}")
+                    print(f"      Action Success Rates: Assign={action_stats['assign_positive_ratio']:.1%}, Charge={action_stats['charge_positive_ratio']:.1%}, Idle={action_stats['idle_positive_ratio']:.1%}")
+                else:
+                    print("    ⚠️ No experience data available for analysis yet")
+        
+        # Save training dataset at line 2085
+        if ifev:
+            if self.current_time % 200 == 0 and offlinsedatalen > 100:  # Save every 200 time steps with enough data
+                self._save_training_dataset(valuefunction_ev)
+                self._analyze_q_value_issues(valuefunction_ev)
+            
+            # 额外分析：每50步检查Q-value趋势
+            if self.current_time % 50 == 0 and offlinsedatalen > 50:
+                self._quick_q_value_analysis(valuefunction_ev)
+
+        else:
+            if self.current_time % 200 == 0 and offlinsedatalen > 100:  # Save every 200 time steps with enough data
+                self._save_training_dataset(valuefunction)
+                self._analyze_q_value_issues(valuefunction)
+            
+            # 额外分析：每50步检查Q-value趋势
+            if self.current_time % 50 == 0 and offlinsedatalen > 50:
+                self._quick_q_value_analysis(valuefunction)
+
+
         from .Action import ServiceAction, ChargingAction, IdleAction
-        # for vehicle_id, action in actions.items():
-        #     if action is None:
-        #         continue
-        #     print(f"vehid: {vehicle_id} ", end="")
-        #     print(f"Action for vehicle at time {self.current_time}: {action}")
-        #     print(f"   Vehicle location: {action.vehicle_loc}, Battery: {action.vehicle_battery:.2f}, Requests: {action.req_num}")
-        #     print(f"ifnext: {getattr(action, 'next_action', None)}")
-        #     print(f"durreward: {action.dur_reward}")
 
         def _manhattan_distance_loc(a_loc: int, b_loc: int) -> int:
             ax, ay = (a_loc % self.grid_size, a_loc // self.grid_size)
             bx, by = (b_loc % self.grid_size, b_loc // self.grid_size)
             return abs(ax - bx) + abs(ay - by)
+
+
+        whether_finish = self.current_time >= self.episode_length
+
 
         for vehicle_id in actions.keys():
             action = actions[vehicle_id]
@@ -2045,60 +2733,29 @@ class ChargingIntegratedEnvironment(Environment):
             current_battery = action.vehicle_battery
             current_request_num = action.req_num
             veh_curloc = self.vehicles[vehicle_id]['location']
-            # Only store at decision points; compute r_exec-style reward per option
-            if (self.value_function and hasattr(self.value_function, 'store_experience')):
-                other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
-                num_requests = len(self.active_requests)
-                store_threshold = 5
-                # Service option at assignment decision
-                next_action = getattr(action, 'next_action', None)
-                if isinstance(action, ServiceAction) and hasattr(action, 'request_id') and next_action is not None and action.dur_reward >store_threshold:
-                    r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
-                    next_value = getattr(next_action, 'next_value', r_exec)
-                    req = action.target_location
-                    next_battery = batterynow
-                    target_location = req
-                    next_location = req
-                    if isinstance(next_action, ServiceAction) :
-                        next_action_type = "assign"
-                    elif isinstance(next_action, ChargingAction) :
-                        next_action_type = "charge"
-                    else:
-                        next_action_type = "idle"
-                    # request_value 用 r_exec 对齐优化器语义
-                    self.value_function.store_experience(
-                        vehicle_id=vehicle_id,
-                        action_type=f"assign_{action.request_id}",
-                        vehicle_location=current_location,
-                        target_location=target_location,
-                        current_time=self.current_time,
-                        reward=r_exec,
-                        next_vehicle_location=next_location,
-                        battery_level=current_battery,
-                        next_battery_level=next_battery,
-                        other_vehicles=other_vehicles,
-                        num_requests=num_requests,
-                        request_value=r_exec,
-                        next_action_type = next_action_type,
-                        next_request_value = next_value
-                    )
-
-                # Service action when vehicle is stationary (rejection case)
-                elif isinstance(action, ServiceAction) and self.vehicles[vehicle_id].get('is_stationary', False):
+            veh_type = self.vehicles[vehicle_id]['type']
+            if veh_type == 2:
+                # Only store at decision points; compute r_exec-style reward per option
+                if (self.value_function and hasattr(self.value_function, 'store_experience')):
+                    other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
+                    num_requests = len(self.active_requests)
+                    store_threshold = 5
+                    # Service option at assignment decision
                     next_action = getattr(action, 'next_action', None)
-                    if next_action is not None:
+                    if isinstance(action, ServiceAction) and hasattr(action, 'request_id') and next_action is not None and action.dur_reward >store_threshold:
                         r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
                         next_value = getattr(next_action, 'next_value', r_exec)
+                        req = action.target_location
                         next_battery = batterynow
-                        target_location = action.target_location
-                        next_location = veh_curloc  # Vehicle doesn't move when stationary
-                        if isinstance(next_action, ServiceAction):
+                        target_location = req
+                        next_location = req
+                        if isinstance(next_action, ServiceAction) :
                             next_action_type = "assign"
-                        elif isinstance(next_action, ChargingAction):
+                        elif isinstance(next_action, ChargingAction) :
                             next_action_type = "charge"
                         else:
                             next_action_type = "idle"
-                        # Store experience for stationary service action (rejection case)
+                        # request_value 用 r_exec 对齐优化器语义
                         self.value_function.store_experience(
                             vehicle_id=vehicle_id,
                             action_type=f"assign_{action.request_id}",
@@ -2112,31 +2769,112 @@ class ChargingIntegratedEnvironment(Environment):
                             other_vehicles=other_vehicles,
                             num_requests=num_requests,
                             request_value=r_exec,
-                            next_action_type=next_action_type,
-                            next_request_value=next_value
+                            next_action_type = next_action_type,
+                            next_request_value = next_value,
+                            dur_time=getattr(action, 'dur_time', 1.0),
+                            is_system_done=getattr(self, 'done', False)
                         )
 
-                # Charging option at decision
-                elif isinstance(action, ChargingAction) and hasattr(action, 'charging_station_id'):
-                    st_id = action.charging_station_id
-                    next_action = getattr(action, 'next_action', None)
-                    if hasattr(self, 'charging_manager') and st_id in self.charging_manager.stations and batterynow > self.chargeincrease_per_epoch and next_action is not None:
-                        next_value = getattr(next_action, 'next_value', 0)
-                        st = self.charging_manager.stations[st_id]
-                        station_loc = st.location
+                    elif isinstance(action, ChargingAction) and hasattr(action, 'charging_station_id'):
+                        # print(f"🔋 Storing charging experience for vehicle {vehicle_id} at step {self.current_time}")
+                        st_id = action.charging_station_id
+                        next_action = getattr(action, 'next_action', None)
+                        if hasattr(self, 'charging_manager') and st_id in self.charging_manager.stations and batterynow > self.chargeincrease_per_epoch and next_action is not None:
+                            next_value = getattr(next_action, 'next_value', 0)
+                            st = self.charging_manager.stations[st_id]
+                            station_loc = st.location
+                            r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+                            next_battery = batterynow
+                            target_location = station_loc
+                            next_location = station_loc
+                            if isinstance(next_action, ServiceAction) :
+                                next_action_type = "assign"
+                            elif isinstance(next_action, ChargingAction) :
+                                next_action_type = "charge"
+                            else:
+                                next_action_type = "idle"
+                            self.value_function.store_experience(
+                                vehicle_id=vehicle_id,
+                                action_type=f"charge_{st_id}",
+                                vehicle_location=current_location,
+                                target_location=target_location,
+                                current_time=self.current_time,
+                                reward=r_exec,
+                                next_vehicle_location=next_location,
+                                battery_level=current_battery,
+                                next_battery_level=next_battery,
+                                other_vehicles=other_vehicles,
+                                num_requests=num_requests,
+                                request_value=r_exec,
+                                next_action_type=next_action_type,
+                                next_request_value=next_value,
+                                dur_time=getattr(action, 'dur_time', 1.0),
+                                is_system_done=getattr(self, 'done', False)
+                            )
+
+                    # Idle/wait decision treated as single-step option
+                    elif isinstance(action, IdleAction):
+
+                        # print(f"⏳ Storing idle experience for vehicle {vehicle_id} at step {self.current_time}")
+                        next_action = getattr(action, 'next_action', None)
+                        # 确定next_action类型和价值，即使next_action为None也要存储
+                        if next_action is not None:
+                            next_value = getattr(next_action, 'next_value', actions[vehicle_id].dur_reward)
+                            if isinstance(next_action, ServiceAction):
+                                next_action_type = "assign"
+                            elif isinstance(next_action, ChargingAction):
+                                next_action_type = "charge"
+                            else:
+                                next_action_type = "idle"
+                        else:
+                            # 没有next_action时，使用当前的dur_reward作为价值估计
+                            next_value = actions[vehicle_id].dur_reward
+                            next_action_type = "idle"
+                        
                         r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+
+                        self.value_function.store_experience(
+                            vehicle_id=vehicle_id,
+                            action_type="idle",
+                            vehicle_location=current_location,
+                            target_location=veh_curloc,
+                            current_time=self.current_time,
+                            reward=-100,
+                            next_vehicle_location=veh_curloc,
+                            battery_level=current_battery,
+                            next_battery_level=batterynow,
+                            other_vehicles=other_vehicles,
+                            num_requests=num_requests,
+                            request_value=r_exec,
+                            next_action_type=next_action_type,
+                            next_request_value=next_value,
+                            dur_time=getattr(action, 'dur_time', 1.0),
+                            is_system_done=getattr(self, 'done', False)
+                        )
+            else:
+                if (self.value_function_ev and hasattr(self.value_function_ev, 'store_experience')):
+                    other_vehicles = len([v for v in self.vehicles.values() if v['assigned_request'] is not None])
+                    num_requests = len(self.active_requests)
+                    store_threshold = 5
+                    # Service option at assignment decision
+                    next_action = getattr(action, 'next_action', None)
+                    if isinstance(action, ServiceAction) and hasattr(action, 'request_id') and next_action is not None and action.dur_reward >store_threshold:
+                        r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+                        next_value = getattr(next_action, 'next_value', r_exec)
+                        req = action.target_location
                         next_battery = batterynow
-                        target_location = station_loc
-                        next_location = station_loc
+                        target_location = req
+                        next_location = req
                         if isinstance(next_action, ServiceAction) :
                             next_action_type = "assign"
                         elif isinstance(next_action, ChargingAction) :
                             next_action_type = "charge"
                         else:
                             next_action_type = "idle"
-                        self.value_function.store_experience(
+                        # request_value 用 r_exec 对齐优化器语义
+                        self.value_function_ev.store_experience(
                             vehicle_id=vehicle_id,
-                            action_type=f"charge_{st_id}",
+                            action_type=f"assign_{action.request_id}",
                             vehicle_location=current_location,
                             target_location=target_location,
                             current_time=self.current_time,
@@ -2147,38 +2885,120 @@ class ChargingIntegratedEnvironment(Environment):
                             other_vehicles=other_vehicles,
                             num_requests=num_requests,
                             request_value=r_exec,
-                            next_action_type=next_action_type,
-                            next_request_value=next_value
+                            next_action_type = next_action_type,
+                            next_request_value = next_value,
+                            dur_time=getattr(action, 'dur_time', 1.0),
+                            is_system_done=getattr(self, 'done', False)
                         )
 
-                # Idle/wait decision treated as single-step option
-                elif isinstance(action, IdleAction):
-                    next_action = getattr(action, 'next_action', None)
-                    if next_action is not None:
-                        next_value = getattr(next_action, 'next_value', 0)
-                        if isinstance(next_action, ServiceAction) :
-                            next_action_type = "assign"
-                        elif isinstance(next_action, ChargingAction) :
-                            next_action_type = "charge"
+                    # Service action when vehicle is stationary (rejection case)
+                    elif isinstance(action, ServiceAction) and self.vehicles[vehicle_id].get('idle_target') is not None and hasattr(action, 'request_id'):
+                        next_action = getattr(action, 'next_action', None)
+                        if next_action is not None:
+                            r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+                            next_value = getattr(next_action, 'next_value', r_exec)
+                            next_battery = batterynow
+                            target_location = action.target_location
+                            next_location = veh_curloc  # Vehicle doesn't move when stationary
+                            if isinstance(next_action, ServiceAction):
+                                next_action_type = "assign"
+                            elif isinstance(next_action, ChargingAction):
+                                next_action_type = "charge"
+                            else:
+                                next_action_type = "idle"
+                            # Store experience for stationary service action (rejection case)
+                            self.value_function_ev.store_experience(
+                                vehicle_id=vehicle_id,
+                                action_type=f"assign_{action.request_id}",
+                                vehicle_location=current_location,
+                                target_location=target_location,
+                                current_time=self.current_time,
+                                reward=r_exec,
+                                next_vehicle_location=next_location,
+                                battery_level=current_battery,
+                                next_battery_level=next_battery,
+                                other_vehicles=other_vehicles,
+                                num_requests=num_requests,
+                                request_value=r_exec,
+                                next_action_type=next_action_type,
+                                next_request_value=next_value,
+                                dur_time=getattr(action, 'dur_time', 1.0),
+                                is_system_done=getattr(self, 'done', False)
+                            )
+
+                    # Charging option at decision
+                    elif isinstance(action, ChargingAction) and hasattr(action, 'charging_station_id'):
+                        st_id = action.charging_station_id
+                        next_action = getattr(action, 'next_action', None)
+                        if hasattr(self, 'charging_manager') and st_id in self.charging_manager.stations and batterynow > self.chargeincrease_per_epoch and next_action is not None:
+                            next_value = getattr(next_action, 'next_value', 0)
+                            st = self.charging_manager.stations[st_id]
+                            station_loc = st.location
+                            r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
+                            next_battery = batterynow
+                            target_location = station_loc
+                            next_location = station_loc
+                            if isinstance(next_action, ServiceAction) :
+                                next_action_type = "assign"
+                            elif isinstance(next_action, ChargingAction) :
+                                next_action_type = "charge"
+                            else:
+                                next_action_type = "idle"
+                            self.value_function_ev.store_experience(
+                                vehicle_id=vehicle_id,
+                                action_type=f"charge_{st_id}",
+                                vehicle_location=current_location,
+                                target_location=target_location,
+                                current_time=self.current_time,
+                                reward=r_exec,
+                                next_vehicle_location=next_location,
+                                battery_level=current_battery,
+                                next_battery_level=next_battery,
+                                other_vehicles=other_vehicles,
+                                num_requests=num_requests,
+                                request_value=r_exec,
+                                next_action_type=next_action_type,
+                                next_request_value=next_value,
+                                dur_time=getattr(action, 'dur_time', 1.0),
+                                is_system_done=getattr(self, 'done', False)
+                            )
+
+                    # Idle/wait decision treated as single-step option
+                    elif isinstance(action, IdleAction):
+                        next_action = getattr(action, 'next_action', None)
+                        # 确定next_action类型和价值，即使next_action为None也要存储
+                        if next_action is not None:
+                            next_value = getattr(next_action, 'next_value', actions[vehicle_id].dur_reward)
+                            if isinstance(next_action, ServiceAction):
+                                next_action_type = "assign"
+                            elif isinstance(next_action, ChargingAction):
+                                next_action_type = "charge"
+                            else:
+                                next_action_type = "idle"
                         else:
+                            # 没有next_action时，使用当前的dur_reward作为价值估计
+                            next_value = actions[vehicle_id].dur_reward
                             next_action_type = "idle"
+                        
                         r_exec = actions[vehicle_id].dur_reward  # Use accumulated reward from action
 
-                        self.value_function.store_experience(
+                        self.value_function_ev.store_experience(
                             vehicle_id=vehicle_id,
                             action_type="idle",
                             vehicle_location=current_location,
                             target_location=veh_curloc,
                             current_time=self.current_time,
                             reward=r_exec,
-                            next_vehicle_location= veh_curloc,
+                            next_vehicle_location=veh_curloc,
                             battery_level=current_battery,
                             next_battery_level=batterynow,
                             other_vehicles=other_vehicles,
                             num_requests=num_requests,
                             request_value=r_exec,
                             next_action_type=next_action_type,
-                            next_request_value=next_value
+                            next_request_value=next_value,
+                            dur_time=getattr(action, 'dur_time', 1.0),
+                            is_system_done=getattr(self, 'done', False)
                         )
 
     def _execute_action(self, vehicle_id, action):
@@ -2186,6 +3006,12 @@ class ChargingIntegratedEnvironment(Environment):
         from src.Action import ChargingAction, ServiceAction, IdleAction
 
         vehicle = self.vehicles[vehicle_id]
+        
+        # Ensure storeactions[vehicle_id] exists
+        if vehicle_id not in self.storeactions or self.storeactions[vehicle_id] is None:
+            self.storeactions[vehicle_id] = action
+            self.storeactions[vehicle_id].dur_reward = 0
+            self.storeactions[vehicle_id].current_time = self.current_time
         
         # Check if vehicle is in stationary state
         
@@ -2222,28 +3048,44 @@ class ChargingIntegratedEnvironment(Environment):
                     reward = -charging_penalty - np.random.random()*0.2  # Invalid station penalty
             else:
                 reward = -charging_penalty - np.random.random()*0.2  # Invalid station penalty
-            self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
+            if vehicle['type'] == 1:
+                reward += -0.1  # Extra penalty for EVs to encourage efficiency
+                if self.storeactions_ev[vehicle_id] is not None:
+                    self.storeactions_ev[vehicle_id].dur_reward += reward  # Store for reference
+            else:
+                reward += -0.01  # Smaller penalty for ICE vehicles
+                if self.storeactions[vehicle_id] is not None:
+                    self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
             dur_reward = action.dur_reward  # Total reward over charging duration
         elif isinstance(action, ServiceAction):
             # Service action - immediate reward is request.value (same as Gurobi)
             # Check if vehicle is in stationary state (rejection case)
-            if vehicle.get('is_stationary', False):
+            if vehicle['idle_target'] is not None:
                 # Vehicle rejected the request - apply penalty and don't move
                 active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
                 active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
                 avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
                 
-                penalty_reward = -avg_request_value * 0.1 - avg_request_value * 0.5
-                self.storeactions[vehicle_id].dur_reward += penalty_reward
+                penalty_reward = - avg_request_value * 0.1
+                if vehicle['type'] == 1:
+                    if self.storeactions_ev[vehicle_id] is not None:
+                        self.storeactions_ev[vehicle_id].dur_reward += penalty_reward
+                else:
+                    if self.storeactions[vehicle_id] is not None:
+                        self.storeactions[vehicle_id].dur_reward += penalty_reward
                             
-                return -avg_request_value * 0.01, penalty_reward  # Penalty for rejection
+                return 0, penalty_reward  # Penalty for rejection
             elif vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:
                 active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
                 active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
                 avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-                
-                self.storeactions[vehicle_id].dur_reward += -avg_request_value*0.1
-                return -avg_request_value*0.1, -avg_request_value*0.1  # Penalty for invalid service action
+                if vehicle['type'] == 1:
+                    if self.storeactions_ev[vehicle_id] is not None:
+                        self.storeactions_ev[vehicle_id].dur_reward += -avg_request_value*0.1
+                else:
+                    if self.storeactions[vehicle_id] is not None:
+                        self.storeactions[vehicle_id].dur_reward += -avg_request_value*0.1
+                return 0, -avg_request_value*0.1  # Penalty for invalid service action
             elif vehicle['assigned_request'] is not None:
                 # Progress towards pickup - check if我们能pickup
                 if self._pickup_passenger(vehicle_id):
@@ -2256,10 +3098,15 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['assigned_request'] = None
                         vehicle['passenger_onboard'] = None
                         vehicle['charging_target'] = None
-                        print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法继续前往pickup位置")
+                        #print(f"⚠️  车辆 {vehicle_id} 电池耗尽，无法继续前往pickup位置")
                     else:
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
-                self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
+                if vehicle['type'] == 1:
+                    if self.storeactions_ev[vehicle_id] is not None:
+                        self.storeactions_ev[vehicle_id].dur_reward += reward  # Store for reference
+                else:
+                    if self.storeactions[vehicle_id] is not None:
+                        self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
             elif vehicle['passenger_onboard'] is not None:
                 earnings = self._dropoff_passenger(vehicle_id)
                 if earnings > 0:
@@ -2267,7 +3114,7 @@ class ChargingIntegratedEnvironment(Environment):
                 else:
                     # 检查电池是否耗尽
                     if vehicle['battery'] <= 0.0:
-                        print(f"⚠️  车辆 {vehicle_id} 电池耗尽，乘客滞留无法到达dropoff位置")
+                        #print(f"⚠️  车辆 {vehicle_id} 电池耗尽，乘客滞留无法到达dropoff位置")
                         vehicle['target_location'] = None
                         vehicle['idle_target'] = None
                         vehicle['assigned_request'] = None
@@ -2275,7 +3122,12 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['charging_target'] = None
                     else:
                         reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
-                self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
+                if vehicle['type'] == 1:
+                    if self.storeactions_ev[vehicle_id] is not None:
+                        self.storeactions_ev[vehicle_id].dur_reward += reward  # Store for reference
+                else:
+                    if self.storeactions[vehicle_id] is not None:
+                        self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
         
         elif isinstance(action, IdleAction):
             if vehicle.get('is_stationary', False):
@@ -2290,15 +3142,26 @@ class ChargingIntegratedEnvironment(Environment):
                 active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
                 active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
                 avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
-                self.storeactions[vehicle_id].dur_reward += - avg_request_value
-                return - avg_request_value*0.01, - avg_request_value
+                if vehicle['type'] == 1:
+                    if self.storeactions_ev[vehicle_id] is not None:
+                        self.storeactions_ev[vehicle_id].dur_reward += - avg_request_value*0.1
+                else:
+                    if self.storeactions[vehicle_id] is not None:
+                        self.storeactions[vehicle_id].dur_reward += - avg_request_value*0.1
+                return - avg_request_value*0.1, - avg_request_value*0.1
             else:
                 active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
                 active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
                 avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 500.0
                 reward = self._execute_movement_towards_idle(vehicle_id, vehicle.get('idle_target', None))
-                self.storeactions[vehicle_id].dur_reward += reward  # Store for reference
-                dur_reward = self.storeactions[vehicle_id].dur_reward  # Total reward over charging duration
+                if vehicle['type'] == 1:
+                    if self.storeactions_ev[vehicle_id] is not None:
+                        self.storeactions_ev[vehicle_id].dur_reward += reward  - avg_request_value*0.1
+                        dur_reward = self.storeactions_ev[vehicle_id].dur_reward  # Total reward over charging duration
+                else:
+                    if self.storeactions[vehicle_id] is not None:
+                        self.storeactions[vehicle_id].dur_reward += reward  - avg_request_value*0.1
+                        dur_reward = self.storeactions[vehicle_id].dur_reward  # Total reward over charging duration
         # if vehicle.get('is_stationary', False):
         #     # Reduce stationary duration
         #     vehicle['stationary_duration'] = 1
@@ -2445,15 +3308,50 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle['passenger_onboard'] = None
             vehicle['charging_target'] = None
             vehicle['needs_emergency_charging'] = True
-            print(f"⚠️  车辆 {vehicle_id} 在智能移动后电池耗尽 (位置: {new_x}, {new_y})")
+            #print(f"⚠️  车辆 {vehicle_id} 在智能移动后电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other movement methods)
         return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance if distance > 0 else -0.05 
     
 
+    def return_nearest_idle_target(self, vehicle_id):
+        if self.use_intense_requests:
+            return self.hotspot_locations[0]
+        else:
+            vehicle_loc = self.vehicles[vehicle_id]['location']
+            x = vehicle_loc % self.grid_size
+            y = vehicle_loc // self.grid_size
+            distance_list = []
+            for loc in self.hotspot_locations:
+                hx, hy = loc
+                dist = abs(hx - x) + abs(hy - y)
+                distance_list.append((dist, loc))
+            if distance_list:
+                # Return the closest hotspot location
+                return min(distance_list, key=lambda item: item[0])[1]
+            return None
 
+    
+    
+    
+    
+    
+    def return_nearest_hotspot_index(self, vehicle_id):
+        vehicle_loc = self.vehicles[vehicle_id]['location']
+        x = vehicle_loc % self.grid_size
+        y = vehicle_loc // self.grid_size
+        distance_list = []
+        for idx, loc in enumerate(self.hotspot_locations):
+            hx, hy = loc
+            dist = abs(hx - x) + abs(hy - y)
+            distance_list.append((dist, idx))
+        if distance_list:
+            # Return the index of the closest hotspot location
+            return min(distance_list, key=lambda item: item[0])[1]
+        return None
 
     def _assign_idle_vehicle(self, vehicle_id):
+
         vehicle = self.vehicles[vehicle_id]
         vehicle['assigned_request'] = None
         vehicle['passenger_onboard'] = None
@@ -2477,9 +3375,13 @@ class ChargingIntegratedEnvironment(Environment):
             target_x, target_y = random.choice(candidates)
         else:
             target_x, target_y = cx, cy
-        # Store target for later use in action execution
-        vehicle['idle_target'] = (target_x, target_y)
         
+        # # Use hotspot location if available, otherwise use the calculated random neighbor
+
+        # target_x, target_y = self.return_nearest_idle_target(vehicle_id)
+
+        # vehicle['idle_target'] = (target_x, target_y)
+
         return True
 
     def _execute_movement_towards_charging_station(self, vehicle_id, station_id):
@@ -2576,7 +3478,7 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle['assigned_request'] = None
             vehicle['passenger_onboard'] = None
             vehicle['charging_target'] = None
-            print(f"⚠️  车辆 {vehicle_id} 前往充电站时电池耗尽 (位置: {new_x}, {new_y})")
+            #print(f"⚠️  车辆 {vehicle_id} 前往充电站时电池耗尽 (位置: {new_x}, {new_y})")
         
         # Small time penalty for movement (consistent with other movement methods)
         return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance 
@@ -2651,12 +3553,12 @@ class ChargingIntegratedEnvironment(Environment):
             vehicle['passenger_onboard'] = None
             vehicle['charging_target'] = None
             vehicle['needs_emergency_charging'] = True
-            print(f"⚠️  车辆 {vehicle_id} 在闲置移动后电池耗尽 (位置: {new_x}, {new_y})")
+            #print(f"⚠️  车辆 {vehicle_id} 在闲置移动后电池耗尽 (位置: {new_x}, {new_y})")
         active_requests_count = len(self.active_requests) if hasattr(self, 'active_requests') else 0
         active_requests_value = sum(req.final_value for req in self.active_requests.values()) if hasattr(self, 'active_requests') else 0.0
         avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 100.0
         # Small time penalty for movement (consistent with other methods)
-        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance   - avg_request_value
+        return (self.movingpenalty  +  np.abs(np.random.normal(0, 0.05)))*distance   
     
     def _update_environment(self):
         """Update environment state"""
@@ -2668,8 +3570,21 @@ class ChargingIntegratedEnvironment(Environment):
 
         else:
             new_requests = self._generate_random_requests()  # Now also returns a list
-        
+        request_num = len(new_requests)
+        self.whole_req_num += request_num
         # Update charging status
+        
+        
+        for vehicle_id, vehicle in self.vehicles.items():
+            if vehicle['assigned_request'] is None and vehicle['passenger_onboard'] is None:  
+                vehicle['idle_timer'] += 1
+            if vehicle['penalty_timer'] > 0:
+                vehicle['penalty_timer'] -= 1
+            
+                    
+        
+        
+        
         for vehicle_id, vehicle in self.vehicles.items():
             if vehicle['charging_station'] is not None:
                 vehicle['charging_time_left'] -= 1
@@ -2687,7 +3602,8 @@ class ChargingIntegratedEnvironment(Environment):
                     vehicle['charging_station'] = None
                     self.charge_finished += 1
                     self.charge_stats[station_id].append(self.current_time)
-        # Synchronize charging states between vehicles and stations
+                    
+
         # This fixes the issue where stations auto-start vehicles from queue but don't update vehicle state
         for station_id, station in self.charging_manager.stations.items():
             for charging_vehicle_id in station.current_vehicles:
@@ -2701,7 +3617,9 @@ class ChargingIntegratedEnvironment(Environment):
                         vehicle['charging_station'] = station_id
                         vehicle['charging_time_left'] = getattr(self, 'default_charging_duration', 2)
                         # Don't increment charging_count as this is just a sync operation
-        
+            self.idle_charging_num[station_id] = station.max_capacity - len(station.current_vehicles)
+        self.current_online = sum(1 for vehicle in self.vehicles.values() if vehicle['idle_target'] is not None)
+
         # Remove expired requests and apply unserved penalty
         current_time = self.current_time
         expired_requests = []
@@ -2713,7 +3631,12 @@ class ChargingIntegratedEnvironment(Environment):
                 # Apply penalty for unserved request
                 unserved_penalty_total += self.unserved_penalty
 
+        # Debug info
+        if len(expired_requests) > 0 and self.current_time % 50 == 0:
+            print(f"⏰ Time {current_time}: {len(expired_requests)} requests expired (pickup_deadline passed)")
+
         # Distribute unserved penalty among all vehicles
+        expired_being_served = 0
         for request_id in expired_requests:
             # 检查订单是否正在被车辆服务（assigned或onboard）
             request_being_served = False
@@ -2721,6 +3644,9 @@ class ChargingIntegratedEnvironment(Environment):
                 if (vehicle['assigned_request'] == request_id or 
                     vehicle['passenger_onboard'] == request_id):
                     request_being_served = True
+                    expired_being_served += 1
+                    if self.current_time % 50 == 0:
+                        print(f"   ⚠️  Request {request_id} expired but still being served by vehicle {vehicle_id}")
                     break
             
             # 只删除不在服务中的过期订单
@@ -2728,6 +3654,9 @@ class ChargingIntegratedEnvironment(Environment):
                 request = self.active_requests[request_id]
                 #self.rejected_requests.append(request)
                 del self.active_requests[request_id]
+        
+        if expired_being_served > 0 and self.current_time % 50 == 0:
+            print(f"   📊 {expired_being_served} expired requests still being served (kept in active_requests)")
         
         # Distribute unserved penalty among all vehicles
         # for vehicle_id, vehicle in self.vehicles.items():
@@ -2739,6 +3668,7 @@ class ChargingIntegratedEnvironment(Environment):
         #         # 只有当订单真的被删除时才清空车辆状态
         #         if self.vehicles[vehicle_id]['passenger_onboard'] not in self.active_requests:
         #             vehicle['passenger_onboard'] = None
+        # NOTE: EV penalty filtering is handled in simulate_motion().
             # if self.vehicles[vehicle_id]['passenger_onboard'] and self.vehicles[vehicle_id]['battery'] <= self.min_battery_level:
             #     # Handle passenger stranding due to low battery
             #     request_id = vehicle['passenger_onboard']
@@ -2760,7 +3690,9 @@ class ChargingIntegratedEnvironment(Environment):
         self.whole_req = 0
         self.ev_requests = []
         self.active_requests = {}
+        self.whole_req_num = 0
         self.completed_requests = []
+        self.completed_requests_ev = []
         self.rejected_requests = []
         self.request_counter = 0
         self.charge_finished = 0
@@ -2770,6 +3702,7 @@ class ChargingIntegratedEnvironment(Environment):
         self.rebalancing_whole = []
         self.total_rebalancing_calls = 0
         self.storeactions = {}
+        self.storeactions_ev = {}
         self.storeactions_next = {}
         self._setup_vehicles()
         return self.get_initial_states()
@@ -2842,6 +3775,8 @@ class ChargingIntegratedEnvironment(Environment):
         # Count active and completed requests
         active_orders = len(self.active_requests)
         completed_orders = len(self.completed_requests)
+        completed_ev_orders = len(self.completed_requests_ev)
+        service_ratio = completed_orders/self.whole_req_num if self.whole_req_num > 0 else 0
         avg_request_value1 = self.request_value_sum/completed_orders if completed_orders > 0 else 0
         total_orders = active_orders + completed_orders + total_rejected
         accepted_orders = active_orders + completed_orders
@@ -2856,6 +3791,7 @@ class ChargingIntegratedEnvironment(Environment):
         # Calculate rebalancing assignment statistics
         avg_rebalancing_assignments = 0
         total_rebalancing_assignments = 0
+        avg_rebalance_whole = 0
         if self.rebalancing_assignments_per_step:
             total_rebalancing_assignments = sum(self.rebalancing_assignments_per_step)
             avg_rebalancing_assignments = total_rebalancing_assignments / len(self.rebalancing_assignments_per_step)
@@ -2868,6 +3804,8 @@ class ChargingIntegratedEnvironment(Environment):
             'rejected_orders': total_rejected,
             'ev_accept': total_ev_request,
             'completed_orders': completed_orders,
+            'completed_ev_orders': completed_ev_orders,
+            'service_ratio': service_ratio,
             'avg_request_value': avg_request_value1,
             'avg_battery_level': avg_battery,
             'finished_charge': self.charge_finished,
@@ -2924,100 +3862,263 @@ class ChargingIntegratedEnvironment(Environment):
             'ev_rejection_rate': ev_rejected / max(1, ev_rejected + len(self.completed_requests)) if ev_vehicles else 0,
             'aev_rejection_rate': aev_rejected / max(1, aev_rejected + len(self.completed_requests)) if aev_vehicles else 0
         }
+        
+        
+        
     def simulate_motion_dqn(self, dqn_agent=None, current_requests: List[Request] = None, training=True):
         """
-        DQN-based simulation for vehicle dispatch as benchmark comparison to ILP-ADP
-        
-        Args:
-            dqn_agent: DQN agent for decision making
-            current_requests: List of current requests to handle
-            training: Whether in training mode (affects exploration)
-        
-        Returns:
-            dict: Simulation results including rewards, actions taken, and performance metrics
+        DQN-based simulation for vehicle dispatch as benchmark comparison to ILP-ADP.
+        存储的 transition 以“动作完成”为 done（接单完成/失败、充电完成、wait/idle 单步）。
         """
+        # Import lightweight DQN utilities without changing other components
         try:
-            # Try to import DQN components (optional dependency)
             from .ValueFunction_pytorch import DQNAgent, create_dqn_state_features
-        except ImportError:
-            print("Warning: DQN components not available. Please ensure ValueFunction_pytorch.py has DQN classes.")
+        except Exception:
+            print("Warning: DQN components not available. Please ensure ValueFunction_pytorch.py defines DQNAgent and create_dqn_state_features.")
             return None
-        
-        # Initialize DQN agent if not provided
+
+        # If caller did not provide a request list, we'll derive a per-vehicle Top-K (by distance) later
+        provided_requests = None if current_requests is None else list(current_requests)
+
+        # Instantiate a default agent if needed (benchmark use only)
         if dqn_agent is None:
             device = 'cuda' if hasattr(self, 'device') else 'cpu'
-            dqn_agent = DQNAgent(
-                state_dim=64,
-                action_dim=32,  # Adjust based on your action space
-                device=device
-            )
-        
-        simulation_results = {
+            dqn_agent = DQNAgent(state_dim=64, action_dim=32, device=device)
+
+        results = {
             'total_reward': 0.0,
             'actions_taken': [],
-            'vehicle_utilization': {},
+            'vehicle_utilization': 0.0,
             'request_completion_rate': 0.0,
-            'average_response_time': 0.0,
+            'average_battery_level': 0.0,
             'dqn_decisions': [],
-            'ilp_comparison': None
+            'transitions_added': 0
         }
-        
-        # Process each vehicle decision
-        for vehicle_id, vehicle in self.vehicles.items():
-            if not vehicle.get('idle', True):
-                continue  # Skip busy vehicles
-            
-            # Create state features for DQN
-            state_features = create_dqn_state_features(self, vehicle_id, self.current_time)
-            
-            # Get action from DQN
-            action, q_values = dqn_agent.select_action(
-                state_features['vehicle'],
-                state_features['request'], 
-                state_features['global'],
-                training=training
-            )
-            
-            # Map DQN action to environment action
-            env_action = self._map_dqn_action_to_env(action, vehicle_id, current_requests)
-            
-            # Execute action and get reward
-            reward = self._execute_dqn_action(vehicle_id, env_action, current_requests)
-            
-            # Store results
-            simulation_results['total_reward'] += reward
-            simulation_results['actions_taken'].append({
-                'vehicle_id': vehicle_id,
-                'action': action,
-                'env_action': env_action,
-                'reward': reward,
-                'q_values': q_values.cpu().numpy().tolist() if hasattr(q_values, 'cpu') else q_values
-            })
-            
-            # Store experience for training if in training mode
-            if training and hasattr(dqn_agent, 'store_transition'):
-                # Get next state after action
-                next_state_features = create_dqn_state_features(self, vehicle_id, self.current_time)
+
+        # Snapshot counts for metrics
+        completed_before = len(self.completed_requests)
+
+        # Prepare per-action buffer (persist across ticks)
+        if not hasattr(self, '_dqn_action_buffers'):
+            self._dqn_action_buffers = {}
+
+        # 1) Progress ongoing actions for vehicles already in buffer
+        for vehicle_id, buf in list(self._dqn_action_buffers.items()):
+            v = self.vehicles.get(vehicle_id)
+            if not v:
+                del self._dqn_action_buffers[vehicle_id]
+                continue
+
+            a_type = buf.get('action_type', 'idle')
+            step_reward = 0.0
+            action_done = False
+
+            if a_type == 'assign':
+                # Continue towards pickup/dropoff
+                if self._pickup_passenger(vehicle_id):
+                    step_reward += 0.5 + np.random.normal(0, 0.2)
+                else:
+                    step_reward += self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.05)
+                # Try dropoff if onboard
+                if v.get('passenger_onboard') is not None:
+                    drop_r = self._dropoff_passenger(vehicle_id)
+                    if drop_r > 0:
+                        step_reward += drop_r + np.random.normal(0, 0.2)
+                        # Mark successful completion for this buffered assign
+                        buf['dropoff_done'] = True
+                    else:
+                        step_reward += self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.05)
+                # Done when vehicle becomes free (no assigned and no onboard)
+                if v.get('assigned_request') is None and v.get('passenger_onboard') is None:
+                    # If we became free without a recorded dropoff, treat as assignment failure
+                    if not buf.get('dropoff_done', False):
+                        active_requests_count = len(self.active_requests)
+                        active_requests_value = sum(req.final_value for req in self.active_requests.values()) if self.active_requests else 0.0
+                        avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 100.0
+                        step_reward += -avg_request_value*0.01
+                    action_done = True
+
+            elif a_type == 'charge':
+                station_id = buf.get('station_id')
+                if v.get('charging_station') is None:
+                    # Move towards station / try start charging
+                    vloc = v.get('location', 0)
+                    # Ensure station_id is valid; remap to nearest if missing
+                    if not hasattr(self, 'charging_manager') or not getattr(self.charging_manager, 'stations', None):
+                        action_done = True  # no stations; consider action finished
+                    else:
+                        stations = self.charging_manager.stations
+                        if station_id not in stations:
+                            best_sid, best_d = None, 1e9
+                            for sid, st in stations.items():
+                                d = self._manhattan_distance_loc(vloc, st.location)
+                                if d < best_d:
+                                    best_sid, best_d = sid, d
+                            station_id = best_sid if best_sid is not None else list(stations.keys())[0]
+                            buf['station_id'] = station_id
+                        self._move_vehicle_to_charging_station(vehicle_id, station_id)
+                        step_reward += self._execute_movement_towards_charging_station(vehicle_id, station_id)
+                # Detect completion: charging_duration == 0 if present; else charging_time_left <= 0; or finished charging (was charging -> now not charging)
+                cd = v.get('charging_duration', None)
+                ctl = v.get('charging_time_left', None)
+                finished_by_time = (cd == 0) if cd is not None else (ctl is not None and ctl <= 0)
+                if finished_by_time:
+                    action_done = True
+                else:
+                    if buf.get('was_charging', False) and v.get('charging_station') is None:
+                        action_done = True
+                    if v.get('charging_station') is not None:
+                        buf['was_charging'] = True
+
+            # wait/idle are stored immediately at creation; buffers shouldn't exist for them
+
+            # Accumulate and finalize if needed
+            buf['acc_reward'] = buf.get('acc_reward', 0.0) + float(step_reward)
+            results['total_reward'] += float(step_reward)
+
+            if action_done and training and hasattr(dqn_agent, 'store_transition'):
+                next_state = create_dqn_state_features(self, vehicle_id, self.current_time)
+                dqn_agent.store_transition(buf['state'], int(buf['action_idx']), float(buf['acc_reward']), next_state, done=True)
+                results['transitions_added'] += 1
+                del self._dqn_action_buffers[vehicle_id]
+
+        # 2) Iterate idle-capable vehicles only (not assigned/onboard/charging) to start new actions
+        for vehicle_id, v in self.vehicles.items():
+            if vehicle_id in self._dqn_action_buffers:
+                continue
+            # Skip busy vehicles
+            is_free = (v.get('assigned_request') is None and
+                       v.get('passenger_onboard') is None and
+                       v.get('charging_station') is None or v.get('is_stationary') is True)
+            if not is_free and v.get('battery_level', 1.0) > self.min_battery_level:
+                continue
+
+            vehicle = self.vehicles[vehicle_id]
+            # 根据车辆类型构建候选请求：
+            # - EV(type==1): 最近且电量可完成
+            # - AEV(type==2): 价值最高且电量可完成
+            if provided_requests is not None:
+                veh_requests = provided_requests
+            else:
+                all_reqs = list(self.active_requests.values())
+                if not all_reqs:
+                    veh_requests = []
+                else:
+                    vloc = v.get('location', 0)
+                    battery = v.get('battery', v.get('battery_level', 1.0))
+
+                    def feasible(req):
+                        pick = getattr(req, 'pickup', 0)
+                        drop = getattr(req, 'dropoff', 0)
+                        d1 = self._manhattan_distance_loc(vloc, pick)
+                        d2 = self._manhattan_distance_loc(pick, drop)
+                        total_d = d1 + d2
+                        est_use = total_d * (self.battery_consum)
+                        return est_use <= battery
+
+                    feasible_reqs = [req for req in all_reqs if feasible(req)]
+
+                    if vehicle['type'] == 1:  # EV: 最近优先
+                        feasible_reqs.sort(key=lambda r: (
+                            self._manhattan_distance_loc(vloc, getattr(r, 'pickup', 0)),
+                            getattr(r, 'request_id', 0)
+                        ))
+                    else:  # AEV: 价值最高优先
+                        feasible_reqs.sort(key=lambda r: (
+                            -float(getattr(r, 'final_value', getattr(r, 'value', 0.0))),
+                            getattr(r, 'request_id', 0)
+                        ))
+
+                    veh_requests = feasible_reqs[:10]
                 
-                # Store transition
-                dqn_agent.store_transition(
-                    state_features,
-                    action,
-                    reward,
-                    next_state_features,
-                    done=False  # Episode continues
-                )
-        
-        # Calculate performance metrics
-        self._calculate_dqn_performance_metrics(simulation_results, current_requests)
-        
-        # Train DQN if in training mode
+            # Build DQN state features
+            state = create_dqn_state_features(self, vehicle_id, self.current_time)
+
+            # 检查当前idle车辆数量，确定是否需要考虑idle约束
+            current_idle_count = self._count_idle_vehicles()
+            min_required_idle = getattr(self, 'idle_vehicle_requirement', 1)
+            
+            # 计算还需要多少车辆保持idle状态
+            idle_deficit = max(0, min_required_idle - current_idle_count)
+            need_idle_constraint = idle_deficit > 0
+            
+            if need_idle_constraint:
+                print(f"  📊 Idle constraint active: current={current_idle_count}, required={min_required_idle}, deficit={idle_deficit}")
+
+            # Select action (考虑idle约束)
+            action_idx, q_values = dqn_agent.select_action(
+                state['vehicle'], state['request'], state['global'], 
+                training=training,
+                force_idle_constraint=need_idle_constraint  # 传递约束信息
+            )
+
+            # Map to environment-level action spec
+            env_action = self._map_dqn_action_to_env(action_idx, vehicle_id, veh_requests)
+
+            # Execute action via DQN executor (uses existing helpers internally)
+            reward = self._execute_dqn_action(vehicle_id, env_action, veh_requests)
+
+            # Record
+            results['total_reward'] += float(reward)
+            results['actions_taken'].append({
+                'vehicle_id': vehicle_id,
+                'dqn_action': int(action_idx),
+                'env_action': env_action,
+                'reward': float(reward),
+                'q_values': q_values.detach().cpu().numpy().tolist() if hasattr(q_values, 'detach') else None
+            })
+
+            # Store transition logic based on action completeness semantics
+            if training and hasattr(dqn_agent, 'store_transition'):
+                a_type = env_action.get('type', 'idle')
+                if a_type == 'assign':
+                    # If assignment failed this step (仍然空闲且没有乘客)，立即存储并结束
+                    if v.get('assigned_request') is None and v.get('passenger_onboard') is None:
+                        next_state = create_dqn_state_features(self, vehicle_id, self.current_time)
+                        dqn_agent.store_transition(state, int(action_idx), float(reward), next_state, done=True)
+                        results['transitions_added'] += 1
+                    else:
+                        # 成功接单：进入缓冲，累计到 dropoff 完成
+                        self._dqn_action_buffers[vehicle_id] = {
+                            'state': state,
+                            'action_idx': int(action_idx),
+                            'env_action': env_action,
+                            'action_type': 'assign',
+                            'acc_reward': float(reward)
+                        }
+                elif a_type == 'charge':
+                    # 充电：进入缓冲，直到 charging_duration==0 或 charging_time_left<=0 完成
+                    self._dqn_action_buffers[vehicle_id] = {
+                        'state': state,
+                        'action_idx': int(action_idx),
+                        'env_action': env_action,
+                        'action_type': 'charge',
+                        'station_id': env_action.get('station_id'),
+                        'acc_reward': float(reward),
+                        'was_charging': v.get('charging_station') is not None
+                    }
+                else:
+                    # wait/idle 单步即完成
+                    next_state = create_dqn_state_features(self, vehicle_id, self.current_time)
+                    dqn_agent.store_transition(state, int(action_idx), float(reward), next_state, done=True)
+                    results['transitions_added'] += 1
+
+        # Advance environment by one tick to keep parity with built-in step()
+        self._update_environment()
+
+        # Compute benchmark metrics from current env
+        self._calculate_dqn_performance_metrics(results, current_requests)
+
+        # Optional policy update
         if training and hasattr(dqn_agent, 'train_step'):
             loss = dqn_agent.train_step(batch_size=32)
             if loss is not None:
-                simulation_results['training_loss'] = loss
-        
-        return simulation_results
+                results['training_loss'] = float(loss)
+
+        # Snapshot deltas
+        results['orders_completed_delta'] = max(0, len(self.completed_requests) - completed_before)
+
+        return results
     
     def _map_dqn_action_to_env(self, dqn_action, vehicle_id, current_requests):
         """
@@ -3043,9 +4144,9 @@ class ChargingIntegratedEnvironment(Environment):
             request = current_requests[dqn_action]
             return {
                 'type': 'assign',
-                'request_id': getattr(request, 'id', dqn_action),
-                'pickup_location': getattr(request, 'pickup_location', 0),
-                'dropoff_location': getattr(request, 'dropoff_location', 0)
+                'request_id': getattr(request, 'request_id', dqn_action),
+                'pickup_location': getattr(request, 'pickup', 0),
+                'dropoff_location': getattr(request, 'dropoff', 0)
             }
         elif 10 <= dqn_action < 20:
             # Rebalance to strategic location (重新平衡)
@@ -3055,10 +4156,15 @@ class ChargingIntegratedEnvironment(Environment):
                 'target_location': min(target_location, self.NUM_LOCATIONS - 1)
             }
         elif 20 <= dqn_action < 25:
-            # Charge at station (充电) - only for EVs
+            # Charge at station (充电) - map to an existing station key
+            station_id = dqn_action - 20
+            if hasattr(self, 'charging_manager') and getattr(self.charging_manager, 'stations', None):
+                station_keys = list(self.charging_manager.stations.keys())
+                if station_keys:
+                    station_id = station_keys[(dqn_action - 20) % len(station_keys)]
             return {
                 'type': 'charge',
-                'station_id': dqn_action - 20
+                'station_id': station_id
             }
         elif 25 <= dqn_action < 28:
             # Wait for better requests (等待更好的订单)
@@ -3088,87 +4194,118 @@ class ChargingIntegratedEnvironment(Environment):
         """
         vehicle = self.vehicles.get(vehicle_id)
         if not vehicle:
-            return -1.0  # Invalid vehicle
-        
-        action_type = action.get('type', 'idle')
-        base_reward = 0.0
-        
-        if action_type == 'assign' and current_requests:
-            # Assign vehicle to request
-            request_id = action.get('request_id')
-            pickup_location = action.get('pickup_location', 0)
-            dropoff_location = action.get('dropoff_location', 0)
-            
-            # Calculate distance-based reward
-            vehicle_location = vehicle.get('location', 0)
-            pickup_distance = abs(vehicle_location - pickup_location)
-            trip_distance = abs(pickup_location - dropoff_location)
-            
-            # Reward based on efficiency
-            base_reward = 10.0 - pickup_distance * 0.5 + trip_distance * 0.3
-            
-            # Update vehicle state
-            vehicle['assigned_request'] = request_id
-            vehicle['target_location'] = pickup_location
-            vehicle['idle'] = False
-            
-            # Battery penalty for EVs
-            if vehicle.get('type') == 1:  # EV
-                battery_cost = (pickup_distance + trip_distance) * 0.1
-                vehicle['battery'] = max(0.0, vehicle['battery'] - battery_cost)
-                if vehicle['battery'] < 0.2:
-                    base_reward -= 5.0  # Low battery penalty
-        
-        elif action_type == 'rebalance':
-            # Move to rebalance location
-            target_location = action.get('target_location', 0)
-            vehicle_location = vehicle.get('location', 0)
-            distance = abs(vehicle_location - target_location)
-            
-            # Small negative reward for rebalancing
-            base_reward = -1.0 - distance * 0.1
-            
-            # Update vehicle location
-            vehicle['location'] = target_location
-            
-        elif action_type == 'charge' and vehicle.get('type') == 1:  # EV only
-            # Charge vehicle (充电)
-            if vehicle.get('battery', 1.0) < 0.8:
-                vehicle['battery'] = min(1.0, vehicle['battery'] + 0.3)
-                base_reward = 2.0  # Positive reward for needed charging
+            return -1.0
+
+        a_type = action.get('type', 'idle')
+
+        # Helper to safely extract request from provided mapping or index
+        def _resolve_request(req_id_or_index):
+            # Prefer direct id lookup
+            if isinstance(req_id_or_index, (int, str)) and req_id_or_index in self.active_requests:
+                return self.active_requests[req_id_or_index]
+            # Fallback: index into current_requests if valid
+            if isinstance(req_id_or_index, int) and 0 <= req_id_or_index < len(current_requests or []):
+                candidate = current_requests[req_id_or_index]
+                rid = getattr(candidate, 'request_id', None)
+                if rid in self.active_requests:
+                    return self.active_requests[rid]
+                return candidate
+            return None
+
+        # Assign/serve: accept one existing order
+        if a_type == 'assign':
+            req_id = action.get('request_id')
+            # Also accept alternate keys from mapper
+            if req_id is None:
+                req_id = action.get('req_id')
+            req = _resolve_request(req_id if req_id is not None else 0)
+            if req is None:
+                return -0.5  # No valid request to accept
+
+            # Ensure the id we use exists in active_requests
+            rid = getattr(req, 'request_id', None)
+            if rid is None or rid not in self.active_requests:
+                return -0.5
+
+            # Attempt to assign (may reject based on EV behaviour)
+            accepted = self._assign_request_to_vehicle(vehicle_id, rid)
+            if not accepted:
+                # Vehicle chose to reject; mark stationary penalty via stationary branch
+                vehicle['is_stationary'] = True
+                vehicle['stationary_duration'] = 1
+                active_requests_count = len(self.active_requests)
+                active_requests_value = sum(req.final_value for req in self.active_requests.values()) if self.active_requests else 0.0
+                avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 100.0
+                vehicle['waiting_for_requests'] = True
+                return -avg_request_value * 0.01
+
+            # Move/pickup/dropoff using existing helpers
+            reward = 0.0
+            if self._pickup_passenger(vehicle_id):
+                reward += 0.5 + np.random.normal(0, 0.2)
             else:
-                base_reward = -1.0  # Penalty for unnecessary charging
-                
-            vehicle['charging_station'] = action.get('station_id', 0)
-            vehicle['idle'] = False  # Vehicle is busy charging
-            
-        elif action_type == 'wait':
-            # Wait for better requests (等待更好的订单)
-            wait_duration = action.get('duration', 5)
-            
-            # Calculate reward based on wait strategy
-            if current_requests and len(current_requests) > 2:
-                # Penalty for waiting when many requests are available
-                base_reward = -2.0
-            elif not current_requests:
-                # Small positive reward for waiting when no requests
-                base_reward = 0.5
-            else:
-                # Neutral reward for strategic waiting
-                base_reward = -0.2
-            
-            # Update vehicle state
-            vehicle['wait_time'] = vehicle.get('wait_time', 0) + wait_duration
-            vehicle['idle'] = True
-            vehicle['waiting_for_requests'] = True
-            
-        else:  # idle
-            # Small penalty for idling (空闲)
-            base_reward = -0.5
-            vehicle['idle'] = True
+                # Move one step toward target (pickup or dropoff)
+                reward += self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.05)
+
+            # If passenger onboard after movement, attempt dropoff
+            if vehicle.get('passenger_onboard') is not None:
+                drop_reward = self._dropoff_passenger(vehicle_id)
+                if drop_reward > 0:
+                    reward += drop_reward + np.random.normal(0, 0.2)
+                else:
+                    reward = self._execute_movement_towards_target(vehicle_id) + np.random.normal(0, 0.1)
+            return float(reward)
+
+        # Charge: send to a station and let charging start when reached
+        if a_type == 'charge' and vehicle.get('type') == 1:
+            # Choose station: prefer provided id else nearest available
+            station_id = action.get('station_id', None)
+            if not hasattr(self, 'charging_manager') or not self.charging_manager.stations:
+                return -1.0
+            stations = self.charging_manager.stations
+            if station_id not in stations:
+                # Pick nearest station by manhattan distance
+                vloc = vehicle.get('location', 0)
+                best_sid, best_d = None, 1e9
+                for sid, st in stations.items():
+                    d = self._manhattan_distance_loc(vloc, st.location)
+                    if d < best_d:
+                        best_sid, best_d = sid, d
+                station_id = best_sid if best_sid is not None else list(stations.keys())[0]
+
+            # Set charging goal and move one step
+            self._move_vehicle_to_charging_station(vehicle_id, station_id)
+            reward = self._execute_movement_towards_charging_station(vehicle_id, station_id)
             vehicle['waiting_for_requests'] = False
-        
-        return base_reward
+            return float(reward)
+
+        # Wait: stay in place for one step with small opportunity penalty
+        if a_type == 'wait':
+            vehicle['is_stationary'] = True
+            vehicle['stationary_duration'] = int(action.get('duration', 1))
+            active_requests_count = len(self.active_requests)
+            active_requests_value = sum(req.final_value for req in self.active_requests.values()) if self.active_requests else 0.0
+            avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 50.0
+            vehicle['waiting_for_requests'] = True
+            return float(-avg_request_value * 0.01)
+
+        # Idle: move toward a simple idle target for exploration
+        # If rebalance target provided, treat as idle to that target
+        if a_type in ('idle', 'rebalance'):
+            if a_type == 'rebalance' and 'target_location' in action:
+                # Convert target index to coordinates
+                tloc = int(action['target_location'])
+                tx, ty = (tloc % self.grid_size, tloc // self.grid_size)
+                vehicle['idle_target'] = (tx, ty)
+            else:
+                self._assign_idle_vehicle(vehicle_id)
+            reward = self._execute_movement_towards_idle(vehicle_id, vehicle.get('idle_target'))
+            vehicle['waiting_for_requests'] = False
+            return float(reward)
+
+        # Default fallback
+        vehicle['waiting_for_requests'] = False
+        return -0.1
     
     def _calculate_dqn_performance_metrics(self, results, current_requests):
         """
@@ -3178,45 +4315,513 @@ class ChargingIntegratedEnvironment(Environment):
             results: Simulation results dictionary to update
             current_requests: List of current requests
         """
-        # Vehicle utilization
-        active_vehicles = sum(1 for v in self.vehicles.values() if not v.get('idle', True))
+        # Vehicle utilization: vehicles engaged in any activity (assigned, onboard, charging)
         total_vehicles = len(self.vehicles)
-        results['vehicle_utilization'] = active_vehicles / max(1, total_vehicles)
-        
-        # Request metrics
-        if hasattr(self, 'completed_requests') and hasattr(self, 'active_requests'):
-            total_requests = len(self.completed_requests) + len(current_requests or [])
-            completed_requests = len(self.completed_requests)
-            results['request_completion_rate'] = completed_requests / max(1, total_requests)
-        else:
-            results['request_completion_rate'] = 0.0
-        
-        # Average battery level for EVs
-        ev_vehicles = [v for v in self.vehicles.values() if v.get('type') == 1]
-        if ev_vehicles:
-            avg_battery = sum(v.get('battery', 1.0) for v in ev_vehicles) / len(ev_vehicles)
-            results['average_battery_level'] = avg_battery
-        else:
-            results['average_battery_level'] = 1.0
-        
-        # Action distribution with all action types
-        actions = [a['action'] for a in results['actions_taken']]
-        if actions:
+        engaged = sum(1 for v in self.vehicles.values() if (
+            v.get('assigned_request') is not None or
+            v.get('passenger_onboard') is not None or
+            v.get('charging_station') is not None
+        ))
+        results['vehicle_utilization'] = engaged / max(1, total_vehicles)
+
+        # Request completion rate based on environment accounting
+        completed = len(self.completed_requests)
+        total_requests = completed + len(self.active_requests) + len(self.rejected_requests)
+        results['request_completion_rate'] = completed / max(1, total_requests)
+
+        # Average EV battery level
+        evs = [v for v in self.vehicles.values() if v.get('type') == 1]
+        results['average_battery_level'] = (sum(v.get('battery', 1.0) for v in evs) / len(evs)) if evs else 1.0
+
+        # Action distribution inferred from chosen DQN indices if available
+        act_indices = [a.get('dqn_action') for a in results.get('actions_taken', []) if 'dqn_action' in a]
+        if act_indices:
+            n = len(act_indices)
             results['action_distribution'] = {
-                'assign': sum(1 for a in actions if a < 10) / len(actions),              # 接受订单
-                'rebalance': sum(1 for a in actions if 10 <= a < 20) / len(actions),    # 重新平衡
-                'charge': sum(1 for a in actions if 20 <= a < 25) / len(actions),       # 充电
-                'wait': sum(1 for a in actions if 25 <= a < 28) / len(actions),         # 等待
-                'idle': sum(1 for a in actions if a >= 28) / len(actions)               # 空闲
+                'assign': sum(1 for a in act_indices if a is not None and a < 10) / n,
+                'rebalance': sum(1 for a in act_indices if a is not None and 10 <= a < 20) / n,
+                'charge': sum(1 for a in act_indices if a is not None and 20 <= a < 25) / n,
+                'wait': sum(1 for a in act_indices if a is not None and 25 <= a < 28) / n,
+                'idle': sum(1 for a in act_indices if a is not None and a >= 28) / n,
             }
         else:
-            results['action_distribution'] = {
-                'assign': 0, 'rebalance': 0, 'charge': 0, 'wait': 0, 'idle': 1
-            }
+            results['action_distribution'] = {'assign': 0, 'rebalance': 0, 'charge': 0, 'wait': 0, 'idle': 1}
+
+        # Waiting stats
+        waiting = sum(1 for v in self.vehicles.values() if v.get('is_stationary', False) or v.get('waiting_for_requests', False))
+        results['vehicles_waiting'] = waiting
+        results['wait_utilization'] = waiting / max(1, total_vehicles)
+
+        return results
+
+    def _save_training_dataset(self, value_function):
+        """
+        保存Q-network训练的experience数据集到本地
+        """
+        import json
+        import pickle
+        import os
+        from datetime import datetime
         
-        # Additional metrics for wait behavior
-        waiting_vehicles = sum(1 for v in self.vehicles.values() 
-                             if v.get('waiting_for_requests', False))
-        results['vehicles_waiting'] = waiting_vehicles
-        results['wait_utilization'] = waiting_vehicles / max(1, total_vehicles)
+        if not hasattr(value_function, 'experience_buffer') or len(value_function.experience_buffer) == 0:
+            print("⚠️ No experience buffer found or empty buffer")
+            return
+        
+        # 创建保存目录
+        save_dir = "results/training_datasets"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 生成时间戳文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 转换经验数据为可保存格式
+        experiences = list(value_function.experience_buffer)
+        dataset = {
+            'timestamp': timestamp,
+            'current_time': self.current_time,
+            'dataset_size': len(experiences),
+            'experiences': experiences,
+            'environment_info': {
+                'grid_size': self.grid_size,
+                'num_vehicles': self.NUM_AGENTS,
+                'num_charging_stations': len(self.charging_stations) if hasattr(self, 'charging_stations') else 0
+            }
+        }
+        
+        # 保存为pickle文件（用于后续训练）
+        pickle_file = f"{save_dir}/training_dataset_{timestamp}.pkl"
+        with open(pickle_file, 'wb') as f:
+            pickle.dump(dataset, f)
+        
+        # 保存为JSON文件（便于查看和分析）
+        json_file = f"{save_dir}/training_dataset_{timestamp}.json"
+        # 将numpy类型转换为Python原生类型以便JSON序列化
+        def convert_for_json(obj):
+            if hasattr(obj, 'item'):  # numpy types
+                return obj.item()
+            elif isinstance(obj, (list, tuple)):
+                return [convert_for_json(x) for x in obj]
+            elif isinstance(obj, dict):
+                return {k: convert_for_json(v) for k, v in obj.items()}
+            else:
+                return obj
+        
+        json_dataset = convert_for_json(dataset)
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(json_dataset, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Training dataset saved:")
+        print(f"   📁 Pickle file: {pickle_file}")
+        print(f"   📄 JSON file: {json_file}")
+        print(f"   📊 Dataset size: {len(experiences)} experiences")
+        
+    def _analyze_q_value_issues(self, value_function):
+        """
+        分析为什么接受订单的Q-value比idle还要小的问题
+        """
+        print("\n🔍 Analyzing Q-value issues (accept vs idle)...")
+        
+        if not hasattr(value_function, 'experience_buffer') or len(value_function.experience_buffer) == 0:
+            print("⚠️ No experience buffer found")
+            return
+        
+        experiences = list(value_function.experience_buffer)
+        
+        # 分离不同类型的动作
+        assign_experiences = [exp for exp in experiences if exp['action_type'].startswith('assign')]
+        idle_experiences = [exp for exp in experiences if exp['action_type'] == 'idle']
+        charge_experiences = [exp for exp in experiences if exp['action_type'].startswith('charge')]
+        
+        print(f"📈 Action type distribution:")
+        print(f"   Assign actions: {len(assign_experiences)}")
+        print(f"   Idle actions: {len(idle_experiences)}")
+        print(f"   Charge actions: {len(charge_experiences)}")
+        
+        if len(assign_experiences) > 0 and len(idle_experiences) > 0:
+            # 计算奖励统计
+            assign_rewards = [exp['reward'] for exp in assign_experiences]
+            idle_rewards = [exp['reward'] for exp in idle_experiences]
+            
+            assign_mean = sum(assign_rewards) / len(assign_rewards)
+            idle_mean = sum(idle_rewards) / len(idle_rewards)
+            
+            assign_positive = len([r for r in assign_rewards if r > 0])
+            idle_positive = len([r for r in idle_rewards if r > 0])
+            
+            print(f"\n🎯 Reward Analysis:")
+            print(f"   Assign - Mean: {assign_mean:.3f}, Positive: {assign_positive}/{len(assign_rewards)} ({assign_positive/len(assign_rewards)*100:.1f}%)")
+            print(f"   Idle   - Mean: {idle_mean:.3f}, Positive: {idle_positive}/{len(idle_rewards)} ({idle_positive/len(idle_rewards)*100:.1f}%)")
+            
+            # 计算当前Q值
+            sample_vehicle_id = 0
+            sample_location = 50  # 网格中心位置
+            sample_time = self.current_time
+            
+            try:
+                # 获取sample state下的Q值
+                assign_q = value_function.get_q_value(
+                    vehicle_id=sample_vehicle_id,
+                    action_type="assign_0",
+                    vehicle_location=sample_location,
+                    target_location=sample_location + 10,
+                    current_time=sample_time,
+                    battery_level=0.8,
+                    request_value=10.0
+                )
+                
+                idle_q = value_function.get_q_value(
+                    vehicle_id=sample_vehicle_id,
+                    action_type="idle",
+                    vehicle_location=sample_location,
+                    target_location=sample_location,
+                    current_time=sample_time,
+                    battery_level=0.8,
+                    request_value=0.0
+                )
+                
+                print(f"\n🧠 Current Q-values (sample state):")
+                print(f"   Assign Q-value: {assign_q:.3f}")
+                print(f"   Idle Q-value:   {idle_q:.3f}")
+                print(f"   Difference:     {assign_q - idle_q:.3f}")
+                
+                if assign_q < idle_q:
+                    print(f"⚠️  ISSUE DETECTED: Assign Q-value is lower than idle!")
+                    
+                    # 分析可能的原因
+                    print(f"\n🔍 Possible causes:")
+                    print(f"   1. Assign actions getting more negative rewards: {assign_mean < idle_mean}")
+                    print(f"   2. Idle actions more consistently positive: {idle_positive/len(idle_rewards) > assign_positive/len(assign_rewards) if len(assign_rewards) > 0 else False}")
+                    print(f"   3. Training imbalance - more negative assign examples")
+                    
+                    # 分析距离对奖励的影响
+                    assign_with_distance = [(exp['reward'], abs(exp['vehicle_location'] - exp['target_location'])) 
+                                          for exp in assign_experiences 
+                                          if 'vehicle_location' in exp and 'target_location' in exp]
+                    
+                    if assign_with_distance:
+                        avg_distance = sum(d[1] for d in assign_with_distance) / len(assign_with_distance)
+                        high_distance_rewards = [r for r, d in assign_with_distance if d > avg_distance]
+                        low_distance_rewards = [r for r, d in assign_with_distance if d <= avg_distance]
+                        
+                        print(f"\n📏 Distance analysis for assign actions:")
+                        print(f"   Average distance: {avg_distance:.1f}")
+                        if high_distance_rewards:
+                            print(f"   High distance rewards: {sum(high_distance_rewards)/len(high_distance_rewards):.3f}")
+                        if low_distance_rewards:
+                            print(f"   Low distance rewards:  {sum(low_distance_rewards)/len(low_distance_rewards):.3f}")
+                
+            except Exception as e:
+                print(f"❌ Error calculating Q-values: {e}")
+        
+        else:
+            print("⚠️ Not enough data for both assign and idle actions")
+
+    def _quick_q_value_analysis(self, value_function):
+        """
+        快速Q-value分析 - 每50步运行一次，检查Q-value趋势和矛盾
+        """
+        if not hasattr(value_function, 'experience_buffer') or len(value_function.experience_buffer) == 0:
+            return
+        
+        experiences = list(value_function.experience_buffer)
+        
+        # 只分析最近100个experience
+        recent_experiences = experiences[-100:] if len(experiences) > 100 else experiences
+        
+        # 快速统计
+        assign_rewards = [exp['reward'] for exp in recent_experiences if exp['action_type'].startswith('assign')]
+        idle_rewards = [exp['reward'] for exp in recent_experiences if exp['action_type'] == 'idle']
+        
+        if len(assign_rewards) > 0 and len(idle_rewards) > 0:
+            assign_mean = sum(assign_rewards) / len(assign_rewards)
+            idle_mean = sum(idle_rewards) / len(idle_rewards)
+            
+            print(f"🔍 Quick Q-Value Check (last {len(recent_experiences)} experiences):")
+            print(f"   Assign avg reward: {assign_mean:.3f} (n={len(assign_rewards)})")
+            print(f"   Idle avg reward:   {idle_mean:.3f} (n={len(idle_rewards)})")
+            print(f"   Difference: {assign_mean - idle_mean:.3f}")
+            
+            # 检查Q值与奖励的矛盾
+            if hasattr(value_function, 'get_q_value'):
+                try:
+                    # 快速获取当前Q值估计 (使用平均状态)
+                    avg_location = 160  # 网格中心位置
+                    avg_time = self.current_time
+                    avg_battery = 0.7
+                    other_vehicles = max(0, len([v for v in self.vehicles.values() 
+                                               if v.get('assigned_request') is None and 
+                                                  v.get('passenger_onboard') is None]) - 1)
+                    num_requests = len(self.active_requests)
+                    
+                    # 获取当前Q值预测
+                    assign_q = value_function.get_q_value(
+                        vehicle_id=1, action_type='assign_1', 
+                        vehicle_location=avg_location, target_location=avg_location,
+                        current_time=avg_time, other_vehicles=other_vehicles,
+                        num_requests=num_requests, battery_level=avg_battery,
+                        request_value=10.0
+                    )
+                    
+                    idle_q = value_function.get_idle_q_value(
+                        vehicle_id=1, vehicle_location=avg_location,
+                        battery_level=avg_battery, current_time=avg_time,
+                        other_vehicles=other_vehicles, num_requests=num_requests
+                    )
+                    
+                    charge_q = value_function.get_charging_q_value(
+                        vehicle_id=1, station_id=1,
+                        vehicle_location=avg_location, station_location=avg_location,
+                        current_time=avg_time, other_vehicles=other_vehicles,
+                        num_requests=num_requests, battery_level=avg_battery
+                    )
+                    
+                    print(f"   Current Q-predictions: Assign={assign_q:.3f}, Idle={idle_q:.3f}, Charge={charge_q:.3f}")
+                    
+                    # 检测矛盾
+                    if assign_mean > idle_mean + 5.0 and idle_q > assign_q + 0.5:
+                        print(f"🚨 CONTRADICTION DETECTED!")
+                        print(f"   Assign rewards ({assign_mean:.1f}) > Idle rewards ({idle_mean:.1f})")
+                        print(f"   But Idle Q-value ({idle_q:.3f}) > Assign Q-value ({assign_q:.3f})")
+                        print(f"   💡 Possible causes:")
+                        print(f"      1. Training hasn't converged yet (need more steps)")
+                        print(f"      2. Sample imbalance in training batch")
+                        print(f"      3. Network capacity insufficient")
+                        print(f"      4. Learning rate too high/low")
+                        
+                        # 调用详细的矛盾分析
+                        self._analyze_q_reward_contradiction(value_function, recent_experiences)
+                        
+                except Exception as e:
+                    print(f"   Q-value prediction error: {e}")
+            
+            if assign_mean < idle_mean - 0.1:  # 阈值0.1
+                print(f"⚠️  WARNING: Assign rewards significantly lower than idle!")
+                
+                # 导出最近的experience数据为CSV
+                self._export_recent_experiences_csv(recent_experiences)
+    
+    def _export_recent_experiences_csv(self, experiences):
+        """
+        导出最近的experience数据为CSV文件
+        """
+        import pandas as pd
+        import os
+        from datetime import datetime
+        
+        # 创建导出目录
+        export_dir = "results/q_value_analysis"
+        os.makedirs(export_dir, exist_ok=True)
+        
+        # 准备数据
+        rows = []
+        for i, exp in enumerate(experiences):
+            # 计算距离 - 安全处理位置坐标
+            v_loc = exp.get('vehicle_location', 0)
+            t_loc = exp.get('target_location', 0)
+            grid_size = getattr(self, 'grid_size', 10)
+            
+            # 安全转换位置为整数索引
+            def _safe_location_to_int(loc):
+                if isinstance(loc, tuple) and len(loc) == 2:
+                    # 如果是坐标元组，转换为索引
+                    x, y = loc
+                    return y * grid_size + x
+                elif isinstance(loc, (int, float)):
+                    return int(loc)
+                else:
+                    return 0
+            
+            v_loc_int = _safe_location_to_int(v_loc)
+            t_loc_int = _safe_location_to_int(t_loc)
+            
+            # 计算坐标
+            vx, vy = v_loc_int % grid_size, v_loc_int // grid_size
+            tx, ty = t_loc_int % grid_size, t_loc_int // grid_size
+            distance = abs(vx - tx) + abs(vy - ty)
+            
+            # 简化动作类型
+            action_type = exp.get('action_type', '')
+            if action_type == 'idle':
+                action_category = 'idle'
+            elif action_type.startswith('assign'):
+                action_category = 'assign'
+            elif action_type.startswith('charge'):
+                action_category = 'charge'
+            else:
+                action_category = 'other'
+            
+            row = {
+                'exp_id': i,
+                'vehicle_id': exp.get('vehicle_id', 0),
+                'action_type': action_type,
+                'action_category': action_category,
+                'vehicle_location': v_loc,
+                'target_location': t_loc,
+                'distance': distance,
+                'battery_level': exp.get('battery_level', 1.0),
+                'current_time': exp.get('current_time', 0.0),
+                'reward': exp.get('reward', 0.0),
+                'next_battery_level': exp.get('next_battery_level', 1.0),
+                'num_requests': exp.get('num_requests', 0),
+                'request_value': exp.get('request_value', 0.0),
+                'is_rejection': exp.get('is_rejection', False)
+            }
+            rows.append(row)
+        
+        # 创建DataFrame并保存
+        df = pd.DataFrame(rows)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_file = os.path.join(export_dir, f"recent_experiences_{timestamp}.csv")
+        df.to_csv(csv_file, index=False, encoding='utf-8')
+        
+        print(f"📊 Recent experiences exported to: {csv_file}")
+        
+        # 显示基础统计
+        print(f"📈 Quick Statistics:")
+        reward_by_action = df.groupby('action_category')['reward'].agg(['count', 'mean', 'std']).round(3)
+        print(reward_by_action)
+    
+    def _analyze_q_reward_contradiction(self, value_function, experiences):
+        """
+        深入分析Q值与奖励矛盾的详细原因
+        """
+        print(f"\n🔬 详细矛盾分析:")
+        print("=" * 50)
+        
+        try:
+            # 1. 分析training step和buffer状态
+            training_step = getattr(value_function, 'training_step', 0)
+            buffer_size = len(value_function.experience_buffer) if hasattr(value_function, 'experience_buffer') else 0
+            
+            print(f"📊 训练状态:")
+            print(f"   训练步数: {training_step}")
+            print(f"   缓冲区大小: {buffer_size}")
+            print(f"   分析样本数: {len(experiences)}")
+            
+            # 2. 分析最近的训练批次构成
+            if hasattr(value_function, '_action_balanced_sample'):
+                try:
+                    sample_batch = value_function._action_balanced_sample(64)
+                    batch_assign = len([exp for exp in sample_batch if exp['action_type'].startswith('assign')])
+                    batch_idle = len([exp for exp in sample_batch if exp['action_type'] == 'idle'])
+                    batch_charge = len([exp for exp in sample_batch if exp['action_type'].startswith('charge')])
+                    
+                    print(f"🎲 最近训练批次构成:")
+                    print(f"   Assign: {batch_assign}/64 ({batch_assign/64:.1%})")
+                    print(f"   Idle: {batch_idle}/64 ({batch_idle/64:.1%})")
+                    print(f"   Charge: {batch_charge}/64 ({batch_charge/64:.1%})")
+                    
+                    # 检查是否过度倾向于idle
+                    if batch_idle > batch_assign * 2:
+                        print(f"   ⚠️  Idle样本过多，可能影响学习")
+                        
+                except Exception as e:
+                    print(f"   采样分析失败: {e}")
+            
+            # 3. 分析奖励分布的细节
+            assign_rewards = [exp['reward'] for exp in experiences if exp['action_type'].startswith('assign')]
+            idle_rewards = [exp['reward'] for exp in experiences if exp['action_type'] == 'idle']
+            
+            if assign_rewards and idle_rewards:
+                import numpy as np
+                
+                # 正负奖励分布
+                assign_pos = len([r for r in assign_rewards if r > 0])
+                assign_neg = len([r for r in assign_rewards if r <= 0])
+                idle_pos = len([r for r in idle_rewards if r > 0])
+                idle_neg = len([r for r in idle_rewards if r <= 0])
+                
+                print(f"\n🎯 奖励分布分析:")
+                print(f"   Assign: {assign_pos} 正奖励, {assign_neg} 负/零奖励")
+                print(f"   Idle: {idle_pos} 正奖励, {idle_neg} 负/零奖励")
+                
+                # 奖励量级分析
+                if assign_rewards:
+                    print(f"   Assign奖励范围: [{np.min(assign_rewards):.1f}, {np.max(assign_rewards):.1f}]")
+                if idle_rewards:
+                    print(f"   Idle奖励范围: [{np.min(idle_rewards):.1f}, {np.max(idle_rewards):.1f}]")
+                
+                # 检查奖励scale问题
+                assign_scale = np.std(assign_rewards) if len(assign_rewards) > 1 else 0
+                idle_scale = np.std(idle_rewards) if len(idle_rewards) > 1 else 0
+                print(f"   奖励变异性: Assign std={assign_scale:.2f}, Idle std={idle_scale:.2f}")
+                
+                if assign_scale > idle_scale * 3:
+                    print(f"   ⚠️  Assign奖励变异性过大，可能影响学习稳定性")
+            
+            # 4. 提供具体的改进建议
+            print(f"\n💡 改进建议:")
+            
+            if training_step < 1000:
+                print(f"   🔄 训练步数较少({training_step})，建议继续训练至少2000步")
+                
+            if buffer_size < 5000:
+                print(f"   📊 缓冲区数据较少({buffer_size})，建议积累更多经验")
+                
+            # 检查学习率
+            if hasattr(value_function, 'optimizer'):
+                current_lr = value_function.optimizer.param_groups[0]['lr']
+                print(f"   📈 当前学习率: {current_lr:.6f}")
+                if current_lr > 0.01:
+                    print(f"      建议降低学习率到 0.001-0.005 范围")
+                elif current_lr < 0.0001:
+                    print(f"      学习率可能过低，建议提高到 0.0005-0.001")
+            
+            print(f"   🎯 建议启用更强的assign奖励bonus")
+            print(f"   🔧 考虑调整action-balanced采样比例 (增加assign权重)")
+            print(f"   📚 使用prioritized experience replay优先训练高价值样本")
+            
+        except Exception as e:
+            print(f"❌ 矛盾分析失败: {e}")
+        
+        return csv_file
+
+    def _count_idle_vehicles(self):
+        """
+        统计当前处于idle状态的车辆数量
+        Idle车辆定义：没有分配请求、没有乘客在车、没有在充电站充电
+        """
+        idle_count = 0
+        for vehicle_id, vehicle in self.vehicles.items():
+            is_idle = (
+                vehicle.get('assigned_request') is None and
+                vehicle.get('passenger_onboard') is None and
+                vehicle.get('charging_station') is None and
+                vehicle.get('battery_level', 1.0) > self.min_battery_level
+            )
+            if is_idle:
+                idle_count += 1
+        
+        return idle_count
+    
+    def _get_idle_action_index(self):
+        """
+        获取idle动作对应的DQN动作索引
+        这需要根据DQN动作空间的定义来确定
+        假设idle动作是最后一个动作（索引为动作空间大小-1）
+        """
+        # 根据DQN动作空间定义，通常idle/wait动作在末尾
+        # 这里假设动作空间大小为32，idle动作索引为31
+        # 实际使用时需要根据具体的DQN实现调整
+        return 31  # 或者根据实际的DQN动作定义返回正确的索引
+
+    def _count_idle_vehicles(self):
+        """
+        统计当前处于idle状态的车辆数量
+        Idle车辆定义：没有分配请求、没有乘客在车、没有在充电站充电
+        """
+        idle_count = 0
+        for vehicle_id, vehicle in self.vehicles.items():
+            is_idle = (
+                vehicle.get('assigned_request') is None and
+                vehicle.get('passenger_onboard') is None and
+                vehicle.get('charging_station') is None and
+                vehicle.get('battery_level', 1.0) > self.min_battery_level
+            )
+            if is_idle:
+                idle_count += 1
+        
+        return idle_count
+
+
 

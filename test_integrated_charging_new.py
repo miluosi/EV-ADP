@@ -234,14 +234,15 @@ def set_random_seeds(seed=42):
     print(f"✓ Random seeds set to {seed} for all generators (Python, NumPy, PyTorch)")
 
 
-def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 20):
+def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 10):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
     # 设置全局随机数种子，确保车辆初始化一致
     set_random_seeds(seed=42)
     
-
+    # Create environment with significantly more complexity for better learning
+    num_vehicles = num_vehicles
     num_stations = 4
     env = ChargingIntegratedEnvironment(
         num_vehicles=num_vehicles, 
@@ -266,20 +267,10 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             max_requests=10000,  # 设置合理的最大请求数
             env=env  # 传递环境引用
         )
-        value_function_ev = PyTorchChargingValueFunction(
-            grid_size=env.grid_size,
-            num_vehicles=num_vehicles,
-            device='cuda' if torch.cuda.is_available() else 'cpu',  # Use GPU if available
-            episode_length=env.episode_length,  # 传递正确的episode长度
-            max_requests=10000,  # 设置合理的最大请求数
-            env=env  # 传递环境引用
-        )
         # Set the value function in the environment for Q-value calculation
         env.set_value_function(value_function)
-        env.set_value_function_ev(value_function_ev)
     else:
         value_function = None
-        value_function_ev = None
         
     env.adp_value = adpvalue
     env.assignmentgurobi = assignmentgurobi
@@ -338,7 +329,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         episode_reward = 0
         episode_charging_events = []
         episode_losses = []
-        episode_losses_ev = []
+        
         Idle_list = []
         for step in range(env.episode_length):
             # Generate actions using ValueFunction
@@ -346,55 +337,23 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             states_for_training = []
             actions_for_training = []
             current_requests = list(env.active_requests.values())
-            actions, storeactions,storeactions_ev = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
-            if step% 100==0:
-                print("action_atype")
-                print(storeactions)
-                print(storeactions_ev)
-            # if step% 10==0:
-            #     carindex =  env.findchargerange_c()
-            #     print("carindex:",carindex)
-            next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions,storeactions_ev)
+            actions, storeactions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+            next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions)
             # Debug: Output step statistics every 100 steps
             if step % 25 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
-                print("whole car number:",len(env.vehicles))
-                
-                # 详细统计每辆车的状态（互斥分类）
-                vehicle_status_count = {
-                    'charging': 0,  # 正在充电站充电
-                    'onboard': 0,   # 车上有乘客
-                    'to_pickup': 0, # 去接客人
-                    'to_charge': 0, # 去充电站
-                    'idle_moving': 0, # 空闲移动
-                    'fully_idle': 0   # 完全空闲
-                }
-                
-                vehicle_details = []
-                for vid, v in env.vehicles.items():
-                    status = None
-                    if v['charging_station'] is not None:
-                        status = 'charging'
-                    elif v['passenger_onboard'] is not None:
-                        status = 'onboard'
-                    elif v['assigned_request'] is not None:
-                        status = 'to_pickup'
-                    elif v.get('charging_target') is not None:
-                        status = 'to_charge'
-                    elif v.get('idle_target') is not None or v.get('target_location') is not None:
-                        status = 'idle_moving'
-                    else:
-                        status = 'fully_idle'
-                    
-                    vehicle_status_count[status] += 1
-                    vehicle_details.append(f"V{vid}:{status}")
-                
+                assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
+                charging_vehicles = len([v for v in env.vehicles.values() if v['charging_station'] is not None])
+                onboard = len([v for v in env.vehicles.values() if v['passenger_onboard'] is not None])
+                idlecar = len([v for v in env.vehicles.values() if  v.get('idle_target') is not None ])
+                waitcar = len([v for v in env.vehicles.values() if  v.get('is_stationary') is True ])
+                movecharge = len([v for v in env.vehicles.values() if v.get('charging_target') is not None])
+                target_location_v = len([v for v in env.vehicles.values() if v.get('target_location') is not None])
+                idle_vehicles = len([v for v in env.vehicles.values() 
+                                   if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None and v['target_location'] is None])
                 step_reward = sum(rewards.values())
-                print(f"Step {step}: Active requests: {active_requests}, Step reward: {step_reward:.2f}")
-                print(f"  Vehicle Status: Charging={vehicle_status_count['charging']}, Onboard={vehicle_status_count['onboard']}, To_pickup={vehicle_status_count['to_pickup']}, To_charge={vehicle_status_count['to_charge']}, Idle_moving={vehicle_status_count['idle_moving']}, Fully_idle={vehicle_status_count['fully_idle']}")
-                print(f"  Total: {sum(vehicle_status_count.values())} vehicles")
-                idle_vehicles = vehicle_status_count['fully_idle']
+                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Onboard: {onboard}, Charging: {charging_vehicles}, Idle: {idlecar}, waitcar: {waitcar}, movecharge: {movecharge}, Idle Vehicles: {idle_vehicles}, Step reward: {step_reward:.2f}")
                 Idle_list.append(idle_vehicles)
                 # Neural network monitoring (if using neural network)
                 if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
@@ -447,9 +406,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
                     training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
                     if training_loss > 0:
                         episode_losses.append(training_loss)
-                    training_loss_ev = value_function_ev.train_step(batch_size=batch_size)  # Larger batch
-                    if training_loss_ev > 0:
-                        episode_losses_ev.append(training_loss_ev)
+                
             episode_reward += sum(rewards.values())
             episode_charging_events.extend(info.get('charging_events', []))
             
@@ -570,9 +527,557 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     return results, env
 
 
+# =============================================================================
+# NEW WORKFLOW: EV-AEV Separate Q-Network Training
+# =============================================================================
+
+def run_ev_aev_separate_training(adpvalue, num_episodes, use_intense_requests, batch_size=256, num_vehicles=10):
+    """
+    新的训练 workflow: EV 和 AEV 分开训练
+    
+    Workflow:
+    1. 生成订单后先对 EV 分配
+    2. EV 拒绝的订单 + 剩余订单分配给 AEV
+    3. 拒绝订单的 EV 有惩罚时间（冷却期）
+    4. EV 按概率移动到充电站或其他热点区域
+    5. EV Q-network 只训练订单分配的 Q-value
+    6. AEV Q-network 训练所有动作（分配、充电、idle）
+    
+    Args:
+        adpvalue: ADP 系数
+        num_episodes: 训练回合数
+        use_intense_requests: 是否使用集中式请求生成
+        batch_size: 训练批次大小
+        num_vehicles: 车辆总数
+    """
+    print("=" * 70)
+    print("🚗 NEW WORKFLOW: EV-AEV Separate Q-Network Training")
+    print("=" * 70)
+    print("📋 Workflow Description:")
+    print("   1. Orders first assigned to EV vehicles")
+    print("   2. Rejected orders + remaining orders → AEV vehicles")
+    print("   3. Rejecting EVs get penalty cooldown time")
+    print("   4. EVs probabilistically move to charging/hotspots")
+    print("   5. EV Q-network: only trains on order assignment")
+    print("   6. AEV Q-network: trains on all actions")
+    print("-" * 70)
+    
+    # 设置随机种子
+    set_random_seeds(seed=42)
+    
+    # 创建环境
+    num_stations = 4
+    env = ChargingIntegratedEnvironment(
+        num_vehicles=num_vehicles,
+        num_stations=num_stations,
+        random_seed=42,
+        use_intense_requests=use_intense_requests
+    )
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"✓ Using device: {device}")
+    
+    # 分离 EV 和 AEV 车辆
+    ev_vehicles = {vid: v for vid, v in env.vehicles.items() if v['type'] == 1}
+    aev_vehicles = {vid: v for vid, v in env.vehicles.items() if v['type'] == 2}
+    print(f"✓ Vehicle distribution: {len(ev_vehicles)} EV, {len(aev_vehicles)} AEV")
+    
+    # 创建分开的 Q-networks
+    use_neural_network = adpvalue > 0
+    
+    if use_neural_network:
+        # EV Q-network: 只用于订单分配决策
+        ev_value_function = PyTorchChargingValueFunction(
+            grid_size=env.grid_size,
+            num_vehicles=len(ev_vehicles),
+            device=device,
+            episode_length=env.episode_length,
+            max_requests=10000,
+            env=env
+        )
+        
+        # AEV Q-network: 用于所有决策（分配、充电、idle）
+        aev_value_function = PyTorchChargingValueFunction(
+            grid_size=env.grid_size,
+            num_vehicles=len(aev_vehicles),
+            device=device,
+            episode_length=env.episode_length,
+            max_requests=10000,
+            env=env
+        )
+        
+        # 设置环境的 value_function（用于兼容现有代码）
+        env.set_value_function(aev_value_function)
+        
+        print(f"✓ EV Q-network initialized (assignment only)")
+        print(f"   Parameters: {sum(p.numel() for p in ev_value_function.network.parameters())}")
+        print(f"✓ AEV Q-network initialized (full actions)")
+        print(f"   Parameters: {sum(p.numel() for p in aev_value_function.network.parameters())}")
+    else:
+        ev_value_function = None
+        aev_value_function = None
+        print(f"✓ Neural network training disabled")
+    
+    env.adp_value = adpvalue
+    
+    # EV 惩罚参数
+    ev_rejection_penalty_time = 3  # 拒绝后的冷却时间步数
+    ev_rejection_cooldown = {}  # {vehicle_id: remaining_cooldown_steps}
+    
+    # EV 移动概率参数
+    ev_charging_probability = 0.3  # 移动到充电站的概率
+    ev_hotspot_probability = 0.5   # 移动到热点区域的概率
+    # 剩余概率：随机移动
+    
+    # 训练参数
+    exploration_episodes = max(1, num_episodes // 2)
+    epsilon_start = 0.4
+    epsilon_end = 0.1
+    epsilon_decay = (epsilon_start - epsilon_end) / exploration_episodes
+    warmup_steps = 100
+    training_frequency = 2
+    
+    # 结果存储
+    results = {
+        'episode_rewards': [],
+        'ev_rewards': [],
+        'aev_rewards': [],
+        'ev_assignments': [],
+        'ev_rejections': [],
+        'aev_assignments': [],
+        'ev_losses': [],
+        'aev_losses': [],
+        'completed_orders': [],
+        'episode_detailed_stats': [],
+        'vehicle_visit_stats': []
+    }
+    
+    for episode in range(num_episodes):
+        # 设置每个 episode 的请求生成种子
+        episode_seed = 42 + episode
+        env.set_request_generation_seed(episode_seed)
+        
+        current_epsilon = max(epsilon_end, epsilon_start - episode * epsilon_decay)
+        
+        # 重置环境
+        states = env.reset()
+        
+        # 重置冷却计时器
+        ev_rejection_cooldown = {vid: 0 for vid in ev_vehicles.keys()}
+        
+        episode_reward = 0
+        ev_episode_reward = 0
+        aev_episode_reward = 0
+        ev_assignment_count = 0
+        ev_rejection_count = 0
+        aev_assignment_count = 0
+        ev_episode_losses = []
+        aev_episode_losses = []
+        
+        print(f"\n{'='*60}")
+        print(f"Episode {episode + 1}/{num_episodes}")
+        print(f"{'='*60}")
+        
+        for step in range(env.episode_length):
+            # 生成新请求
+            if use_intense_requests:
+                new_requests = env._generate_intense_requests()
+            else:
+                new_requests = env._generate_random_requests()
+            
+            current_requests = list(env.active_requests.values())
+            
+            # ========================================
+            # PHASE 1: EV Assignment (Priority)
+            # ========================================
+            ev_actions = {}
+            ev_assigned_requests = set()
+            rejected_requests = []
+            
+            # 获取可用的 EV（不在冷却期）
+            available_evs = [vid for vid, v in ev_vehicles.items() 
+                           if ev_rejection_cooldown.get(vid, 0) <= 0
+                           and env.vehicles[vid]['assigned_request'] is None
+                           and env.vehicles[vid]['passenger_onboard'] is None
+                           and env.vehicles[vid]['charging_station'] is None]
+            
+            # 按距离排序请求给每个 EV
+            for ev_id in available_evs:
+                if not current_requests:
+                    break
+                    
+                ev_vehicle = env.vehicles[ev_id]
+                ev_loc = ev_vehicle['location']
+                ev_battery = ev_vehicle['battery']
+                
+                # 按距离排序可用请求
+                sorted_requests = sorted(
+                    [r for r in current_requests if r.request_id not in ev_assigned_requests],
+                    key=lambda r: abs(r.pickup - ev_loc)
+                )
+                
+                if not sorted_requests:
+                    continue
+                
+                # 选择最近的请求
+                best_request = sorted_requests[0]
+                
+                # 检查电量是否足够完成订单
+                pickup_distance = abs(best_request.pickup - ev_loc)
+                dropoff_distance = abs(best_request.dropoff - best_request.pickup)
+                total_distance = pickup_distance + dropoff_distance
+                battery_needed = total_distance * env.battery_consum
+                
+                if ev_battery < battery_needed + 0.1:  # 保留10%电量余量
+                    # 电量不足，移动到充电站
+                    ev_actions[ev_id] = ('charge', None)
+                    continue
+                
+                # 尝试分配订单
+                if env._should_reject_request(ev_id, best_request):
+                    # EV 拒绝订单
+                    ev_rejection_count += 1
+                    rejected_requests.append(best_request)
+                    
+                    # 设置拒绝惩罚冷却时间
+                    ev_rejection_cooldown[ev_id] = ev_rejection_penalty_time
+                    
+                    # 存储拒绝经验到 EV Q-network（负奖励）
+                    if use_neural_network and ev_value_function is not None:
+                        _store_ev_rejection_experience(
+                            ev_value_function, ev_id, ev_vehicle, 
+                            best_request, env, rejection_penalty=-5.0
+                        )
+                    
+                    # 按概率决定 EV 下一步动作
+                    rand_val = random.random()
+                    if rand_val < ev_charging_probability:
+                        ev_actions[ev_id] = ('charge', None)
+                    elif rand_val < ev_charging_probability + ev_hotspot_probability:
+                        ev_actions[ev_id] = ('hotspot', None)
+                    else:
+                        ev_actions[ev_id] = ('random_move', None)
+                else:
+                    # EV 接受订单
+                    ev_assignment_count += 1
+                    ev_assigned_requests.add(best_request.request_id)
+                    ev_actions[ev_id] = ('assign', best_request)
+                    
+                    # 存储分配经验到 EV Q-network（正奖励）
+                    if use_neural_network and ev_value_function is not None:
+                        _store_ev_assignment_experience(
+                            ev_value_function, ev_id, ev_vehicle,
+                            best_request, env, assignment_reward=best_request.final_value
+                        )
+            
+            # ========================================
+            # PHASE 2: AEV Assignment (Remaining + Rejected)
+            # ========================================
+            aev_actions = {}
+            
+            # 合并剩余订单和被拒绝的订单
+            remaining_requests = [r for r in current_requests 
+                                if r.request_id not in ev_assigned_requests]
+            remaining_requests.extend(rejected_requests)
+            
+            # 获取可用的 AEV
+            available_aevs = [vid for vid, v in aev_vehicles.items()
+                            if env.vehicles[vid]['assigned_request'] is None
+                            and env.vehicles[vid]['passenger_onboard'] is None
+                            and env.vehicles[vid]['charging_station'] is None]
+            
+            # AEV 使用 Q-value 选择最优订单
+            for aev_id in available_aevs:
+                if not remaining_requests:
+                    break
+                    
+                aev_vehicle = env.vehicles[aev_id]
+                aev_loc = aev_vehicle['location']
+                aev_battery = aev_vehicle['battery']
+                
+                # 按 Q-value 排序请求（如果有神经网络）
+                if use_neural_network and aev_value_function is not None:
+                    request_q_values = []
+                    for req in remaining_requests:
+                        q_val = aev_value_function.get_assignment_q_value(
+                            aev_id, req.request_id, aev_loc, req.pickup,
+                            env.current_time, len(available_aevs), len(remaining_requests),
+                            aev_battery, req.final_value
+                        )
+                        request_q_values.append((req, q_val))
+                    
+                    # 按 Q-value 降序排序
+                    request_q_values.sort(key=lambda x: x[1], reverse=True)
+                    sorted_requests = [r for r, _ in request_q_values]
+                else:
+                    # 启发式：按价值/距离比排序
+                    sorted_requests = sorted(
+                        remaining_requests,
+                        key=lambda r: r.final_value / (abs(r.pickup - aev_loc) + 1),
+                        reverse=True
+                    )
+                
+                if not sorted_requests:
+                    continue
+                
+                # 选择最优请求
+                best_request = sorted_requests[0]
+                
+                # 检查电量
+                pickup_distance = abs(best_request.pickup - aev_loc)
+                dropoff_distance = abs(best_request.dropoff - best_request.pickup)
+                total_distance = pickup_distance + dropoff_distance
+                battery_needed = total_distance * env.battery_consum
+                
+                if aev_battery < battery_needed + 0.1:
+                    # 电量不足，选择充电
+                    aev_actions[aev_id] = ('charge', None)
+                else:
+                    # AEV 分配订单（AEV 不会拒绝）
+                    aev_assignment_count += 1
+                    remaining_requests.remove(best_request)
+                    aev_actions[aev_id] = ('assign', best_request)
+            
+            # ========================================
+            # PHASE 3: Execute Actions
+            # ========================================
+            all_actions = {}
+            storeactions = {}
+            
+            # 执行 EV 动作
+            for ev_id, (action_type, action_data) in ev_actions.items():
+                action = _create_action_from_type(env, ev_id, action_type, action_data)
+                if action:
+                    all_actions[ev_id] = action
+                    storeactions[ev_id] = (action_type, action_data)
+            
+            # 执行 AEV 动作
+            for aev_id, (action_type, action_data) in aev_actions.items():
+                action = _create_action_from_type(env, aev_id, action_type, action_data)
+                if action:
+                    all_actions[aev_id] = action
+                    storeactions[aev_id] = (action_type, action_data)
+            
+            # 处理没有动作的车辆（使用环境的 simulate_motion）
+            unassigned_vehicles = set(env.vehicles.keys()) - set(all_actions.keys())
+            if unassigned_vehicles:
+                # 让环境处理剩余车辆
+                env_actions, env_storeactions = env.simulate_motion(
+                    agents=[], current_requests=remaining_requests, rebalance=True
+                )
+                for vid in unassigned_vehicles:
+                    if vid in env_actions:
+                        all_actions[vid] = env_actions[vid]
+                        storeactions[vid] = env_storeactions.get(vid)
+            
+            # 执行环境步进
+            next_states, rewards, dur_rewards, done, info = env.step(all_actions, storeactions)
+            
+            # 更新冷却计时器
+            for ev_id in ev_rejection_cooldown:
+                if ev_rejection_cooldown[ev_id] > 0:
+                    ev_rejection_cooldown[ev_id] -= 1
+            
+            # 累计奖励
+            for vid, reward in rewards.items():
+                episode_reward += reward
+                if vid in ev_vehicles:
+                    ev_episode_reward += reward
+                else:
+                    aev_episode_reward += reward
+            
+            # ========================================
+            # PHASE 4: Training
+            # ========================================
+            if use_neural_network and step >= warmup_steps and step % training_frequency == 0:
+                # 训练 EV Q-network（只用分配经验）
+                if len(ev_value_function.experience_buffer) >= batch_size:
+                    ev_loss = ev_value_function.train_step(batch_size=batch_size)
+                    if ev_loss > 0:
+                        ev_episode_losses.append(ev_loss)
+                
+                # 训练 AEV Q-network（所有经验）
+                if len(aev_value_function.experience_buffer) >= batch_size:
+                    aev_loss = aev_value_function.train_step(batch_size=batch_size)
+                    if aev_loss > 0:
+                        aev_episode_losses.append(aev_loss)
+            
+            # 输出状态
+            if step % 25 == 0:
+                idle_count = len([v for v in env.vehicles.values() 
+                                if v['assigned_request'] is None 
+                                and v['passenger_onboard'] is None 
+                                and v['charging_station'] is None])
+                print(f"Step {step}: Requests={len(env.active_requests)}, "
+                      f"EV_Assign={ev_assignment_count}, EV_Reject={ev_rejection_count}, "
+                      f"AEV_Assign={aev_assignment_count}, Idle={idle_count}")
+            
+            if done:
+                break
+        
+        # 记录 episode 结果
+        results['episode_rewards'].append(episode_reward)
+        results['ev_rewards'].append(ev_episode_reward)
+        results['aev_rewards'].append(aev_episode_reward)
+        results['ev_assignments'].append(ev_assignment_count)
+        results['ev_rejections'].append(ev_rejection_count)
+        results['aev_assignments'].append(aev_assignment_count)
+        results['ev_losses'].append(np.mean(ev_episode_losses) if ev_episode_losses else 0.0)
+        results['aev_losses'].append(np.mean(aev_episode_losses) if aev_episode_losses else 0.0)
+        
+        stats = env.get_stats()
+        results['completed_orders'].append(stats.get('completed_orders', 0))
+        
+        # 收集详细统计
+        episode_stats = env.get_episode_stats()
+        episode_stats['ev_assignments'] = ev_assignment_count
+        episode_stats['ev_rejections'] = ev_rejection_count
+        episode_stats['aev_assignments'] = aev_assignment_count
+        episode_stats['ev_reward'] = ev_episode_reward
+        episode_stats['aev_reward'] = aev_episode_reward
+        results['episode_detailed_stats'].append(episode_stats)
+        
+        # 车辆访问模式
+        vehicle_visit_stats = analyze_vehicle_visit_patterns(env)
+        results['vehicle_visit_stats'].append(vehicle_visit_stats)
+        
+        print(f"\nEpisode {episode + 1} Summary:")
+        print(f"  Total Reward: {episode_reward:.2f} (EV: {ev_episode_reward:.2f}, AEV: {aev_episode_reward:.2f})")
+        print(f"  Assignments: EV={ev_assignment_count}, AEV={aev_assignment_count}")
+        print(f"  EV Rejections: {ev_rejection_count}")
+        print(f"  Completed Orders: {stats.get('completed_orders', 0)}")
+        if use_neural_network:
+            print(f"  Losses: EV={np.mean(ev_episode_losses) if ev_episode_losses else 0:.4f}, "
+                  f"AEV={np.mean(aev_episode_losses) if aev_episode_losses else 0:.4f}")
+        
+        # 保存检查点
+        if use_neural_network and episode % 10 == 0:
+            checkpoint_dir = "checkpoints/ev_aev_separate"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            torch.save(ev_value_function.network.state_dict(), 
+                      f"{checkpoint_dir}/ev_network_ep{episode}.pth")
+            torch.save(aev_value_function.network.state_dict(), 
+                      f"{checkpoint_dir}/aev_network_ep{episode}.pth")
+            print(f"  ✓ Saved checkpoints")
+    
+    print("\n" + "=" * 70)
+    print("🎉 EV-AEV Separate Training Complete!")
+    print("=" * 70)
+    print(f"Total Episodes: {num_episodes}")
+    print(f"Average Reward: {np.mean(results['episode_rewards']):.2f}")
+    print(f"Average EV Assignments: {np.mean(results['ev_assignments']):.1f}")
+    print(f"Average EV Rejections: {np.mean(results['ev_rejections']):.1f}")
+    print(f"Average AEV Assignments: {np.mean(results['aev_assignments']):.1f}")
+    print(f"Average Completed Orders: {np.mean(results['completed_orders']):.1f}")
+    
+    # 保存结果
+    results_dir = Path("results/ev_aev_separate")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    excel_path, spatial_path = save_episode_stats_to_excel(
+        env, results['episode_detailed_stats'], results_dir, 
+        results.get('vehicle_visit_stats')
+    )
+    results['excel_path'] = excel_path
+    results['spatial_image_path'] = spatial_path
+    
+    return results, env
 
 
-def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=128,heuristic_battery_threshold = 0.5, num_vehicles = 10):
+def _store_ev_rejection_experience(value_function, vehicle_id, vehicle, request, env, rejection_penalty=-5.0):
+    """存储 EV 拒绝订单的经验"""
+    experience = {
+        'vehicle_id': vehicle_id,
+        'vehicle_location': vehicle['location'],
+        'target_location': request.pickup,
+        'current_time': env.current_time,
+        'other_vehicles': len([v for v in env.vehicles.values() if v['assigned_request'] is None]),
+        'num_requests': len(env.active_requests),
+        'battery_level': vehicle['battery'],
+        'next_battery_level': vehicle['battery'],
+        'request_value': request.final_value,
+        'action_type': 'assign_rejected',
+        'reward': rejection_penalty,
+        'done': False
+    }
+    value_function.experience_buffer.append(experience)
+
+
+def _store_ev_assignment_experience(value_function, vehicle_id, vehicle, request, env, assignment_reward):
+    """存储 EV 成功分配订单的经验"""
+    experience = {
+        'vehicle_id': vehicle_id,
+        'vehicle_location': vehicle['location'],
+        'target_location': request.pickup,
+        'current_time': env.current_time,
+        'other_vehicles': len([v for v in env.vehicles.values() if v['assigned_request'] is None]),
+        'num_requests': len(env.active_requests),
+        'battery_level': vehicle['battery'],
+        'next_battery_level': vehicle['battery'] - abs(request.dropoff - request.pickup) * env.battery_consum,
+        'request_value': request.final_value,
+        'action_type': 'assign',
+        'reward': assignment_reward,
+        'done': False
+    }
+    value_function.experience_buffer.append(experience)
+
+
+def _create_action_from_type(env, vehicle_id, action_type, action_data):
+    """根据动作类型创建动作对象"""
+    vehicle = env.vehicles[vehicle_id]
+    
+    if action_type == 'assign' and action_data is not None:
+        # 分配订单
+        request = action_data
+        env._assign_request_to_vehicle(vehicle_id, request.request_id)
+        # 设置目标位置为 pickup
+        pickup_x = request.pickup % env.grid_size
+        pickup_y = request.pickup // env.grid_size
+        vehicle['target_location'] = (pickup_x, pickup_y)
+        return ServiceAction(vehicle_id=vehicle_id, requests={request})
+    
+    elif action_type == 'charge':
+        # 移动到充电站
+        if hasattr(env, 'charging_manager') and env.charging_manager.stations:
+            # 找最近的充电站
+            vehicle_loc = vehicle['location']
+            nearest_station = min(
+                env.charging_manager.stations.values(),
+                key=lambda s: abs(s.location - vehicle_loc)
+            )
+            env._move_vehicle_to_charging_station(vehicle_id, nearest_station.id)
+            return ChargingAction(vehicle_id=vehicle_id, charging_station_id=nearest_station.id)
+        return None
+    
+    elif action_type == 'hotspot':
+        # 移动到热点区域
+        if hasattr(env, 'hotspot_locations') and env.hotspot_locations:
+            vehicle_loc = vehicle['location']
+            vehicle_x = vehicle_loc % env.grid_size
+            vehicle_y = vehicle_loc // env.grid_size
+            
+            # 找最近的热点
+            nearest_hotspot = min(
+                env.hotspot_locations,
+                key=lambda h: abs(h[0] - vehicle_x) + abs(h[1] - vehicle_y)
+            )
+            vehicle['target_location'] = nearest_hotspot
+            vehicle['idle_target'] = nearest_hotspot[1] * env.grid_size + nearest_hotspot[0]
+            return Action(vehicle_id=vehicle_id, action_type='idle')
+        return None
+    
+    elif action_type == 'random_move':
+        # 随机移动
+        new_x = random.randint(0, env.grid_size - 1)
+        new_y = random.randint(0, env.grid_size - 1)
+        vehicle['target_location'] = (new_x, new_y)
+        vehicle['idle_target'] = new_y * env.grid_size + new_x
+        return Action(vehicle_id=vehicle_id, action_type='idle')
+    
+    return None
+
+
+def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256,heuristic_battery_threshold = 0.5, num_vehicles = 10):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
@@ -686,63 +1191,25 @@ def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_re
             states_for_training = []
             actions_for_training = []
             current_requests = list(env.active_requests.values())
-            actions, storeactions, storeactions_ev = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
-            next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions,storeactions_ev)
+            actions, storeactions = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+            next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions)
             # Debug: Output step statistics every 100 steps
             if step % 25 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
-                print("whole car number:",len(env.vehicles))
-                
-                # 详细统计每辆车的状态（互斥分类）
-                vehicle_status_count = {
-                    'charging': 0,  # 正在充电站充电
-                    'onboard': 0,   # 车上有乘客
-                    'to_pickup': 0, # 去接客人
-                    'to_charge': 0, # 去充电站
-                    'idle_moving': 0, # 空闲移动
-                    'fully_idle': 0   # 完全空闲
-                }
-                
-                vehicle_details = []
-                for vid, v in env.vehicles.items():
-                    status = None
-                    if v['charging_station'] is not None:
-                        status = 'charging'
-                    elif v['passenger_onboard'] is not None:
-                        status = 'onboard'
-                    elif v['assigned_request'] is not None:
-                        status = 'to_pickup'
-                    elif v.get('charging_target') is not None:
-                        status = 'to_charge'
-                    elif v.get('idle_target') is not None or v.get('target_location') is not None:
-                        status = 'idle_moving'
-                    else:
-                        status = 'fully_idle'
-                    
-                    vehicle_status_count[status] += 1
-                    vehicle_details.append(f"V{vid}:{status}")
-                
+                assigned_vehicles = len([v for v in env.vehicles.values() if v['assigned_request'] is not None])
+                charging_vehicles = len([v for v in env.vehicles.values() if v['charging_station'] is not None])
+                onboard = len([v for v in env.vehicles.values() if v['passenger_onboard'] is not None])
+                idlecar = len([v for v in env.vehicles.values() if  v.get('idle_target') is not None ])
+                waitcar = len([v for v in env.vehicles.values() if  v.get('is_stationary') is True ])
+                movecharge = len([v for v in env.vehicles.values() if v.get('charging_target') is not None])
+                target_location_v = len([v for v in env.vehicles.values() if v.get('target_location') is not None])
+                idle_vehicles = len([v for v in env.vehicles.values() 
+                                   if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None and v['target_location'] is None])
                 step_reward = sum(rewards.values())
-                print(f"Step {step}: Active requests: {active_requests}, Step reward: {step_reward:.2f}")
-                print(f"  Vehicle Status: Charging={vehicle_status_count['charging']}, Onboard={vehicle_status_count['onboard']}, To_pickup={vehicle_status_count['to_pickup']}, To_charge={vehicle_status_count['to_charge']}, Idle_moving={vehicle_status_count['idle_moving']}, Fully_idle={vehicle_status_count['fully_idle']}")
-                print(f"  Total: {sum(vehicle_status_count.values())} vehicles")
-                print(f"  Details: {', '.join(vehicle_details[:10])}...")  # 只显示前10辆
-                idle_vehicles = vehicle_status_count['fully_idle']
+                print(f"Step {step}: Active requests: {active_requests}, Assigned: {assigned_vehicles}, Onboard: {onboard}, Charging: {charging_vehicles}, Idle: {idlecar}, waitcar: {waitcar}, movecharge: {movecharge}, Idle Vehicles: {idle_vehicles}, Step reward: {step_reward:.2f}")
                 Idle_list.append(idle_vehicles)
                 # Neural network monitoring (if using neural network)
-
-
-                if use_neural_network and len(value_function.experience_buffer) >= warmup_steps:
-                # Train more frequently based on our new parameters
-                    if step % training_frequency == 0:
-                        training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
-                        if training_loss > 0:
-                            episode_losses.append(training_loss)
-                        training_loss_ev = value_function_ev.train_step(batch_size=batch_size)  # Larger batch
-                        if training_loss_ev > 0:
-                            episode_losses_ev.append(training_loss_ev)
-
                 if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
                     recent_loss = value_function.training_losses[-1] if value_function.training_losses else 0.0
                     buffer_size = len(value_function.experience_buffer)
@@ -787,7 +1254,12 @@ def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_re
             # This ensures consistency between traditional Q-table and neural network training
             
             # Enhanced training: much more frequent training for better learning (only if using neural network)
-            
+            if use_neural_network and len(value_function.experience_buffer) >= warmup_steps:
+                # Train more frequently based on our new parameters
+                if step % training_frequency == 0:
+                    training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
+                    if training_loss > 0:
+                        episode_losses.append(training_loss)
                 
             episode_reward += sum(rewards.values())
             episode_charging_events.extend(info.get('charging_events', []))
@@ -1690,6 +2162,22 @@ def main():
             results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
             print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
             print("="*60)
+        
+        # ========================================
+        # NEW WORKFLOW: EV-AEV Separate Training
+        # ========================================
+        # 取消下面的注释以运行新的 EV-AEV 分开训练 workflow
+        # print("\n" + "="*70)
+        # print("🚗 开始新 Workflow: EV-AEV 分开训练")
+        # print("="*70)
+        # ev_aev_results, ev_aev_env = run_ev_aev_separate_training(
+        #     adpvalue=1,
+        #     num_episodes=num_episodes,
+        #     use_intense_requests=use_intense_requests,
+        #     batch_size=batch_size,
+        #     num_vehicles=10
+        # )
+        # print(f"📁 EV-AEV 分开训练结果保存在: results/ev_aev_separate/")
             
     except Exception as e:
         print(f"\n❌ 测试失败: {e}")

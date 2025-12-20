@@ -64,6 +64,38 @@ class GurobiOptimizer:
         except Exception as e:
             print(f"Gurobi rebalancing with reject failed: {e}, using heuristic")
             return self._heuristic_rebalancing_assignment(vehicle_ids)
+        
+    
+    
+    def optimize_vehicle_rebalancing_integrated(self, vehicle_ids):
+        """Optimize vehicle rebalancing using Gurobi or heuristic methods with reject consideration"""
+        if not self.available:
+            return self._heuristic_rebalancing_assignment(vehicle_ids)
+        
+        # Get available requests from environment
+        available_requests = []
+        assigned_requests = []
+        for vehicle_id in vehicle_ids:
+            vehicle = self.env.vehicles[vehicle_id]
+            if vehicle.get('assigned_request') is not None:
+                assigned_requests.append(vehicle['assigned_request'].request_id)
+                
+        if hasattr(self.env, 'active_requests') and self.env.active_requests:
+            available_requests = list(self.env.active_requests.values())
+        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+        # Get available charging stations
+        charging_stations = []
+        if hasattr(self.env, 'charging_manager') and self.env.charging_manager.stations:
+            charging_stations = [station for station in self.env.charging_manager.stations.values() 
+                               if station.available_slots > 0]
+        
+        try:
+            return self._gurobi_vehicle_rebalancing_integrated(vehicle_ids, available_requests, charging_stations)
+        except Exception as e:
+            print(f"Gurobi rebalancing with reject failed: {e}, using heuristic")
+            return self._heuristic_rebalancing_assignment(vehicle_ids)
+        
+        
 
     def _gurobi_vehicle_rebalancing(self, vehicle_ids):
         """Use Gurobi optimization to assign vehicles to available requests"""
@@ -507,8 +539,242 @@ class GurobiOptimizer:
                 charging_priorities = [(p, v) for p, v in charging_priorities if v != best_vehicle]
         
         return assignments
+    
+    
+    
+    
+    def _gurobi_vehicle_rebalancing_ev(self, vehicle_ids, available_requests, charging_stations=None):
+  
+  
+        if not self.available:
+            return {}
+        
+        assignments = {}
+        
+        # Create optimization model
+        model = self.gp.Model("vehicle_assignment_with_reject_and_charging")
+        model.setParam('OutputFlag', 0)  # Suppress output
 
-    def _gurobi_vehicle_rebalancing_knownreject(self, vehicle_ids, available_requests, charging_stations=None):
+        # Aggregate stats for opportunity costs (optional)
+        active_requests_count = len(self.env.active_requests) if hasattr(self.env, 'active_requests') else 0
+        active_requests_value = sum(getattr(req, 'final_value', getattr(req, 'value', 0.0)) for req in (self.env.active_requests.values() if hasattr(self.env, 'active_requests') else []))
+        avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 0.0
+
+        # Parameters
+        min_battery_level = self.env.min_battery_level if hasattr(self.env, 'min_battery_level') else 0.2
+
+        battery_consum = self.env.battery_consum if hasattr(self.env, 'battery_consum') else 0.05 # Battery consumption per travel step
+        service_consumption = 0.05 # Battery consumption per service
+        request_decision =[[model.addVar(vtype=self.GRB.BINARY,
+                     name=f'request_{vehicle_id}_{request.request_id}') for request in available_requests] for i, vehicle_id in enumerate(vehicle_ids)]
+            
+        # Battery level variables (t-1 and t)
+        battery_t_minus_1 = {}  # Battery level at t-1 (current)
+        battery_t = {}          # Battery level at t (after actions)
+        
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.env.vehicles[vehicle_id]
+            
+            # t-1 battery level (current battery level)
+            battery_t_minus_1[i] = vehicle['battery']
+            
+            # t battery level (decision variable)
+            battery_t[i] = model.addVar(
+                vtype=self.GRB.CONTINUOUS,
+
+                name=f'battery_t_{vehicle_id}'
+            )
+        
+
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.env.vehicles[vehicle_id]
+            
+            # Initialize battery expressions as Gurobi LinExpr
+            battery_loss = self.gp.LinExpr()
+
+            # Battery consumption from service requests (travel to pickup + pickup to dropoff)
+            if available_requests:
+                for j, request in enumerate(available_requests):
+                    # Travel from vehicle current position to pickup
+                    pickup_x = request.pickup % self.env.grid_size
+                    pickup_y = request.pickup // self.env.grid_size
+                    travel_distance_to_pickup = abs(vehicle['coordinates'][0] - pickup_x) + abs(vehicle['coordinates'][1] - pickup_y)
+                    
+                    # Travel from pickup to dropoff
+                    dropoff_x = request.dropoff % self.env.grid_size
+                    dropoff_y = request.dropoff // self.env.grid_size
+                    travel_distance_pickup_to_dropoff = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+                    
+                    # Total battery consumption for this request
+                    total_travel_distance = travel_distance_to_pickup + travel_distance_pickup_to_dropoff
+                    battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
+
+            # Battery transition constraint (simplified to avoid infeasibility)
+            model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss)
+            # Ensure vehicle has enough battery for actions (but allow some flexibility)
+            model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
+            # Ensure battery doesn't go below minimum (but allow some flexibility)
+            model.addConstr(battery_t[i] >=min_battery_level)  # If not idle, must meet min battery
+
+
+            
+            # Constraint 1: Each vehicle can only take one action
+        for i in range(len(vehicle_ids)):
+            actionv = self.gp.LinExpr()
+            # Add valid request assignments
+            for j in range(len(available_requests)):
+                actionv += request_decision[i][j]
+            model.addConstr(actionv <= 1)
+        
+
+        
+        # Constraint 2: Each request can be assigned to at most one vehicle
+        for j in range(len(available_requests)):
+            valid_vehicles = self.gp.LinExpr()
+            for i in range(len(vehicle_ids)):
+                valid_vehicles += request_decision[i][j]
+            model.addConstr(valid_vehicles <= 1)
+            
+        objective_terms = self.gp.LinExpr()
+        adp_weight = getattr(self.env, 'adp_value', 1.0)
+        
+        # 批量预计算所有vehicle-request对的Q值以提高性能
+        option_q_cache = {}
+        rejection_adjusted_values = {}  # 存储拒绝感知调整后的价值
+        
+        if adp_weight > 0:
+            # 收集所有需要计算的vehicle-request对
+            vehicle_request_pairs = []
+            for i, vehicle_id in enumerate(vehicle_ids):
+                for j, request in enumerate(available_requests):
+                    vehicle_request_pairs.append((vehicle_id, request))
+            
+            # 批量计算Q值和拒绝感知价值
+            if hasattr(self.env, 'batch_evaluate_service_options'):
+                try:
+                    batch_q_values = self.env.batch_evaluate_service_options(vehicle_request_pairs)
+                    
+                    # 批量计算拒绝概率（只对EV）
+                    batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs)
+                    
+                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
+                        q_value = batch_q_values[i] if i < len(batch_q_values) else 0.0
+                        rejection_prob = batch_rejection_probs[i] if i < len(batch_rejection_probs) else 0.0
+                        
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+                        # 计算拒绝感知调整价值
+                        adjusted_value = self._calculate_rejection_aware_value(
+                            vehicle_id, request, q_value, rejection_prob
+                        )
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = adjusted_value
+                except Exception as e:
+                    print(f"Batch evaluation failed: {e}, falling back to individual calculations")
+            
+            # 如果批量计算失败，使用单独计算
+            if not option_q_cache:
+                # 批量计算拒绝概率（只对EV）
+                batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs)
+                
+                for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
+                    try:
+                        q_value = self.env.evaluate_service_option(vehicle_id, request)
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+                        # 使用批量计算的拒绝概率
+                        rejection_prob = batch_rejection_probs[i] if i < len(batch_rejection_probs) else 0.0
+                        
+                        adjusted_value = self._calculate_rejection_aware_value(
+                            vehicle_id, request, q_value, rejection_prob
+                        )
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = adjusted_value
+                    except Exception:
+                        option_q_cache[(vehicle_id, request.request_id)] = 0.0
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = 0.0
+            
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.env.vehicles[vehicle_id]
+
+            for j, request in enumerate(available_requests):
+                if adp_weight <= 0:
+                    # 回退到基础计算
+                    req_val = getattr(request, 'final_value', getattr(request, 'value', 0.0))
+                    cur_loc = vehicle['location']
+                    d1 = self._manhattan_loc(cur_loc, request.pickup)
+                    d2 = self._manhattan_loc(request.pickup, request.dropoff)
+                    moving_cost = getattr(self.env, 'movingpenalty', -0.1) * (d1 + d2)
+                    immediate = req_val 
+                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
+                else:
+                    # 使用批量计算的Q值和拒绝感知的调整价值
+                    base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
+                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
+                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                
+
+
+        
+        model.setObjective(objective_terms, self.GRB.MAXIMIZE)
+        try:
+            model.optimize()
+            
+            # Extract assignments
+            if model.status == self.GRB.OPTIMAL:
+                # Print battery level optimization results for debugging
+
+                
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    # Check request assignments
+                    for j, request in enumerate(available_requests):
+                        if request_decision[i][j].x > 0.5:
+                            assignments[vehicle_id] = request
+                            break
+                    
+                
+                # Update vehicle battery levels based on optimization results
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):
+                        self.env.vehicles[vehicle_id]['predicted_battery_t'] = battery_t[i].x
+                        
+            else:
+                print(f"Optimization status: {model.status}")
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    assignments[vehicle_id] = f"waiting"
+                if model.status == self.GRB.INFEASIBLE:
+                    print("Model is infeasible. Computing IIS...")
+                    model.computeIIS()
+                    print("Infeasible constraints:")
+                    for c in model.getConstrs():
+                        if c.IISConstr:
+                            print(f"  {c.constrName}")
+                            
+            selected_request = []
+            for vehicle_id, assignment in assignments.items():
+                if isinstance(assignment, str) and assignment.startswith("charge_"):
+                    continue
+                elif isinstance(assignment, str) and assignment in ["waiting", "idle"]:
+                    continue
+                else:
+                    selected_request.append(assignment.request_id)
+            remaining_requests = [req.request_id for req in available_requests if req.request_id not in selected_request]
+        except Exception as e:
+            print(f"Gurobi optimization with reject and charging levels failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to heuristic with reject consideration
+            assignments = self._heuristic_assignment_with_reject(vehicle_ids, available_requests, charging_stations)
+        
+        return assignments,remaining_requests
+    
+    
+    
+    
+    
+    
+    
+    
+    def _gurobi_vehicle_rebalancing_integrated(self, vehicle_ids, available_requests, charging_stations=None):
         """
         Gurobi optimization with known reject behavior for EVs and charging level constraints
         EVs won't be assigned to requests they would reject
@@ -535,32 +801,6 @@ class GurobiOptimizer:
         service_consumption = 0.05 # Battery consumption per service
         request_decision =[[model.addVar(vtype=self.GRB.BINARY,
                      name=f'request_{vehicle_id}_{request.request_id}') for request in available_requests] for i, vehicle_id in enumerate(vehicle_ids)]
-            
-
-        # valid_assignments = {}  # (vehicle_id, request_idx) -> is_valid
-        # for i, vehicle_id in enumerate(vehicle_ids):
-        #     vehicle = self.env.vehicles[vehicle_id]
-        #     for j, request in enumerate(available_requests):
-        #         # Check if EV would reject this request
-        #         if vehicle['type'] == 1:
-        #             # Calculate rejection probability
-        #             rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
-        #             valid_assignments[(i, j)] = rejection_prob < 0.5
-        #         else:
-        #             # AEV never rejects
-        #             valid_assignments[(i, j)] = True
-        # for i in range(len(vehicle_ids)):
-        #     for j in range(len(available_requests)):
-        #         if not valid_assignments.get((i, j), False):
-        #             model.addConstr(request_decision[i][j] == 0)
-
-
-
-    # Decision variables for request assignments
-        
-        # Constraint invalid assignments to 0
-
-            
             
         # Decision variables for charging assignments
         charge_decision = {}
@@ -589,14 +829,885 @@ class GurobiOptimizer:
                 name=f'battery_t_{vehicle_id}'
             )
         
-        
-
         idle_vehicle = {}
         for i in range(len(vehicle_ids)):
             idle_vehicle[i] = model.addVar(
                 vtype=self.GRB.BINARY,
                 name=f'vehicle_{vehicle_ids[i]}_idle'
             )
+
+        idle_vehicle_assign = {}
+        for i in range(len(vehicle_ids)):
+            for j in range(self.env.hotspot_locations_num):
+                idle_vehicle_assign[i,j] = model.addVar(
+                    vtype=self.GRB.BINARY,
+                    name=f'vehicle_{vehicle_ids[i]}_idle_assign_{j}'
+                )
+        for i in range(len(vehicle_ids)):
+            model.addConstr(self.gp.quicksum(idle_vehicle_assign[i,j] for j in range(self.env.hotspot_locations_num)) == idle_vehicle[i])
+        
+        for i in range(len(vehicle_ids)):
+            vehicle = self.env.vehicles[vehicle_ids[i]]
+            if vehicle['type'] == 1: # EV
+                nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_ids[i])
+                if nearest_hotspot_index is not None:
+                    for j in range(self.env.hotspot_locations_num):
+                        if j != nearest_hotspot_index:
+                            model.addConstr(idle_vehicle_assign[i,j] == 0)
+
+        waiting_vehicle = {}
+        for i in range(len(vehicle_ids)):
+            waiting_vehicle[i] = model.addVar(
+                vtype=self.GRB.BINARY,
+                name=f'vehicle_{vehicle_ids[i]}_waiting'
+            )
+            # Battery level transition constraints (t-1 to t relationship)
+            
+            
+        for i, vehicle_id in enumerate(vehicle_ids):
+            if self.env.vehicles[vehicle_id]['type'] == 1: # EV
+                model.addConstr(idle_vehicle[i]== 0)
+                model.addConstr(waiting_vehicle[i]== 0)
+                for j in range(len(charging_stations)):
+                    model.addConstr(charge_decision[i, j] == 0)
+                
+                
+        
+
+
+        carindex =  self.env.findchargerange_c()
+        positivenum = 500
+
+        # carindex is a dict {station_id: [vehicle_ids]}
+        # Need to iterate over charging_stations and get corresponding vehicles
+        for i in range(len(vehicle_ids)):
+            model.addConstr(carindex[i]<=positivenum*(1 - waiting_vehicle[i]))
+        
+
+
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.env.vehicles[vehicle_id]
+            
+            # Initialize battery expressions as Gurobi LinExpr
+            battery_loss = self.gp.LinExpr()
+            battery_increase = self.gp.LinExpr()
+            
+            # Battery consumption from charging (travel to station)
+            if charging_stations:
+                for j, station in enumerate(charging_stations):
+                    # Convert station location index to coordinates
+                    station_x = station.location % self.env.grid_size
+                    station_y = station.location // self.env.grid_size
+                    travel_distance = abs(vehicle['coordinates'][0] - station_x) + abs(vehicle['coordinates'][1] - station_y)
+                    battery_loss += travel_distance * battery_consum * charge_decision[i, j]
+                    battery_increase +=  self.env.chargeincrease_whole*charge_decision[i, j]
+            
+            # Battery consumption from service requests (travel to pickup + pickup to dropoff)
+            if available_requests:
+                for j, request in enumerate(available_requests):
+                    # Travel from vehicle current position to pickup
+                    pickup_x = request.pickup % self.env.grid_size
+                    pickup_y = request.pickup // self.env.grid_size
+                    travel_distance_to_pickup = abs(vehicle['coordinates'][0] - pickup_x) + abs(vehicle['coordinates'][1] - pickup_y)
+                    
+                    # Travel from pickup to dropoff
+                    dropoff_x = request.dropoff % self.env.grid_size
+                    dropoff_y = request.dropoff // self.env.grid_size
+                    travel_distance_pickup_to_dropoff = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+                    
+                    # Total battery consumption for this request
+                    total_travel_distance = travel_distance_to_pickup + travel_distance_pickup_to_dropoff
+                    battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
+            veh_loc = vehicle['location']
+            # if vehicle['type'] == 1: # EV
+            #     nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_id)
+            #     if nearest_hotspot_index is not None:
+            #         hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[nearest_hotspot_index]
+            #         hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
+            #         travel_distance_to_hotspot = self._manhattan_loc(veh_loc, hotspot_loc)
+            #         battery_loss += travel_distance_to_hotspot * battery_consum * idle_vehicle_assign[i,nearest_hotspot_index]
+            #     else:
+            if vehicle['type'] == 2:
+                for j in range(self.env.hotspot_locations_num):
+                    hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[j]
+                    hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
+                    maximam_idle_distance = self._manhattan_loc(veh_loc, hotspot_loc)
+                    battery_loss += maximam_idle_distance * battery_consum * idle_vehicle_assign[i,j]
+            # battery_loss+=idle_vehicle[i]*2*battery_consum # idle consumption
+            # Battery transition constraint (simplified to avoid infeasibility)
+            model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss + battery_increase)
+            # Ensure vehicle has enough battery for actions (but allow some flexibility)
+            #model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
+            # Ensure battery doesn't go below minimum (but allow some flexibility)
+            model.addConstr(battery_t[i] >=min_battery_level)  # If not idle, must meet min battery
+
+        idle_carnum = self.gp.LinExpr()
+        for i, vehicle_id in enumerate(vehicle_ids):
+            idle_carnum += idle_vehicle[i]
+
+        current_online_vehicles = int(getattr(self.env, 'current_online', 0))
+        idle_requirement = int(getattr(self.env, 'idle_vehicle_requirement', 0))
+
+            
+            # Constraint 1: Each vehicle can only take one action
+        for i, vehicle_id in enumerate(vehicle_ids):
+            if self.env.vehicles[vehicle_id]['type'] == 1: # EV
+                actionv = self.gp.LinExpr()
+                for j in range(len(available_requests)):
+                    actionv += request_decision[i][j]
+                model.addConstr(actionv <= 1)
+            else:
+                actionv = self.gp.LinExpr()
+                # Add valid request assignments
+                for j in range(len(available_requests)):
+                    actionv += request_decision[i][j]
+                # Add charging assignments
+                if charging_stations:
+                    for j in range(len(charging_stations)):
+                        actionv += charge_decision[i, j]
+                model.addConstr(actionv <= 1)
+                model.addConstr(idle_vehicle[i] + actionv + waiting_vehicle[i] == 1)
+        
+
+        
+        # Constraint 2: Each request can be assigned to at most one vehicle
+        for j in range(len(available_requests)):
+            valid_vehicles = self.gp.LinExpr()
+            for i in range(len(vehicle_ids)):
+                valid_vehicles += request_decision[i][j]
+            model.addConstr(valid_vehicles <= 1)
+            
+            # Constraint 3: Each charging station capacity
+        if charging_stations:
+            for j, station in enumerate(charging_stations):
+                model.addConstr(
+                    self.gp.quicksum(charge_decision[i, j] for i in range(len(vehicle_ids))) 
+                    <= max(
+                        0,
+                        station.max_capacity - len(station.current_vehicles)
+                ))
+        objective_terms = self.gp.LinExpr()
+        adp_weight = getattr(self.env, 'adp_value', 1.0)
+        
+        # 批量预计算所有vehicle-request对的Q值以提高性能
+        option_q_cache = {}
+        rejection_adjusted_values = {}  # 存储拒绝感知调整后的价值
+        
+        if adp_weight > 0:
+            # 收集所有需要计算的vehicle-request对
+            vehicle_request_pairs_ev = []
+            vehicle_request_pairs_aev = []
+            vehicle_request_pairs = []
+            for i , vehicle_id in enumerate(vehicle_ids):
+                for j, request in enumerate(available_requests):
+                    vehicle_request_pairs.append((vehicle_id, request))
+            for i, vehicle_id in enumerate(vehicle_ids):
+                if self.env.vehicles[vehicle_id]['type'] == 1: # EV
+                    for j, request in enumerate(available_requests):
+                        vehicle_request_pairs_ev.append((vehicle_id, request))
+                else:
+                    for j, request in enumerate(available_requests):
+                        vehicle_request_pairs_aev.append((vehicle_id, request))
+            
+            
+            
+            
+            # 批量计算Q值和拒绝感知价值
+            if hasattr(self.env, 'batch_evaluate_service_options'):
+                try:
+                    
+                    batch_q_values_ev = self.env.batch_evaluate_service_options(vehicle_request_pairs_ev,True)
+                    batch_q_values_aev = self.env.batch_evaluate_service_options(vehicle_request_pairs_aev,False)
+                    
+                    # 批量计算拒绝概率（只对EV）
+                    batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs_ev)
+                    
+                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs_ev):
+                        q_value = batch_q_values_ev[i] if i < len(batch_q_values_ev) else 0.0
+                        rejection_prob = batch_rejection_probs[i] if i < len(batch_rejection_probs) else 0.0
+                        
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+                        # 计算拒绝感知调整价值
+                        adjusted_value = self._calculate_rejection_aware_value(
+                            vehicle_id, request, q_value, rejection_prob
+                        )
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = adjusted_value
+                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs_aev):
+                        q_value = batch_q_values_aev[i] if i < len(batch_q_values_aev) else 0.0
+                        rejection_prob = 0.0
+                        
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+
+                except Exception as e:
+                    print(f"Batch evaluation failed: {e}, falling back to individual calculations")
+            
+            # 如果批量计算失败，使用单独计算
+            if not option_q_cache:
+                # 批量计算拒绝概率（只对EV）
+                print("individual calculation fallback")
+        
+        
+
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.env.vehicles[vehicle_id]
+
+            for j, request in enumerate(available_requests):
+                if adp_weight <= 0:
+                    # 回退到基础计算
+                    req_val = getattr(request, 'final_value', getattr(request, 'value', 0.0))
+                    cur_loc = vehicle['location']
+                    d1 = self._manhattan_loc(cur_loc, request.pickup)
+                    d2 = self._manhattan_loc(request.pickup, request.dropoff)
+                    moving_cost = getattr(self.env, 'movingpenalty', -0.1) * (d1 + d2)
+                    immediate = req_val 
+                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
+                else:
+                    # 使用批量计算的Q值和拒绝感知的调整价值
+                    base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
+                    
+                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
+                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                
+                # Process charging assignments
+            if charging_stations:
+                for j, station in enumerate(charging_stations):
+                    cur_loc = vehicle['location']
+                    d_travel = self._manhattan_loc(cur_loc, station.location)
+                    moving_cost = getattr(self.env, 'movingpenalty', -0.1) * d_travel
+                    charge_steps = getattr(self.env, 'charge_duration', 2)
+                    charging_penalty = -getattr(self.env, 'charging_penalty', 0.5) * charge_steps
+                    immediate = moving_cost + charging_penalty
+                    if adp_weight <= 0:
+                        # Immediate charging cost fallback
+                        objective_terms += immediate * charge_decision[i, j]
+                    else:
+                        # Use option-completion Q-value for charging
+                        charging_q = 0.0
+                        if hasattr(self.env, 'evaluate_charging_option'):
+                            try:
+                                charging_q = self.env.evaluate_charging_option(vehicle_id, station)
+                            except Exception:
+                                charging_q = 0.0
+                        # print(f"Charging Q-value for vehicle {vehicle_id} at station {station.id}: {charging_q}")
+                        objective_terms +=charging_q* adp_weight * charge_decision[i, j]
+            
+        served_requests = self.gp.LinExpr()
+        for j in range(len(available_requests)):
+            for i in range(len(vehicle_ids)):
+                served_requests += request_decision[i][j]
+        wait_q_penalty = -5e+3
+        idle_q_penalty = -5e+3
+        for i in range(len(vehicle_ids)):
+            # 使用神经网络预测的idle Q值替代固定的idle_vehicle_reward
+            vehicle_id = vehicle_ids[i]
+            vehicle = self.env.vehicles[vehicle_id]
+            wait_q_value = 0    
+            if hasattr(self.env, 'evaluate_waiting_option'):
+                try:
+                    wait_q_value = self.env.evaluate_waiting_option(
+                        vehicle_id=vehicle_id,
+                    )
+
+                except Exception as e:
+                    print(f"Warning: Failed to get waiting Q-value for vehicle {vehicle_id}: {e}")
+                    # 使用默认的waiting奖励作为后备
+                    wait_q_value = getattr(self.env, 'waiting_vehicle_reward', -0.1)
+            else:
+                # 如果没有神经网络方法，使用默认奖励
+                wait_q_value = getattr(self.env, 'waiting_vehicle_reward', -0.1)
+            
+            if adp_weight <= 0:
+                objective_terms += (-avg_request_value ) * waiting_vehicle[i]  # Additional opportunity cost penalty
+            else:
+                objective_terms += wait_q_value * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
+        for i in range(len(vehicle_ids)):
+            for j in range(self.env.hotspot_locations_num):
+                idle_q_value = 0    
+                idle_loc_x , idle_loc_y = self.env.hotspot_locations[j]
+                idle_loc = idle_loc_y * self.env.grid_size + idle_loc_x
+                if hasattr(self.env, 'evaluate_idle_option'):
+                    try:
+                        idle_q_value = self.env.evaluate_idle_option(
+                            vehicle_id=vehicle_ids[i],
+                            target_loc=idle_loc
+                        )
+                        idle_q_value =-10000
+                    except Exception as e:
+                        print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_ids[i]} at location {j}: {e}")
+                        # 使用默认的idle奖励作为后备
+                        idle_q_value = getattr(self.env, 'idle_vehicle_reward', -0.1)
+                else:
+                    # 如果没有神经网络方法，使用默认奖励
+                    idle_q_value = getattr(self.env, 'idle_vehicle_reward', -0.1)
+                
+                if adp_weight <= 0:
+                    objective_terms += (-avg_request_value ) * idle_vehicle_assign[i,j]  # Additional opportunity cost penalty
+                else:
+                    objective_terms += idle_q_value* idle_vehicle_assign[i,j]  # Use neural network predicted idle Q-value
+
+        
+        model.setObjective(objective_terms, self.GRB.MAXIMIZE)
+
+        try:
+            model.optimize()
+            
+            # Extract assignments
+            if model.status == self.GRB.OPTIMAL:
+                # Print battery level optimization results for debugging
+
+                
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    # Check request assignments
+                    for j, request in enumerate(available_requests):
+                        if request_decision[i][j].x > 0.5:
+                            assignments[vehicle_id] = request
+                            break
+                    
+                    # Check charging assignments if no request assigned
+                    if vehicle_id not in assignments and charging_stations:
+                        for j, station in enumerate(charging_stations):
+                            if charge_decision[i, j].x > 0.5:
+                                assignments[vehicle_id] = f"charge_{station.id}"
+                                break
+                    if waiting_vehicle[i].x > 0.1:
+                        assignments[vehicle_id] = f"waiting"
+
+                    for j in range(self.env.hotspot_locations_num):
+                        if idle_vehicle_assign[i,j].x > 0.1:
+                            assignments[vehicle_id] = f"idle_at_{j}"
+
+                    # if idle_vehicle[i].x > 0.1:
+                    #     assignments[vehicle_id] = f"idle"
+                
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    # Check request assignments
+                    if vehicle_id not in assignments:
+                        assignments[vehicle_id] = f"reloc"
+                
+                
+                
+                
+                # Update vehicle battery levels based on optimization results
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):
+                        self.env.vehicles[vehicle_id]['predicted_battery_t'] = battery_t[i].x
+                        
+            else:
+                print(f"Optimization status: {model.status}")
+                for i, vehicle_id in enumerate(vehicle_ids):
+                    assignments[vehicle_id] = f"waiting"
+                if model.status == self.GRB.INFEASIBLE:
+                    print("Model is infeasible. Computing IIS...")
+                    model.computeIIS()
+                    print("Infeasible constraints:")
+                    for c in model.getConstrs():
+                        if c.IISConstr:
+                            print(f"  {c.constrName}")
+        except Exception as e:
+            print(f"Gurobi optimization with reject and charging levels failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to heuristic with reject consideration
+            assignments = self._heuristic_assignment_with_reject(vehicle_ids, available_requests, charging_stations)
+        
+        return assignments
+    
+    
+    
+    
+    
+    def _gurobi_vehicle_rebalancing_aev(self, vehicle_ids, available_requests, charging_stations=None):
+        """
+        Gurobi optimization with known reject behavior for EVs and charging level constraints
+        EVs won't be assigned to requests they would reject
+        Includes t-1 to t charging level progression with minimum battery requirements
+        """
+        if not self.available:
+            return {}
+        
+        assignments = {}
+        
+        # Create optimization model
+        model = self.gp.Model("vehicle_assignment_with_reject_and_charging")
+        model.setParam('OutputFlag', 0)  # Suppress output
+
+        # Aggregate stats for opportunity costs (optional)
+        active_requests_count = len(self.env.active_requests) if hasattr(self.env, 'active_requests') else 0
+        active_requests_value = sum(getattr(req, 'final_value', getattr(req, 'value', 0.0)) for req in (self.env.active_requests.values() if hasattr(self.env, 'active_requests') else []))
+        avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 0.0
+
+        # Parameters
+        min_battery_level = self.env.min_battery_level if hasattr(self.env, 'min_battery_level') else 0.2
+
+        battery_consum = self.env.battery_consum if hasattr(self.env, 'battery_consum') else 0.05 # Battery consumption per travel step
+        service_consumption = 0.05 # Battery consumption per service
+
+            
+        vehicle_ids_aev = []
+        for vid in vehicle_ids:
+            if self.env.vehicles[vid]['type'] == 2:
+                vehicle_ids_aev.append(vid)
+                
+        request_decision =[[model.addVar(vtype=self.GRB.BINARY,
+                name=f'request_{vehicle_id}_{request.request_id}') for request in available_requests] for i, vehicle_id in enumerate(vehicle_ids_aev)]
+        charge_decision = {}
+        if charging_stations:
+            for i, vehicle_id in enumerate(vehicle_ids_aev):
+                for j, station in enumerate(charging_stations):
+                    charge_decision[i, j] = model.addVar(
+                        vtype=self.GRB.BINARY,
+                        name=f'charge_{vehicle_id}_{station.id}'
+                    )
+            
+        # Battery level variables (t-1 and t)
+        battery_t_minus_1 = {}  # Battery level at t-1 (current)
+        battery_t = {}          # Battery level at t (after actions)
+        
+        for i, vehicle_id in enumerate(vehicle_ids_aev):
+            vehicle = self.env.vehicles[vehicle_id]
+            
+            # t-1 battery level (current battery level)
+            battery_t_minus_1[i] = vehicle['battery']
+            
+            # t battery level (decision variable)
+            battery_t[i] = model.addVar(
+                vtype=self.GRB.CONTINUOUS,
+
+                name=f'battery_t_{vehicle_id}'
+            )
+        
+        idle_vehicle = {}
+        for i in range(len(vehicle_ids_aev)):
+            idle_vehicle[i] = model.addVar(
+                vtype=self.GRB.BINARY,
+                name=f'vehicle_{vehicle_ids[i]}_idle'
+            )
+
+        idle_vehicle_assign = {}
+        for i in range(len(vehicle_ids_aev)):
+            for j in range(self.env.hotspot_locations_num):
+                idle_vehicle_assign[i,j] = model.addVar(
+                    vtype=self.GRB.BINARY,
+                    name=f'vehicle_{vehicle_ids[i]}_idle_assign_{j}'
+                )
+        for i in range(len(vehicle_ids_aev)):
+            model.addConstr(self.gp.quicksum(idle_vehicle_assign[i,j] for j in range(self.env.hotspot_locations_num)) == idle_vehicle[i])
+        
+        for i in range(len(vehicle_ids_aev)):
+            vehicle = self.env.vehicles[vehicle_ids_aev[i]]
+            if vehicle['type'] == 1: # EV
+                nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_ids[i])
+                if nearest_hotspot_index is not None:
+                    for j in range(self.env.hotspot_locations_num):
+                        if j != nearest_hotspot_index:
+                            model.addConstr(idle_vehicle_assign[i,j] == 0)
+
+        waiting_vehicle = {}
+        for i in range(len(vehicle_ids_aev)):
+            waiting_vehicle[i] = model.addVar(
+                vtype=self.GRB.BINARY,
+                name=f'vehicle_{vehicle_ids[i]}_waiting'
+            )
+            # Battery level transition constraints (t-1 to t relationship)
+        for i, vehicle_id in enumerate(vehicle_ids_aev):
+            vehicle = self.env.vehicles[vehicle_id]
+            
+            # Initialize battery expressions as Gurobi LinExpr
+            battery_loss = self.gp.LinExpr()
+            battery_increase = self.gp.LinExpr()
+            
+            # Battery consumption from charging (travel to station)
+            if charging_stations:
+                for j, station in enumerate(charging_stations):
+                    # Convert station location index to coordinates
+                    station_x = station.location % self.env.grid_size
+                    station_y = station.location // self.env.grid_size
+                    travel_distance = abs(vehicle['coordinates'][0] - station_x) + abs(vehicle['coordinates'][1] - station_y)
+                    battery_loss += travel_distance * battery_consum * charge_decision[i, j]
+                    battery_increase +=  self.env.chargeincrease_whole*charge_decision[i, j]
+            
+            # Battery consumption from service requests (travel to pickup + pickup to dropoff)
+            if available_requests:
+                for j, request in enumerate(available_requests):
+                    # Travel from vehicle current position to pickup
+                    pickup_x = request.pickup % self.env.grid_size
+                    pickup_y = request.pickup // self.env.grid_size
+                    travel_distance_to_pickup = abs(vehicle['coordinates'][0] - pickup_x) + abs(vehicle['coordinates'][1] - pickup_y)
+                    
+                    # Travel from pickup to dropoff
+                    dropoff_x = request.dropoff % self.env.grid_size
+                    dropoff_y = request.dropoff // self.env.grid_size
+                    travel_distance_pickup_to_dropoff = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
+                    
+                    # Total battery consumption for this request
+                    total_travel_distance = travel_distance_to_pickup + travel_distance_pickup_to_dropoff
+                    battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
+            veh_loc = vehicle['location']
+            if vehicle['type'] == 1: # EV
+                nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_id)
+                if nearest_hotspot_index is not None:
+                    hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[nearest_hotspot_index]
+                    hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
+                    travel_distance_to_hotspot = self._manhattan_loc(veh_loc, hotspot_loc)
+                    battery_loss += travel_distance_to_hotspot * battery_consum * idle_vehicle_assign[i,nearest_hotspot_index]
+                else:
+                    for j in range(self.env.hotspot_locations_num):
+                        hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[j]
+                        hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
+                        maximam_idle_distance = 2
+                        battery_loss += maximam_idle_distance * battery_consum * idle_vehicle_assign[i,j]
+            # battery_loss+=idle_vehicle[i]*2*battery_consum # idle consumption
+            # Battery transition constraint (simplified to avoid infeasibility)
+            model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss + battery_increase)
+            # Ensure vehicle has enough battery for actions (but allow some flexibility)
+            model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
+            # Ensure battery doesn't go below minimum (but allow some flexibility)
+            model.addConstr(battery_t[i] >=min_battery_level)  # If not idle, must meet min battery
+
+        idle_carnum = self.gp.LinExpr()
+        for i, vehicle_id in enumerate(vehicle_ids_aev):
+            idle_carnum += idle_vehicle[i]
+
+        current_online_vehicles = int(getattr(self.env, 'current_online', 0))
+        idle_requirement = int(getattr(self.env, 'idle_vehicle_requirement', 0))
+
+            
+            # Constraint 1: Each vehicle can only take one action
+        for i in range(len(vehicle_ids_aev)):
+            actionv = self.gp.LinExpr()
+            # Add valid request assignments
+            for j in range(len(available_requests)):
+                actionv += request_decision[i][j]
+            # Add charging assignments
+            if charging_stations:
+                for j in range(len(charging_stations)):
+                    actionv += charge_decision[i, j]
+            model.addConstr(actionv <= 1)
+            model.addConstr(idle_vehicle[i] + actionv + waiting_vehicle[i] == 1)
+        
+
+        
+        # Constraint 2: Each request can be assigned to at most one vehicle
+        for j in range(len(available_requests)):
+            valid_vehicles = self.gp.LinExpr()
+            for i in range(len(vehicle_ids_aev)):
+                valid_vehicles += request_decision[i][j]
+            model.addConstr(valid_vehicles <= 1)
+            
+            # Constraint 3: Each charging station capacity
+        if charging_stations:
+            for j, station in enumerate(charging_stations):
+                model.addConstr(
+                    self.gp.quicksum(charge_decision[i, j] for i in range(len(vehicle_ids))) 
+                    <= max(
+                        0,
+                        station.max_capacity - len(station.current_vehicles)
+                ))
+        objective_terms = self.gp.LinExpr()
+        adp_weight = getattr(self.env, 'adp_value', 1.0)
+        
+        # 批量预计算所有vehicle-request对的Q值以提高性能
+        option_q_cache = {}
+        rejection_adjusted_values = {}  # 存储拒绝感知调整后的价值
+        
+        if adp_weight > 0:
+            # 收集所有需要计算的vehicle-request对
+            vehicle_request_pairs = []
+            for i, vehicle_id in enumerate(vehicle_ids_aev):
+                for j, request in enumerate(available_requests):
+                    vehicle_request_pairs.append((vehicle_id, request))
+            
+            # 批量计算Q值和拒绝感知价值
+            if hasattr(self.env, 'batch_evaluate_service_options'):
+                try:
+                    batch_q_values = self.env.batch_evaluate_service_options(vehicle_request_pairs)
+                    
+                    # 批量计算拒绝概率（只对EV）
+                    batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs)
+                    
+                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
+                        q_value = batch_q_values[i] if i < len(batch_q_values) else 0.0
+                        rejection_prob = batch_rejection_probs[i] if i < len(batch_rejection_probs) else 0.0
+                        
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+                        # 计算拒绝感知调整价值
+                        adjusted_value = self._calculate_rejection_aware_value(
+                            vehicle_id, request, q_value, rejection_prob
+                        )
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = adjusted_value
+                except Exception as e:
+                    print(f"Batch evaluation failed: {e}, falling back to individual calculations")
+            
+            # 如果批量计算失败，使用单独计算
+            if not option_q_cache:
+                # 批量计算拒绝概率（只对EV）
+                batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs)
+                
+                for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
+                    try:
+                        q_value = self.env.evaluate_service_option(vehicle_id, request)
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+                        # 使用批量计算的拒绝概率
+                        rejection_prob = batch_rejection_probs[i] if i < len(batch_rejection_probs) else 0.0
+                        
+                        adjusted_value = self._calculate_rejection_aware_value(
+                            vehicle_id, request, q_value, rejection_prob
+                        )
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = adjusted_value
+                    except Exception:
+                        option_q_cache[(vehicle_id, request.request_id)] = 0.0
+                        rejection_adjusted_values[(vehicle_id, request.request_id)] = 0.0
+            
+        for i, vehicle_id in enumerate(vehicle_ids_aev):
+            vehicle = self.env.vehicles[vehicle_id]
+
+            for j, request in enumerate(available_requests):
+                if adp_weight <= 0:
+                    # 回退到基础计算
+                    req_val = getattr(request, 'final_value', getattr(request, 'value', 0.0))
+                    cur_loc = vehicle['location']
+                    d1 = self._manhattan_loc(cur_loc, request.pickup)
+                    d2 = self._manhattan_loc(request.pickup, request.dropoff)
+                    moving_cost = getattr(self.env, 'movingpenalty', -0.1) * (d1 + d2)
+                    immediate = req_val 
+                    rejection_prob = self.env._calculate_rejection_probability(vehicle_id, request)
+                    objective_terms += immediate* request_decision[i][j]*(1 - rejection_prob)
+                else:
+                    # 使用批量计算的Q值和拒绝感知的调整价值
+                    base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
+                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
+                    objective_terms += base_q_value * adp_weight * request_decision[i][j]
+                
+                # Process charging assignments
+            if charging_stations:
+                for j, station in enumerate(charging_stations):
+                    cur_loc = vehicle['location']
+                    d_travel = self._manhattan_loc(cur_loc, station.location)
+                    moving_cost = getattr(self.env, 'movingpenalty', -0.1) * d_travel
+                    charge_steps = getattr(self.env, 'charge_duration', 2)
+                    charging_penalty = -getattr(self.env, 'charging_penalty', 0.5) * charge_steps
+                    immediate = moving_cost + charging_penalty
+                    if adp_weight <= 0:
+                        # Immediate charging cost fallback
+                        objective_terms += immediate * charge_decision[i, j]
+                    else:
+                        # Use option-completion Q-value for charging
+                        charging_q = 0.0
+                        if hasattr(self.env, 'evaluate_charging_option'):
+                            try:
+                                charging_q = self.env.evaluate_charging_option(vehicle_id, station)
+                            except Exception:
+                                charging_q = 0.0
+                        objective_terms += charging_q * adp_weight * charge_decision[i, j]
+            
+        served_requests = self.gp.LinExpr()
+        for j in range(len(available_requests)):
+            for i in range(len(vehicle_ids)):
+                served_requests += request_decision[i][j]
+        wait_q_penalty = -5e+3
+        idle_q_penalty = -5e+3
+        for i in range(len(vehicle_ids_aev)):
+            # 使用神经网络预测的idle Q值替代固定的idle_vehicle_reward
+            vehicle_id = vehicle_ids_aev[i]
+            vehicle = self.env.vehicles[vehicle_id]
+            wait_q_value = 0    
+            if hasattr(self.env, 'evaluate_waiting_option'):
+                try:
+                    wait_q_value = self.env.evaluate_waiting_option(
+                        vehicle_id=vehicle_id,
+                    )
+                    wait_q_value =wait_q_value*self.env.adp_value
+                except Exception as e:
+                    print(f"Warning: Failed to get waiting Q-value for vehicle {vehicle_id}: {e}")
+                    # 使用默认的waiting奖励作为后备
+                    wait_q_value = getattr(self.env, 'waiting_vehicle_reward', -0.1)
+            else:
+                # 如果没有神经网络方法，使用默认奖励
+                wait_q_value = getattr(self.env, 'waiting_vehicle_reward', -0.1)
+            
+            if adp_weight <= 0:
+                objective_terms += (-avg_request_value ) * waiting_vehicle[i]  # Additional opportunity cost penalty
+            else:
+                objective_terms += (wait_q_value) * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
+        for i in range(len(vehicle_ids_aev)):
+            for j in range(self.env.hotspot_locations_num):
+                idle_q_value = 0    
+                idle_loc_x , idle_loc_y = self.env.hotspot_locations[j]
+                idle_loc = idle_loc_y * self.env.grid_size + idle_loc_x
+                if hasattr(self.env, 'evaluate_idle_option'):
+                    try:
+                        idle_q_value = self.env.evaluate_idle_option(
+                            vehicle_id=vehicle_ids[i],
+                            target_loc=idle_loc
+                        )
+                        idle_q_value =idle_q_value*self.env.adp_value
+                    except Exception as e:
+                        print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_ids[i]} at location {j}: {e}")
+                        # 使用默认的idle奖励作为后备
+                        idle_q_value = getattr(self.env, 'idle_vehicle_reward', -0.1)
+                else:
+                    # 如果没有神经网络方法，使用默认奖励
+                    idle_q_value = getattr(self.env, 'idle_vehicle_reward', -0.1)
+                
+                if adp_weight <= 0:
+                    objective_terms += (-avg_request_value ) * idle_vehicle_assign[i,j]  # Additional opportunity cost penalty
+                else:
+                    objective_terms += (idle_q_value) * idle_vehicle_assign[i,j]  # Use neural network predicted idle Q-value
+
+        
+        model.setObjective(objective_terms, self.GRB.MAXIMIZE)
+
+        try:
+            model.optimize()
+            
+            # Extract assignments
+            if model.status == self.GRB.OPTIMAL:
+                # Print battery level optimization results for debugging
+
+                
+                for i, vehicle_id in enumerate(vehicle_ids_aev):
+                    # Check request assignments
+                    for j, request in enumerate(available_requests):
+                        if request_decision[i][j].x > 0.5:
+                            assignments[vehicle_id] = request
+                            break
+                    
+                    # Check charging assignments if no request assigned
+                    if vehicle_id not in assignments and charging_stations:
+                        for j, station in enumerate(charging_stations):
+                            if charge_decision[i, j].x > 0.5:
+                                assignments[vehicle_id] = f"charge_{station.id}"
+                                break
+                    if waiting_vehicle[i].x > 0.1:
+                        assignments[vehicle_id] = f"waiting"
+
+                    if idle_vehicle[i].x > 0.1:
+                        assignments[vehicle_id] = f"idle"
+                
+                # Update vehicle battery levels based on optimization results
+                for i, vehicle_id in enumerate(vehicle_ids_aev):
+                    if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):
+                        self.env.vehicles[vehicle_id]['predicted_battery_t'] = battery_t[i].x
+                        
+            else:
+                print(f"Optimization status: {model.status}")
+                for i, vehicle_id in enumerate(vehicle_ids_aev):
+                    assignments[vehicle_id] = f"waiting"
+                if model.status == self.GRB.INFEASIBLE:
+                    print("Model is infeasible. Computing IIS...")
+                    model.computeIIS()
+                    print("Infeasible constraints:")
+                    for c in model.getConstrs():
+                        if c.IISConstr:
+                            print(f"  {c.constrName}")
+        except Exception as e:
+            print(f"Gurobi optimization with reject and charging levels failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to heuristic with reject consideration
+            assignments = self._heuristic_assignment_with_reject(vehicle_ids, available_requests, charging_stations)
+        
+        return assignments
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    def _gurobi_vehicle_rebalancing_knownreject(self, vehicle_ids, available_requests, charging_stations=None):
+        """
+        Gurobi optimization with known reject behavior for EVs and charging level constraints
+        EVs won't be assigned to requests they would reject
+        Includes t-1 to t charging level progression with minimum battery requirements
+        """
+        if not self.available:
+            return {}
+        
+        assignments = {}
+        
+        # Create optimization model
+        model = self.gp.Model("vehicle_assignment_with_reject_and_charging")
+        model.setParam('OutputFlag', 0)  # Suppress output
+
+        # Aggregate stats for opportunity costs (optional)
+        active_requests_count = len(self.env.active_requests) if hasattr(self.env, 'active_requests') else 0
+        active_requests_value = sum(getattr(req, 'final_value', getattr(req, 'value', 0.0)) for req in (self.env.active_requests.values() if hasattr(self.env, 'active_requests') else []))
+        avg_request_value = (active_requests_value / active_requests_count) if active_requests_count > 0 else 0.0
+
+        # Parameters
+        min_battery_level = self.env.min_battery_level if hasattr(self.env, 'min_battery_level') else 0.2
+
+        battery_consum = self.env.battery_consum if hasattr(self.env, 'battery_consum') else 0.05 # Battery consumption per travel step
+        service_consumption = 0.05 # Battery consumption per service
+        request_decision =[[model.addVar(vtype=self.GRB.BINARY,
+                     name=f'request_{vehicle_id}_{request.request_id}') for request in available_requests] for i, vehicle_id in enumerate(vehicle_ids)]
+            
+        # Decision variables for charging assignments
+        charge_decision = {}
+        if charging_stations:
+            for i, vehicle_id in enumerate(vehicle_ids):
+                for j, station in enumerate(charging_stations):
+                    charge_decision[i, j] = model.addVar(
+                        vtype=self.GRB.BINARY,
+                        name=f'charge_{vehicle_id}_{station.id}'
+                    )
+            
+        # Battery level variables (t-1 and t)
+        battery_t_minus_1 = {}  # Battery level at t-1 (current)
+        battery_t = {}          # Battery level at t (after actions)
+        
+        for i, vehicle_id in enumerate(vehicle_ids):
+            vehicle = self.env.vehicles[vehicle_id]
+            
+            # t-1 battery level (current battery level)
+            battery_t_minus_1[i] = vehicle['battery']
+            
+            # t battery level (decision variable)
+            battery_t[i] = model.addVar(
+                vtype=self.GRB.CONTINUOUS,
+
+                name=f'battery_t_{vehicle_id}'
+            )
+        
+        idle_vehicle = {}
+        for i in range(len(vehicle_ids)):
+            idle_vehicle[i] = model.addVar(
+                vtype=self.GRB.BINARY,
+                name=f'vehicle_{vehicle_ids[i]}_idle'
+            )
+
+        idle_vehicle_assign = {}
+        for i in range(len(vehicle_ids)):
+            for j in range(self.env.hotspot_locations_num):
+                idle_vehicle_assign[i,j] = model.addVar(
+                    vtype=self.GRB.BINARY,
+                    name=f'vehicle_{vehicle_ids[i]}_idle_assign_{j}'
+                )
+        for i in range(len(vehicle_ids)):
+            model.addConstr(self.gp.quicksum(idle_vehicle_assign[i,j] for j in range(self.env.hotspot_locations_num)) == idle_vehicle[i])
+        
+        for i in range(len(vehicle_ids)):
+            vehicle = self.env.vehicles[vehicle_ids[i]]
+            if vehicle['type'] == 1: # EV
+                nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_ids[i])
+                if nearest_hotspot_index is not None:
+                    for j in range(self.env.hotspot_locations_num):
+                        if j != nearest_hotspot_index:
+                            model.addConstr(idle_vehicle_assign[i,j] == 0)
+
         waiting_vehicle = {}
         for i in range(len(vehicle_ids)):
             waiting_vehicle[i] = model.addVar(
@@ -637,15 +1748,35 @@ class GurobiOptimizer:
                     # Total battery consumption for this request
                     total_travel_distance = travel_distance_to_pickup + travel_distance_pickup_to_dropoff
                     battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
-            battery_loss+=idle_vehicle[i]*2*battery_consum # idle consumption
+            veh_loc = vehicle['location']
+            if vehicle['type'] == 1: # EV
+                nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_id)
+                if nearest_hotspot_index is not None:
+                    hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[nearest_hotspot_index]
+                    hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
+                    travel_distance_to_hotspot = self._manhattan_loc(veh_loc, hotspot_loc)
+                    battery_loss += travel_distance_to_hotspot * battery_consum * idle_vehicle_assign[i,nearest_hotspot_index]
+                else:
+                    for j in range(self.env.hotspot_locations_num):
+                        hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[j]
+                        hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
+                        maximam_idle_distance = 2
+                        battery_loss += maximam_idle_distance * battery_consum * idle_vehicle_assign[i,j]
+            # battery_loss+=idle_vehicle[i]*2*battery_consum # idle consumption
             # Battery transition constraint (simplified to avoid infeasibility)
             model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss + battery_increase)
             # Ensure vehicle has enough battery for actions (but allow some flexibility)
             model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
             # Ensure battery doesn't go below minimum (but allow some flexibility)
-            model.addConstr(battery_t[i] >=min_battery_level*(1 - waiting_vehicle[i]))  # If not idle, must meet min battery
+            model.addConstr(battery_t[i] >=min_battery_level)  # If not idle, must meet min battery
 
-            
+        idle_carnum = self.gp.LinExpr()
+        for i, vehicle_id in enumerate(vehicle_ids):
+            idle_carnum += idle_vehicle[i]
+
+        current_online_vehicles = int(getattr(self.env, 'current_online', 0))
+        idle_requirement = int(getattr(self.env, 'idle_vehicle_requirement', 0))
+
             
             # Constraint 1: Each vehicle can only take one action
         for i in range(len(vehicle_ids)):
@@ -660,11 +1791,7 @@ class GurobiOptimizer:
             model.addConstr(actionv <= 1)
             model.addConstr(idle_vehicle[i] + actionv + waiting_vehicle[i] == 1)
         
-        # Minimum idle vehicles constraint
-        idle_vehicles = self.gp.LinExpr()
-        for i in range(len(vehicle_ids)):
-            idle_vehicles += idle_vehicle[i]
-        #model.addConstr(idle_vehicles >= self.env.idle_vehicle_requirement)
+
         
         # Constraint 2: Each request can be assigned to at most one vehicle
         for j in range(len(available_requests)):
@@ -682,8 +1809,6 @@ class GurobiOptimizer:
                         0,
                         station.max_capacity - len(station.current_vehicles)
                 ))
-        
-        # Objective: Maximize total value considering Q-values with rejection-aware ADP
         objective_terms = self.gp.LinExpr()
         adp_weight = getattr(self.env, 'adp_value', 1.0)
         
@@ -783,49 +1908,23 @@ class GurobiOptimizer:
                                 charging_q = 0.0
                         objective_terms += charging_q * adp_weight * charge_decision[i, j]
             
-
-            
-            # Add penalty for unserved requests (considering reject behavior)
         served_requests = self.gp.LinExpr()
         for j in range(len(available_requests)):
             for i in range(len(vehicle_ids)):
                 served_requests += request_decision[i][j]
         wait_q_penalty = -5e+3
-        idld_q_penalty = -5e+3
+        idle_q_penalty = -5e+3
         for i in range(len(vehicle_ids)):
             # 使用神经网络预测的idle Q值替代固定的idle_vehicle_reward
             vehicle_id = vehicle_ids[i]
             vehicle = self.env.vehicles[vehicle_id]
-            
-            # 获取神经网络预测的idle Q值
-            idle_q_value = 0
-            wait_q_value = 0
-            current_coords = vehicle['coordinates']
-            target_x = max(0, min(self.env.grid_size-1, 
-                                current_coords[0] + random.randint(-1, 1)))
-            target_y = max(0, min(self.env.grid_size-1, 
-                                current_coords[1] + random.randint(-1, 1)))
-            target_loc = target_y * self.env.grid_size + target_x            
-            if hasattr(self.env, 'evaluate_idle_option'):
-                try:
-                    idle_q_value = self.env.evaluate_idle_option(
-                        vehicle_id=vehicle_id,
-                        target_loc = target_loc,
-                    )
-                except Exception as e:
-                    print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_id}: {e}")
-                    # 使用默认的idle奖励作为后备
-                    idle_q_value = getattr(self.env, 'idle_vehicle_reward', 0.0)
-            else:
-                # 如果没有神经网络方法，使用默认奖励
-                idle_q_value = getattr(self.env, 'idle_vehicle_reward', 0.0)
-            
-            # 获取神经网络预测的waiting Q值
+            wait_q_value = 0    
             if hasattr(self.env, 'evaluate_waiting_option'):
                 try:
                     wait_q_value = self.env.evaluate_waiting_option(
                         vehicle_id=vehicle_id,
                     )
+                    wait_q_value =wait_q_value*self.env.adp_value
                 except Exception as e:
                     print(f"Warning: Failed to get waiting Q-value for vehicle {vehicle_id}: {e}")
                     # 使用默认的waiting奖励作为后备
@@ -835,19 +1934,37 @@ class GurobiOptimizer:
                 wait_q_value = getattr(self.env, 'waiting_vehicle_reward', -0.1)
             
             if adp_weight <= 0:
-                objective_terms += (-avg_request_value + wait_q_penalty) * idle_vehicle[i]
-                objective_terms += (-avg_request_value + wait_q_penalty) * waiting_vehicle[i]  # Additional opportunity cost penalty
+                objective_terms += (-avg_request_value ) * waiting_vehicle[i]  # Additional opportunity cost penalty
             else:
-                objective_terms += (idle_q_value+wait_q_penalty) * idle_vehicle[i]
-                objective_terms += (wait_q_value+wait_q_penalty) * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
+                objective_terms += (wait_q_value) * waiting_vehicle[i]  # Use neural network predicted waiting Q-value
+        for i in range(len(vehicle_ids)):
+            for j in range(self.env.hotspot_locations_num):
+                idle_q_value = 0    
+                idle_loc_x , idle_loc_y = self.env.hotspot_locations[j]
+                idle_loc = idle_loc_y * self.env.grid_size + idle_loc_x
+                if hasattr(self.env, 'evaluate_idle_option'):
+                    try:
+                        idle_q_value = self.env.evaluate_idle_option(
+                            vehicle_id=vehicle_ids[i],
+                            target_loc=idle_loc
+                        )
+                        idle_q_value =idle_q_value*self.env.adp_value
+                    except Exception as e:
+                        print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_ids[i]} at location {j}: {e}")
+                        # 使用默认的idle奖励作为后备
+                        idle_q_value = getattr(self.env, 'idle_vehicle_reward', -0.1)
+                else:
+                    # 如果没有神经网络方法，使用默认奖励
+                    idle_q_value = getattr(self.env, 'idle_vehicle_reward', -0.1)
+                
+                if adp_weight <= 0:
+                    objective_terms += (-avg_request_value ) * idle_vehicle_assign[i,j]  # Additional opportunity cost penalty
+                else:
+                    objective_terms += (idle_q_value) * idle_vehicle_assign[i,j]  # Use neural network predicted idle Q-value
 
-            # Penalty for unserved requests
-        unserved_penalty = getattr(self.env, 'unserved_penalty', 1.5)
-        objective_terms -= 0.01*avg_request_value * (len(available_requests) - served_requests)
         
         model.setObjective(objective_terms, self.GRB.MAXIMIZE)
-        
-            # Solve the optimization problem
+
         try:
             model.optimize()
             
@@ -899,13 +2016,6 @@ class GurobiOptimizer:
             assignments = self._heuristic_assignment_with_reject(vehicle_ids, available_requests, charging_stations)
         
         return assignments
-
-
-
-
-
-
-
 
 
 
@@ -1161,6 +2271,7 @@ class GurobiOptimizer:
                         vehicle_id=vehicle_id,
                         target_loc = target_loc,
                     )
+                    idle_q_value = idle_q_value*self.env.adp_value
                 except Exception as e:
                     print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_id}: {e}")
                     # 使用默认的idle奖励作为后备
@@ -1175,6 +2286,7 @@ class GurobiOptimizer:
                     wait_q_value = self.env.evaluate_waiting_option(
                         vehicle_id=vehicle_id,
                     )
+                    wait_q_value = wait_q_value*self.env.adp_value
                 except Exception as e:
                     print(f"Warning: Failed to get waiting Q-value for vehicle {vehicle_id}: {e}")
                     # 使用默认的waiting奖励作为后备
@@ -1318,7 +2430,10 @@ class GurobiOptimizer:
                 if best_station:
                     assignments[vehicle_id] = f"charge_{best_station.id}"
         
-        # 第三步：按电池容量从高到低排序剩余车辆
+        high_battery_ev = [v_id for v_id in high_battery_vehicles 
+                           if self.env.vehicles[v_id]['type'] == 1]
+        high_battery_aev = [v_id for v_id in high_battery_vehicles 
+                            if self.env.vehicles[v_id]['type'] != 1]
         high_battery_vehicles.sort(
             key=lambda v_id: self.env.vehicles[v_id]['battery'], 
             reverse=True
@@ -1326,9 +2441,59 @@ class GurobiOptimizer:
         
         # 第四步：为高电量车辆分配订单（考虑EV拒绝率）
         if available_requests and high_battery_vehicles:
-            remaining_requests = list(available_requests)
             
+            high_battery_vehicles_list = {}
             for vehicle_id in high_battery_vehicles:
+                high_battery_vehicles_list[vehicle_id] = self.env.vehicles[vehicle_id]
+
+            remaining_requests = available_requests.copy()
+            for vehicle_id in high_battery_ev:
+                if vehicle_id in assignments:  # 已被分配充电
+                    continue
+                
+                vehicle = self.env.vehicles[vehicle_id]
+                vehicle_coords = vehicle['coordinates']
+                battery_level = vehicle['battery']
+                
+                # 计算该车辆到所有订单的距离
+                distance_list = {}
+                for request in remaining_requests:
+                    pickup_coords = (
+                        request.pickup // self.env.grid_size,
+                        request.pickup % self.env.grid_size
+                    )
+
+                    distance = abs(vehicle_coords[0] - pickup_coords[0]) + \
+                              abs(vehicle_coords[1] - pickup_coords[1])
+                    distance_list[request.request_id] = distance
+                
+                battery_consumption = self.env.battery_consum if hasattr(self.env, 'battery_consum') else 0.05
+                min_battery_level = self.env.min_battery_level if hasattr(self.env, 'min_battery_level') else 0.2
+                
+                # 为该车辆寻找最佳订单
+                best_request = None
+                
+                distance_sorted = sorted(distance_list.items(), key=lambda x: x[1])
+                
+                for req_id, distance in distance_sorted:
+                    request = next(r for r in remaining_requests if r.request_id == req_id)
+                    dropoff_coords = (
+                        request.dropoff // self.env.grid_size,
+                        request.dropoff % self.env.grid_size
+                    )
+                    whole_distance = distance + \
+                                     abs(request.pickup // self.env.grid_size - dropoff_coords[0]) + \
+                                        abs(request.pickup % self.env.grid_size - dropoff_coords[1])
+                    estimated_consumption = whole_distance * battery_consumption 
+                    if battery_level - estimated_consumption >= min_battery_level:
+                        # 检查拒绝概率
+                        request = next(r for r in remaining_requests if r.request_id == req_id)
+                        best_request = request
+
+                if best_request:
+                    assignments[vehicle_id] = best_request
+                    remaining_requests.remove(best_request)
+            for vehicle_id in high_battery_aev:
                 if vehicle_id in assignments:  # 已被分配充电
                     continue
                 
@@ -1353,39 +2518,34 @@ class GurobiOptimizer:
                 # 为该车辆寻找最佳订单
                 best_request = None
                 
-                if vehicle['type'] == 1:  # EV车辆：优先选择近距离订单
-                    # 按距离从近到远排序
-                    distance_sorted = sorted(distance_list.items(), key=lambda x: x[1])
+                value_distance_list = []
+                for req_id, distance in distance_list.items():
+                    request = next(r for r in remaining_requests if r.request_id == req_id)
+                    value = getattr(request, 'final_value', getattr(request, 'value', 0.0))
+                    dropoff_coords = (
+                        request.dropoff // self.env.grid_size,
+                        request.dropoff % self.env.grid_size
+                    )
+                    whole_distance = distance + \
+                                     abs(request.pickup // self.env.grid_size - dropoff_coords[0]) + \
+                                        abs(request.pickup % self.env.grid_size - dropoff_coords[1])
+                    estimated_consumption = whole_distance * battery_consumption  # 往返消耗
                     
-                    for req_id, distance in distance_sorted:
-                        # 检查电池是否足够
-                        estimated_consumption = distance * battery_consumption * 2  # 往返消耗
-                        if battery_level - estimated_consumption >= min_battery_level:
-                            # 检查拒绝概率
-                            request = next(r for r in remaining_requests if r.request_id == req_id)
-                            best_request = request
+                    if battery_level - estimated_consumption >= min_battery_level:
+                        value_distance_list.append((request, value, distance))
                 
-                else:  # AEV车辆：可以选择任何距离的订单，优先高价值
-                    # 按订单价值排序
-                    value_distance_list = []
-                    for req_id, distance in distance_list.items():
-                        request = next(r for r in remaining_requests if r.request_id == req_id)
-                        value = getattr(request, 'final_value', getattr(request, 'value', 0.0))
-                        estimated_consumption = distance * battery_consumption * 2
-                        
-                        if battery_level - estimated_consumption >= min_battery_level:
-                            value_distance_list.append((request, value, distance))
-                    
-                    # 按价值从高到低排序
-                    if value_distance_list:
-                        value_distance_list.sort(key=lambda x: x[1], reverse=True)
-                        best_request = value_distance_list[0][0]
+                # 按价值从高到低排序
+                if value_distance_list:
+                    value_distance_list.sort(key=lambda x: x[1], reverse=True)
+                    best_request = value_distance_list[0][0]
+                
                 
                 # 分配最佳订单
                 if best_request:
                     assignments[vehicle_id] = best_request
                     remaining_requests.remove(best_request)
 
+                        
         for vehicle_id in vehicle_ids:
             if vehicle_id not in assignments:
                 assignments[vehicle_id] = "idle"
