@@ -72,16 +72,17 @@ class GurobiOptimizer:
         if not self.available:
             return self._heuristic_rebalancing_assignment(vehicle_ids)
         
-        # Get available requests from environment
-        available_requests = []
         assigned_requests = []
         for vehicle_id in vehicle_ids:
             vehicle = self.env.vehicles[vehicle_id]
-            if vehicle.get('assigned_request') is not None:
-                assigned_requests.append(vehicle['assigned_request'].request_id)
+            for vehicle_id in self.env.vehicles.keys():
+                if self.env.vehicles[vehicle_id]['assigned_request'] is not None:
+                    assigned_requests.append(self.env.vehicles[vehicle_id]['assigned_request'])
+                if self.env.vehicles[vehicle_id]['passenger_onboard'] is not None:
+                    assigned_requests.append(self.env.vehicles[vehicle_id]['passenger_onboard'])
                 
-        if hasattr(self.env, 'active_requests') and self.env.active_requests:
-            available_requests = list(self.env.active_requests.values())
+
+        available_requests = list(self.env.active_requests.values())
         available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
         # Get available charging stations
         charging_stations = []
@@ -571,7 +572,10 @@ class GurobiOptimizer:
         # Battery level variables (t-1 and t)
         battery_t_minus_1 = {}  # Battery level at t-1 (current)
         battery_t = {}          # Battery level at t (after actions)
-        
+        idle_vehicle = {}
+        for i in range(len(vehicle_ids)):
+            idle_vehicle[i] = model.addVar(vtype=self.GRB.BINARY,
+                                     name=f'vehicle_{vehicle_ids[i]}_idle')
         for i, vehicle_id in enumerate(vehicle_ids):
             vehicle = self.env.vehicles[vehicle_id]
             
@@ -624,7 +628,7 @@ class GurobiOptimizer:
             # Add valid request assignments
             for j in range(len(available_requests)):
                 actionv += request_decision[i][j]
-            model.addConstr(actionv <= 1)
+            model.addConstr(actionv + idle_vehicle[i] == 1)
         
 
         
@@ -649,16 +653,17 @@ class GurobiOptimizer:
                 for j, request in enumerate(available_requests):
                     vehicle_request_pairs.append((vehicle_id, request))
             
-            # 批量计算Q值和拒绝感知价值
+            vehicle_request_pairs_ev = [(vid, req) for vid, req in vehicle_request_pairs if self.env.vehicles[vid]['type'] == 1]
             if hasattr(self.env, 'batch_evaluate_service_options'):
                 try:
-                    batch_q_values = self.env.batch_evaluate_service_options(vehicle_request_pairs)
+                    
+                    batch_q_values_ev = self.env.batch_evaluate_service_options(vehicle_request_pairs_ev,True)
                     
                     # 批量计算拒绝概率（只对EV）
-                    batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs)
+                    batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs_ev)
                     
-                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
-                        q_value = batch_q_values[i] if i < len(batch_q_values) else 0.0
+                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs_ev):
+                        q_value = batch_q_values_ev[i] if i < len(batch_q_values_ev) else 0.0
                         rejection_prob = batch_rejection_probs[i] if i < len(batch_rejection_probs) else 0.0
                         
                         option_q_cache[(vehicle_id, request.request_id)] = q_value
@@ -668,8 +673,16 @@ class GurobiOptimizer:
                             vehicle_id, request, q_value, rejection_prob
                         )
                         rejection_adjusted_values[(vehicle_id, request.request_id)] = adjusted_value
+                    for i, (vehicle_id, request) in enumerate(vehicle_request_pairs_ev):
+                        q_value = batch_q_values_ev[i] if i < len(batch_q_values_ev) else 0.0
+                        rejection_prob = 0.0
+                        
+                        option_q_cache[(vehicle_id, request.request_id)] = q_value
+                        
+
                 except Exception as e:
                     print(f"Batch evaluation failed: {e}, falling back to individual calculations")
+            
             
             # 如果批量计算失败，使用单独计算
             if not option_q_cache:
@@ -730,8 +743,9 @@ class GurobiOptimizer:
                         if request_decision[i][j].x > 0.5:
                             assignments[vehicle_id] = request
                             break
+                    if idle_vehicle[i].x > 0.5:
+                        assignments[vehicle_id] = "idle"
                     
-                
                 # Update vehicle battery levels based on optimization results
                 for i, vehicle_id in enumerate(vehicle_ids):
                     if hasattr(self.env.vehicles[vehicle_id], 'predicted_battery_t'):
@@ -745,6 +759,7 @@ class GurobiOptimizer:
                     print("Model is infeasible. Computing IIS...")
                     model.computeIIS()
                     print("Infeasible constraints:")
+                    print("ev infeasible constraints:")
                     for c in model.getConstrs():
                         if c.IISConstr:
                             print(f"  {c.constrName}")
@@ -872,16 +887,18 @@ class GurobiOptimizer:
                     model.addConstr(charge_decision[i, j] == 0)
                 
                 
-        
-
-
         carindex =  self.env.findchargerange_c()
         positivenum = 500
+        
+        carindex_aev = []
+        for i, vehicle_id in enumerate(vehicle_ids):
+            carindex_aev.append(carindex[vehicle_id])
 
-        # carindex is a dict {station_id: [vehicle_ids]}
-        # Need to iterate over charging_stations and get corresponding vehicles
         for i in range(len(vehicle_ids)):
-            model.addConstr(carindex[i]<=positivenum*(1 - waiting_vehicle[i]))
+            model.addConstr(carindex_aev[i]<=positivenum*(1 - waiting_vehicle[i]))
+
+
+
         
 
 
@@ -1312,14 +1329,25 @@ class GurobiOptimizer:
                 name=f'vehicle_{vehicle_ids[i]}_waiting'
             )
             # Battery level transition constraints (t-1 to t relationship)
+
+
+
+
+        carindex =  self.env.findchargerange_c()
+        positivenum = 500
+        
+        carindex_aev = []
+        for i, vehicle_id in enumerate(vehicle_ids_aev):
+            carindex_aev.append(carindex[vehicle_id])
+
+        for i in range(len(vehicle_ids_aev)):
+            model.addConstr(carindex_aev[i]<=positivenum*(1 - waiting_vehicle[i]))
+
+    
         for i, vehicle_id in enumerate(vehicle_ids_aev):
             vehicle = self.env.vehicles[vehicle_id]
-            
-            # Initialize battery expressions as Gurobi LinExpr
             battery_loss = self.gp.LinExpr()
             battery_increase = self.gp.LinExpr()
-            
-            # Battery consumption from charging (travel to station)
             if charging_stations:
                 for j, station in enumerate(charging_stations):
                     # Convert station location index to coordinates
@@ -1328,8 +1356,6 @@ class GurobiOptimizer:
                     travel_distance = abs(vehicle['coordinates'][0] - station_x) + abs(vehicle['coordinates'][1] - station_y)
                     battery_loss += travel_distance * battery_consum * charge_decision[i, j]
                     battery_increase +=  self.env.chargeincrease_whole*charge_decision[i, j]
-            
-            # Battery consumption from service requests (travel to pickup + pickup to dropoff)
             if available_requests:
                 for j, request in enumerate(available_requests):
                     # Travel from vehicle current position to pickup
@@ -1341,31 +1367,19 @@ class GurobiOptimizer:
                     dropoff_x = request.dropoff % self.env.grid_size
                     dropoff_y = request.dropoff // self.env.grid_size
                     travel_distance_pickup_to_dropoff = abs(pickup_x - dropoff_x) + abs(pickup_y - dropoff_y)
-                    
-                    # Total battery consumption for this request
                     total_travel_distance = travel_distance_to_pickup + travel_distance_pickup_to_dropoff
                     battery_loss += total_travel_distance * battery_consum * request_decision[i][j]
             veh_loc = vehicle['location']
-            if vehicle['type'] == 1: # EV
-                nearest_hotspot_index = self.env.return_nearest_hotspot_index(vehicle_id)
-                if nearest_hotspot_index is not None:
-                    hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[nearest_hotspot_index]
+            if vehicle['type'] == 2:
+                for j in range(self.env.hotspot_locations_num):
+                    hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[j]
                     hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
-                    travel_distance_to_hotspot = self._manhattan_loc(veh_loc, hotspot_loc)
-                    battery_loss += travel_distance_to_hotspot * battery_consum * idle_vehicle_assign[i,nearest_hotspot_index]
-                else:
-                    for j in range(self.env.hotspot_locations_num):
-                        hotspot_loc_x , hotspot_loc_y = self.env.hotspot_locations[j]
-                        hotspot_loc = hotspot_loc_x*self.env.grid_size + hotspot_loc_y
-                        maximam_idle_distance = 2
-                        battery_loss += maximam_idle_distance * battery_consum * idle_vehicle_assign[i,j]
-            # battery_loss+=idle_vehicle[i]*2*battery_consum # idle consumption
-            # Battery transition constraint (simplified to avoid infeasibility)
+                    maximam_idle_distance = self._manhattan_loc(veh_loc, hotspot_loc)
+                    battery_loss += maximam_idle_distance * battery_consum * idle_vehicle_assign[i,j]
             model.addConstr(battery_t[i] == battery_t_minus_1[i] - battery_loss + battery_increase)
-            # Ensure vehicle has enough battery for actions (but allow some flexibility)
-            model.addConstr(battery_loss <= battery_t_minus_1[i] )  # Allow small battery deficit to avoid infeasibility
-            # Ensure battery doesn't go below minimum (but allow some flexibility)
-            model.addConstr(battery_t[i] >=min_battery_level)  # If not idle, must meet min battery
+            model.addConstr(battery_t[i] >=min_battery_level)  
+
+
 
         idle_carnum = self.gp.LinExpr()
         for i, vehicle_id in enumerate(vehicle_ids_aev):
@@ -1602,9 +1616,33 @@ class GurobiOptimizer:
                     print("Model is infeasible. Computing IIS...")
                     model.computeIIS()
                     print("Infeasible constraints:")
+                    print("aev infeasible constraints:")
                     for c in model.getConstrs():
                         if c.IISConstr:
-                            print(f"  {c.constrName}")
+                            # Get constraint details
+                            constr_name = c.constrName
+                            constr_sense = c.sense
+                            constr_rhs = c.RHS
+                            
+                            # Get the linear expression
+                            row = model.getRow(c)
+                            expr_str = ""
+                            for i in range(row.size()):
+                                var = row.getVar(i)
+                                coeff = row.getCoeff(i)
+                                if i > 0 and coeff >= 0:
+                                    expr_str += " + "
+                                elif coeff < 0:
+                                    expr_str += " - "
+                                    coeff = -coeff
+                                else:
+                                    pass  # First term, no operator needed
+                                
+                                if coeff != 1.0:
+                                    expr_str += f"{coeff}*"
+                                expr_str += var.varName
+                            
+                            print(f"  {constr_name}: {expr_str} {constr_sense} {constr_rhs}")
         except Exception as e:
             print(f"Gurobi optimization with reject and charging levels failed: {e}")
             import traceback

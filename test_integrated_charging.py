@@ -234,7 +234,7 @@ def set_random_seeds(seed=42):
     print(f"✓ Random seeds set to {seed} for all generators (Python, NumPy, PyTorch)")
 
 
-def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 20):
+def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 10, transportation_mode = 'integrated'):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
@@ -320,6 +320,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         'battery_levels': [],
         'environment_stats': [],
         'value_function_losses': [],
+        'value_function_ev_losses': [],
         'qvalue_losses': []  # Added: to store all training losses
     }
     
@@ -346,7 +347,12 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
             states_for_training = []
             actions_for_training = []
             current_requests = list(env.active_requests.values())
-            actions, storeactions,storeactions_ev = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+            if transportation_mode == 'integrated':
+                actions, storeactions,storeactions_ev = env.simulate_motion(agents=[], current_requests=current_requests, rebalance=True)
+            elif transportation_mode == 'evfirst':
+                actions, storeactions,storeactions_ev = env.simulate_motion_evfirst(agents=[], current_requests=current_requests, rebalance=True)
+            elif transportation_mode == 'aevfirst':
+                actions, storeactions,storeactions_ev = env.simulate_motion_aevfirst(agents=[], current_requests=current_requests, rebalance=True)
             if step% 100==0:
                 print("action_atype")
                 print(storeactions)
@@ -459,6 +465,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         results['episode_rewards'].append(episode_reward)
         results['charging_events'].extend(episode_charging_events)
         results['value_function_losses'].append(np.mean(episode_losses) if episode_losses else 0.0)
+        results['value_function_ev_losses'].append(np.mean(episode_losses_ev) if episode_losses_ev else 0.0)
         results['qvalue_losses'].extend(episode_losses)  # Fixed: extend instead of assign
         # Record environment statistics
         stats = env.get_stats()
@@ -561,7 +568,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     print(f"✓ Results will be saved to: {results_dir}")
     
     # Save detailed episode statistics to Excel including vehicle visit patterns
-    excel_path, spatial_path = save_episode_stats_to_excel(env, results['episode_detailed_stats'], results_dir, results.get('vehicle_visit_stats'))
+    excel_path, spatial_path = save_episode_stats_to_excel(env, results['episode_detailed_stats'], results_dir, results.get('vehicle_visit_stats'), transportation_mode)
     
     # Store file paths in results for reference
     results['excel_path'] = excel_path
@@ -572,7 +579,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
 
 
 
-def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=128,heuristic_battery_threshold = 0.5, num_vehicles = 10):
+def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=64,heuristic_battery_threshold = 0.5, num_vehicles = 10):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
@@ -1089,7 +1096,7 @@ def print_vehicle_visit_summary(vehicle_visit_stats_list):
         print(f"   最不活跃车辆: Vehicle {least_mobile} ({mobility_scores[least_mobile]:.1f} 个不同位置/episode)")
 
 
-def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_stats=None):
+def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_stats=None,transportation_mode='integrated'):
     """Save detailed episode statistics to Excel file including vehicle visit patterns, ADP values, and spatial analysis"""
     if not episode_stats:
         print("⚠ No episode statistics to save")
@@ -1097,7 +1104,7 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
     
     # Create DataFrame from episode statistics
     df = pd.DataFrame(episode_stats)
-    
+    ev_num = env.ev_num_vehicles
     # Extract ADP value and demand pattern information
     adpvalue = getattr(env, 'adp_value', 1.0)
     demand_pattern = "intense" if getattr(env, 'use_intense_requests', True) else "random"
@@ -1106,7 +1113,7 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
     
     # Add timestamp to filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_filename = f"episode_statistics_adp{adpvalue}_demand{demand_pattern}_{env.heuristic_battery_threshold}_{timestamp}.xlsx"
+    excel_filename = f"episode_statistics_adp_{transportation_mode}_{adpvalue}_demand{demand_pattern}_{env.heuristic_battery_threshold}_{ev_num}_{timestamp}.xlsx"
     excel_path = results_dir / excel_filename
     
     # Generate spatial visualization
@@ -1626,10 +1633,10 @@ def main():
     training_config = get_training_config()
     env_config = config_manager.get_environment_config()
     charge_threshold = [0.3+i*0.1 for i in range(6)]
-    use_intense_requests = False
+    use_intense_requests = True
     try:
         # 从配置获取训练参数
-        num_episodes = 100
+        num_episodes = 50
         print(f"📊 使用配置参数: episodes={num_episodes}")
         
         # carnumlist = [i*5 for i in range(1,6)]
@@ -1654,42 +1661,12 @@ def main():
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
-            results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi)
+            transportation_mode_list = ['integrated','evfirst','aevfirst']
+            for transportation_mode in transportation_mode_list:
+                print(f"\n🚦 交通模式: {transportation_mode.upper()}")
+                results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi, transportation_mode=transportation_mode)
 
-            # 分析结果
-            analysis = analyze_results(results)
             
-            # 生成可视化
-            success = visualize_integrated_results(env, results, assignmentgurobi=assignmentgurobi)
-            
-            # 空间分布可视化已在Excel导出中生成
-            print(f"\n🗺️  空间分布分析已完成，图像路径: {results.get('spatial_image_path', 'N/A')}")
-            
-            # 生成传统的空间分布分析（用于兼容性）
-            spatial_viz = SpatialVisualization(env.grid_size)
-            spatial_analysis = spatial_viz.analyze_spatial_patterns(env, adp_value=adpvalue)
-            spatial_viz.print_spatial_analysis(spatial_analysis)
-            
-            # 生成报告
-            generate_integration_report(results, analysis, assignmentgurobi=assignmentgurobi)
-            
-            # 输出车辆访问模式总结
-            print_vehicle_visit_summary(results.get('vehicle_visit_stats', []))
-            
-            print("\n" + "="*60)
-            print(f"🎉 集成测试完成! (ADP={adpvalue}, {assignment_type})")
-            print("📊 结果摘要:")
-            print(f"   - 平均奖励: {analysis['avg_reward']:.2f}")
-            print(f"   - 充电次数: {analysis['total_charging']}")
-            print(f"   - 平均电量: {analysis['avg_battery']:.2f}")
-            print(f"   - 奖励改进: {analysis['improvement']:.2f}")
-            
-            if success:
-                print("📈 可视化图表生成成功")
-            
-            results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
-            print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
-            print("="*60)
             
     except Exception as e:
         print(f"\n❌ 测试失败: {e}")
