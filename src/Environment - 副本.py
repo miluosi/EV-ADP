@@ -2875,28 +2875,7 @@ class ChargingIntegratedEnvironment(Environment):
                             from src.Action import ChargingAction
                             
                             actions[vehicle_id] = ChargingAction([], station_id, self.charge_duration, vehicle_location,vehicle_battery,req_num = quest_num_now)
-                            if storeactions[vehicle_id] is None:
-                                storeactions[vehicle_id] = actions[vehicle_id]
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                            else:
-                                storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                storeactions[vehicle_id].next_action.next_value = 0
-                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                # Save the old current_time before replacing the action
-                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                self.storeactions[vehicle_id] = None
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-
+                            self._update_storeaction(vehicle_id, actions[vehicle_id], storeactions, is_ev=False)
                         elif isinstance(target_request, Request) and target_request.request_id in self.active_requests:
                             #print("veh_id:", vehicle_id, "veh_loc:", vehicle_location, "veh_battery:", vehicle_battery)
                             #print("target_request:", target_request.request_id, "pickup:", target_request.pickup, "dropoff:", target_request.dropoff)
@@ -2915,25 +2894,20 @@ class ChargingIntegratedEnvironment(Environment):
                                                         target_coords=self.active_requests[target_request.request_id].dropoff,
                                                         next_value=self.active_requests[target_request.request_id].final_value)
                                 else:
-                                    if storeactions[vehicle_id] is None:
-                                        storeactions[vehicle_id] = actions[vehicle_id]
-                                        self.storeactions[vehicle_id] = actions[vehicle_id]
-                                        self.storeactions[vehicle_id].dur_reward = 0
-                                        self.storeactions[vehicle_id].current_time = self.current_time
-                                        self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
-                                    else:
-                                        storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                        storeactions[vehicle_id].next_action.next_value = self.active_requests[target_request.request_id].final_value
-                                        storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                        storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                        # Save the old current_time before replacing the action
-                                        old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                        self.storeactions[vehicle_id] = None
-                                        self.storeactions[vehicle_id] = actions[vehicle_id]
-                                        self.storeactions[vehicle_id].dur_reward = 0
-                                        self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                        self.storeactions[vehicle_id].current_time = self.current_time
-                                        self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                                    self._store_action(vehicle_id, actions[vehicle_id], storeactions, vehicle_location, vehicle_battery,
+                                                     target_coords=self.active_requests[target_request.request_id].dropoff,
+                                                     next_value=self.active_requests[target_request.request_id].final_value)
+                        elif isinstance(target_request, Request) and target_request.request_id not in self.active_requests:
+                            # Request no longer in active_requests (已被分配或过期)
+                            print(f"⚠️ Vehicle {vehicle_id} 分配的请求 {target_request.request_id} 不在 active_requests 中 (step {self.current_time})")
+                            # 给车辆分配idle action
+                            self._assign_idle_vehicle(vehicle_id)
+                            from src.Action import IdleAction
+                            vehicle = self.vehicles[vehicle_id]
+                            current_coords = vehicle['coordinates']
+                            target_coords = vehicle.get('idle_target', current_coords)
+                            actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                            self._update_storeaction(vehicle_id, actions[vehicle_id], storeactions, is_ev=False)
                         elif isinstance(target_request, str) and target_request == "waiting":
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to waiting at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle waiting state - mark vehicle as stationary for next simulation
@@ -2944,27 +2918,8 @@ class ChargingIntegratedEnvironment(Environment):
                             from src.Action import IdleAction
                             current_coords = vehicle['coordinates']
                             actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location,vehicle_battery,req_num = quest_num_now)  # Stay in place
-                            if storeactions[vehicle_id] is None:
-                                storeactions[vehicle_id] = actions[vehicle_id]
-                                storeactions[vehicle_id].target_location = current_coords
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = current_coords
-                            else:
-                                storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                storeactions[vehicle_id].next_action.next_value = 0
-                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                # Save the old current_time before replacing the action
-                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                self.storeactions[vehicle_id] = None
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = current_coords
+                            self._store_action(vehicle_id, actions[vehicle_id], storeactions, vehicle_location, vehicle_battery,
+                                             target_coords=self.vehicles[vehicle_id]['location'])
                         elif isinstance(target_request, str) and target_request.startswith("idle_at_"):
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             zone_id_str = target_request.replace("idle_at_", "")
@@ -2981,31 +2936,11 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle['assigned_request'] = None
                             vehicle['passenger_onboard'] = None
                             vehicle['charging_station'] = None
-                            vehicle['target_location'] = idle_target
+                            vehicle['target_location'] = None
                             vehicle['idle_target'] = idle_target
                             current_coords = vehicle['coordinates']
                             actions[vehicle_id] = IdleAction([], current_coords, idle_target, vehicle_location, vehicle_battery,req_num = quest_num_now)
-                            if storeactions[vehicle_id] is None:
-                                storeactions[vehicle_id] = actions[vehicle_id]
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                            else:
-                                storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                storeactions[vehicle_id].next_action.next_value = 0
-                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                # Save the old current_time before replacing the action
-                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                self.storeactions[vehicle_id] = None
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
+                            self._update_storeaction(vehicle_id, actions[vehicle_id], storeactions, is_ev=False)
 
                             
                         else:
@@ -3238,27 +3173,7 @@ class ChargingIntegratedEnvironment(Environment):
                             from src.Action import ChargingAction
                             
                             actions[vehicle_id] = ChargingAction([], station_id, self.charge_duration, vehicle_location,vehicle_battery,req_num = quest_num_now)
-                            if storeactions[vehicle_id] is None:
-                                storeactions[vehicle_id] = actions[vehicle_id]
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                            else:
-                                storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                storeactions[vehicle_id].next_action.next_value = 0
-                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                # Save the old current_time before replacing the action
-                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                self.storeactions[vehicle_id] = None
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
+                            self._update_storeaction(vehicle_id, actions[vehicle_id], storeactions, is_ev=False)
                         elif isinstance(target_request, Request) and target_request.request_id in self.active_requests:
                             #print("veh_id:", vehicle_id, "veh_loc:", vehicle_location, "veh_battery:", vehicle_battery)
                             #print("target_request:", target_request.request_id, "pickup:", target_request.pickup, "dropoff:", target_request.dropoff)
@@ -3277,25 +3192,20 @@ class ChargingIntegratedEnvironment(Environment):
                                                         target_coords=self.active_requests[target_request.request_id].dropoff,
                                                         next_value=self.active_requests[target_request.request_id].final_value)
                                 else:
-                                    if storeactions[vehicle_id] is None:
-                                        storeactions[vehicle_id] = actions[vehicle_id]
-                                        self.storeactions[vehicle_id] = actions[vehicle_id]
-                                        self.storeactions[vehicle_id].dur_reward = 0
-                                        self.storeactions[vehicle_id].current_time = self.current_time
-                                        self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
-                                    else:
-                                        storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                        storeactions[vehicle_id].next_action.next_value = self.active_requests[target_request.request_id].final_value
-                                        storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                        storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                        # Save the old current_time before replacing the action
-                                        old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                        self.storeactions[vehicle_id] = None
-                                        self.storeactions[vehicle_id] = actions[vehicle_id]
-                                        self.storeactions[vehicle_id].dur_reward = 0
-                                        self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                        self.storeactions[vehicle_id].current_time = self.current_time
-                                        self.storeactions[vehicle_id].target_location = self.active_requests[target_request.request_id].dropoff
+                                    self._store_action(vehicle_id, actions[vehicle_id], storeactions, vehicle_location, vehicle_battery,
+                                                     target_coords=self.active_requests[target_request.request_id].dropoff,
+                                                     next_value=self.active_requests[target_request.request_id].final_value)
+                        elif isinstance(target_request, Request) and target_request.request_id not in self.active_requests:
+                            # Request no longer in active_requests (已被分配或过期)
+                            print(f"⚠️ Vehicle {vehicle_id} 分配的请求 {target_request.request_id} 不在 active_requests 中 (step {self.current_time})")
+                            # 给车辆分配idle action
+                            self._assign_idle_vehicle(vehicle_id)
+                            from src.Action import IdleAction
+                            vehicle = self.vehicles[vehicle_id]
+                            current_coords = vehicle['coordinates']
+                            target_coords = vehicle.get('idle_target', current_coords)
+                            actions[vehicle_id] = IdleAction([], current_coords, target_coords, vehicle_location, vehicle_battery, req_num=quest_num_now)
+                            self._update_storeaction(vehicle_id, actions[vehicle_id], storeactions, is_ev=False)
                         elif isinstance(target_request, str) and target_request == "waiting":
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to waiting at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             # Handle waiting state - mark vehicle as stationary for next simulation
@@ -3306,27 +3216,8 @@ class ChargingIntegratedEnvironment(Environment):
                             from src.Action import IdleAction
                             current_coords = vehicle['coordinates']
                             actions[vehicle_id] = IdleAction([], current_coords, current_coords, vehicle_location,vehicle_battery,req_num = quest_num_now)  # Stay in place
-                            if storeactions[vehicle_id] is None:
-                                storeactions[vehicle_id] = actions[vehicle_id]
-                                storeactions[vehicle_id].target_location = current_coords
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = current_coords
-                            else:
-                                storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                storeactions[vehicle_id].next_action.next_value = 0
-                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                # Save the old current_time before replacing the action
-                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                self.storeactions[vehicle_id] = None
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = current_coords
+                            self._store_action(vehicle_id, actions[vehicle_id], storeactions, vehicle_location, vehicle_battery,
+                                             target_coords=self.vehicles[vehicle_id]['location'])
                         elif isinstance(target_request, str) and target_request.startswith("idle_at_"):
                             #print(f"DEBUG Assignment: Vehicle {vehicle_id} assigned to idle at step {self.current_time}, battery: {vehicle_battery:.2f}")
                             zone_id_str = target_request.replace("idle_at_", "")
@@ -3347,27 +3238,7 @@ class ChargingIntegratedEnvironment(Environment):
                             vehicle['idle_target'] = idle_target
                             current_coords = vehicle['coordinates']
                             actions[vehicle_id] = IdleAction([], current_coords, idle_target, vehicle_location, vehicle_battery,req_num = quest_num_now)
-                            if storeactions[vehicle_id] is None:
-                                storeactions[vehicle_id] = actions[vehicle_id]
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                            else:
-                                storeactions[vehicle_id].next_action = actions[vehicle_id]
-                                storeactions[vehicle_id].next_action.next_value = 0
-                                storeactions[vehicle_id].vehicle_loc_post = vehicle_location
-                                storeactions[vehicle_id].vehicle_battery_post = vehicle_battery
-                                storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
-                                # Save the old current_time before replacing the action
-                                old_current_time = getattr(storeactions[vehicle_id], 'current_time', self.current_time)
-                                self.storeactions[vehicle_id] = None
-                                self.storeactions[vehicle_id] = actions[vehicle_id]
-                                self.storeactions[vehicle_id].dur_reward = 0
-                                self.storeactions[vehicle_id].dur_time = self.current_time - old_current_time
-                                self.storeactions[vehicle_id].current_time = self.current_time
-                                self.storeactions[vehicle_id].target_location = self.vehicles[vehicle_id]['target_location']
+                            self._update_storeaction(vehicle_id, actions[vehicle_id], storeactions, is_ev=False)
 
                             
                         else:

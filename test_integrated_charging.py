@@ -234,7 +234,7 @@ def set_random_seeds(seed=42):
     print(f"✓ Random seeds set to {seed} for all generators (Python, NumPy, PyTorch)")
 
 
-def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 10,num_ev = 5, transportation_mode = 'integrated'):
+def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 20,num_ev = 10, transportation_mode = 'integrated'):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
@@ -242,7 +242,7 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
     set_random_seeds(seed=42)
     
 
-    num_stations = 4
+    num_stations = 8
     env = ChargingIntegratedEnvironment(
         num_vehicles=num_vehicles, 
         num_stations=num_stations, 
@@ -356,12 +356,31 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
                 actions, storeactions,storeactions_ev = env.simulate_motion_aevfirst(agents=[], current_requests=current_requests, rebalance=True)
             if step% 100==0:
                 print("action_atype")
-                print(storeactions)
-                print(storeactions_ev)
+                print("🔍 AEV storeactions:", storeactions)
+                print("🔍 EV storeactions_ev:", storeactions_ev)
+                
+                # 统计 AEV 和 EV 的动作数量
+                aev_action_count = sum(1 for v in storeactions.values() if v is not None)
+                ev_action_count = sum(1 for v in storeactions_ev.values() if v is not None)
+                print(f"📊 Actions this step: AEV={aev_action_count}, EV={ev_action_count}")
+                
+                # 检查车辆类型分布
+                aev_vehicle_ids = [vid for vid, v in env.vehicles.items() if v['type'] == 2]
+                ev_vehicle_ids = [vid for vid, v in env.vehicles.items() if v['type'] == 1]
+                print(f"🚗 Vehicle count: AEV={len(aev_vehicle_ids)}, EV={len(ev_vehicle_ids)}")
+                print(f"🚗 AEV IDs: {aev_vehicle_ids[:5]}...")  # 只显示前5个
+                print(f"🚗 EV IDs: {ev_vehicle_ids[:5]}...")
+                
             # if step% 10==0:
             #     carindex =  env.findchargerange_c()
             #     print("carindex:",carindex)
             next_states, rewards, dur_rewards, done, info = env.step(actions,storeactions,storeactions_ev)
+            
+            # 在 step 之后检查经验缓冲区增长
+            if step % 100 == 0 and use_neural_network:
+                aev_buffer_before = len(value_function.experience_buffer)
+                ev_buffer_before = len(value_function_ev.experience_buffer)
+                print(f"📦 Buffer size after step {step}: AEV={aev_buffer_before}, EV={ev_buffer_before}")
             # Debug: Output step statistics every 100 steps
             if step % 25 == 0:
                 stats = env.get_stats()
@@ -451,6 +470,12 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
             if use_neural_network and len(value_function.experience_buffer) >= warmup_steps:
                 # Train more frequently based on our new parameters
                 if step % training_frequency == 0:
+                    # 在训练前记录缓冲区大小
+                    if step % 100 == 0:
+                        aev_buffer_size = len(value_function.experience_buffer)
+                        ev_buffer_size = len(value_function_ev.experience_buffer)
+                        print(f"🔄 Before training: AEV buffer={aev_buffer_size}, EV buffer={ev_buffer_size}")
+                    
                     training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
                     if training_loss > 0:
                         episode_losses.append(training_loss)
