@@ -234,7 +234,7 @@ def set_random_seeds(seed=42):
     print(f"✓ Random seeds set to {seed} for all generators (Python, NumPy, PyTorch)")
 
 
-def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 10, transportation_mode = 'integrated'):
+def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 10,num_ev = 5, transportation_mode = 'integrated'):
     """Run charging integration test with EV/AEV analysis"""
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
     
@@ -246,6 +246,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
     env = ChargingIntegratedEnvironment(
         num_vehicles=num_vehicles, 
         num_stations=num_stations, 
+        ev_num_vehicles=num_ev,
         random_seed=42,
         use_intense_requests=use_intense_requests
     )
@@ -501,6 +502,7 @@ def run_charging_integration_test(adpvalue,num_episodes,use_intense_requests,ass
         # Only record neural network metrics if using neural network
         if use_neural_network:
             episode_stats['neural_network_loss'] = np.mean(episode_losses) if episode_losses else 0.0
+            episode_stats['neural_evnetwork_loss'] = np.mean(episode_losses_ev) if episode_losses_ev else 0.0
             episode_stats['neural_network_loss_std'] = np.std(episode_losses) if episode_losses else 0.0
             episode_stats['training_steps_in_episode'] = len(episode_losses)
             
@@ -1308,22 +1310,22 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
                 vehicle_comparison.to_excel(writer, sheet_name='Vehicle_Comparison', index=False)
         
         # Generate and save spatial visualization
-        try:
-            spatial_viz = SpatialVisualization(env.grid_size)
-            success = spatial_viz.create_comprehensive_spatial_plot(
-                env=env, 
-                save_path=spatial_image_path,
-                adpvalue=adpvalue,
-                demand_pattern=demand_pattern
-            )
+        # try:
+        #     spatial_viz = SpatialVisualization(env.grid_size)
+        #     success = spatial_viz.create_comprehensive_spatial_plot(
+        #         env=env, 
+        #         save_path=spatial_image_path,
+        #         adpvalue=adpvalue,
+        #         demand_pattern=demand_pattern
+        #     )
             
-            if success:
-                print(f"✓ Spatial visualization saved: {spatial_image_path}")
-            else:
-                print(f"⚠ Failed to generate spatial visualization")
+        #     if success:
+        #         print(f"✓ Spatial visualization saved: {spatial_image_path}")
+        #     else:
+        #         print(f"⚠ Failed to generate spatial visualization")
             
-        except Exception as e:
-            print(f"⚠ Error generating spatial visualization: {e}")
+        # except Exception as e:
+        #     print(f"⚠ Error generating spatial visualization: {e}")
         
         print(f"✓ Episode statistics saved to Excel: {excel_path}")
         print(f"  - Episode_Statistics: Detailed data for each episode")
@@ -1653,7 +1655,7 @@ def main():
 
 
         # print("\n" + "="*60)
-        assignmentgurobi =True
+        assignmentgurobi = True
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
@@ -1662,8 +1664,9 @@ def main():
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
             transportation_mode_list = ['integrated','evfirst','aevfirst']
+            # transportation_mode_list = ['integrated']
             for transportation_mode in transportation_mode_list:
-                print(f"\n🚦 交通模式: {transportation_mode.upper()}")
+            #     print(f"\n🚦 交通模式: {transportation_mode.upper()}")
                 results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi, transportation_mode=transportation_mode)
 
             

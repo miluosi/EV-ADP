@@ -428,7 +428,7 @@ class ChargingIntegratedEnvironment(Environment):
     Integrated charging environment class, inheriting from src.Environment
     """
 
-    def __init__(self, num_vehicles=5, num_stations=3, ev_num_vehicles=None, grid_size=15, use_intense_requests=True, assignmentgurobi=True, random_seed=None,decision_mode="integrated"):  # Increased grid size
+    def __init__(self, num_vehicles=5, num_stations=3, ev_num_vehicles=None, grid_size=10, use_intense_requests=True, assignmentgurobi=True, random_seed=None,decision_mode="integrated"):  # Increased grid size
         # Provide required parameters for base class
         NUM_LOCATIONS = grid_size * grid_size  # Total locations in grid
         MAX_CAPACITY = 4  # Maximum capacity per location
@@ -1080,6 +1080,121 @@ class ChargingIntegratedEnvironment(Environment):
                     for vehicle_id, request in valid_pairs]
     
     
+
+
+    def batch_evaluate_service_options_meanfield(self, vehicle_request_pairs, ifEVQvalue = False):
+        """
+        批量计算多个vehicle-request对的Mean Field Q值
+        使用周围智能体的历史决策分布作为条件变量
+        
+        Args:
+            vehicle_request_pairs: List of (vehicle_id, request) tuples
+            ifEVQvalue: 是否使用EV的value function
+            
+        Returns:
+            List of Mean Field Q-values: Q(s, a, μ) where μ is mean action distribution
+        """
+        if not vehicle_request_pairs:
+            return []
+        
+        # 选择合适的 value function
+        value_func = self.value_function_ev if ifEVQvalue else self.value_function
+        
+        # 检查 value function 是否支持 mean field
+        if not hasattr(value_func, 'compute_mean_field') or not hasattr(value_func, 'batch_get_q_value_with_mean_field'):
+            # 如果不支持 mean field，回退到普通方法
+            return self.batch_evaluate_service_options(vehicle_request_pairs, ifEVQvalue)
+        
+        # 准备批量输入数据
+        batch_inputs = []
+        valid_pairs = []
+        mean_fields = []
+        
+        # 收集所有车辆位置信息用于计算邻居
+        agent_locations = {}
+        for vid, vehicle in self.vehicles.items():
+            loc = vehicle.get('location', 0)
+            x = loc % self.grid_size
+            y = loc // self.grid_size
+            agent_locations[vid] = (x, y)
+        
+        for vehicle_id, request in vehicle_request_pairs:
+            # 检查 vehicle 和 request 的有效性
+            veh = self.vehicles.get(vehicle_id)
+            if veh is None or request is None:
+                continue
+                
+            # 如果 request 是 ID，解析为对象
+            if isinstance(request, (int, str)) and request in self.active_requests:
+                request = self.active_requests[request]
+            if request is None:
+                continue
+            
+            # 计算该车辆的邻居智能体的平均动作分布（mean field）
+            mean_field = value_func.compute_mean_field(
+                environment=self,
+                agent_id=vehicle_id,
+                agent_locations=agent_locations
+            )
+            mean_fields.append(mean_field)
+            
+            # 准备状态特征
+            cur_loc = veh['location']
+            cur_bat = veh['battery']
+            num_reqs = len(self.active_requests)
+            other_idle = len([v for vid, v in self.vehicles.items() 
+                             if vid != vehicle_id and v['assigned_request'] is None 
+                             and v['passenger_onboard'] is None and v['charging_station'] is None])
+            
+            # 准备输入数据
+            input_data = {
+                'vehicle_id': vehicle_id,
+                'target_id': request.request_id,
+                'vehicle_location': cur_loc,
+                'target_reject': request.pickup,
+                'target_location': request.dropoff,
+                'current_time': self.current_time,
+                'other_vehicles': max(0, other_idle),
+                'num_requests': num_reqs,
+                'battery_level': cur_bat,
+                'request_value': getattr(request, 'final_value', getattr(request, 'value', 0.0))
+            }
+            
+            batch_inputs.append(input_data)
+            valid_pairs.append((vehicle_id, request))
+        
+        if not batch_inputs:
+            return []
+        
+        # 批量计算 Mean Field Q值
+        try:
+            # 使用 value function 的批量 mean field Q值计算方法
+            mean_field_q_values = value_func.batch_get_q_value_with_mean_field(
+                batch_inputs, 
+                mean_fields
+            )
+            
+            # 应用拒绝感知调整（如果需要）
+            adjusted_q_values = []
+            for i, (vehicle_id, request) in enumerate(valid_pairs):
+                base_q = mean_field_q_values[i] if i < len(mean_field_q_values) else 0.0
+                
+                # 计算拒绝感知调整
+                adjusted_q = self._calculate_rejection_aware_adjustment(
+                    vehicle_id, request, base_q
+                )
+                adjusted_q_values.append(adjusted_q)
+            
+            return adjusted_q_values
+            
+        except Exception as e:
+            print(f"Mean Field batch Q-value calculation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # 回退到普通批量方法
+            return self.batch_evaluate_service_options(vehicle_request_pairs, ifEVQvalue)
+
+
     
   
     
@@ -1509,12 +1624,23 @@ class ChargingIntegratedEnvironment(Environment):
         if random.random() < self.request_generation_rate:
 
             rand_val = random.random()
-            if rand_val < 0.8:
-                num_requests = random.randint(int(self.num_vehicles),self.num_vehicles*2)
-            elif rand_val < 0.95:
-                num_requests = random.randint(self.num_vehicles*2, int(self.num_vehicles*3))
+            if self.current_time < self.episode_length * 0.5:
+                rand_val = random.random()
+                if rand_val < 0.3:
+                    num_requests = random.randint(int(self.num_vehicles*0.25), int(self.num_vehicles*0.5))
+                elif rand_val < 0.8:
+                    num_requests = random.randint(int(self.num_vehicles*0.5), int(self.num_vehicles))
+                else:
+                    num_requests = random.randint(int(self.num_vehicles*1.5), int(self.num_vehicles*2))
             else:
-                num_requests = random.randint(int(self.num_vehicles*3), int(self.num_vehicles*4))
+                rand_val = random.random()
+                if rand_val < 0.3:
+                    num_requests = random.randint(int(self.num_vehicles*0.5), int(self.num_vehicles))
+                elif rand_val < 0.8:
+                    num_requests = random.randint(int(self.num_vehicles), int(self.num_vehicles*1.5))
+                else:
+                    num_requests = random.randint(int(self.num_vehicles*2), int(self.num_vehicles*3))
+
             
             for request_idx in range(num_requests):
                 self.request_counter += 1
@@ -1552,6 +1678,14 @@ class ChargingIntegratedEnvironment(Environment):
                 base_value = 25
                 distance_value = travel_time * (2 + np.random.rand()*0.1)
                 surge_factor = 1.0 + (num_requests - 1) * 0.1  # More requests = higher prices
+                point_loc = pickup_y * self.grid_size + pickup_x
+                zone_loc = self.loc_to_zone.get(point_loc, None)
+                if zone_loc==1:
+                    distance_value += 5  # Downtown has higher surge
+                elif zone_loc==2:
+                    distance_value -= 2  # Suburban has moderate surge
+                elif zone_loc==3:
+                    distance_value -= 2  # Outskirts have lower surge
                 point_loc = pickup_y * self.grid_size + pickup_x
                 zone_loc = self.loc_to_zone.get(point_loc, None)
                 if zone_loc==1:
@@ -1624,17 +1758,11 @@ class ChargingIntegratedEnvironment(Environment):
                     num_requests = random.randint(int(self.num_vehicles*2), int(self.num_vehicles*3))
 
             # Define 3 hotspot centers in the grid
-            hotspots = [
-                (self.grid_size // 4, self.grid_size // 4),           # Bottom-left hotspot
-                (3 * self.grid_size // 4, self.grid_size // 4),       # Bottom-right hotspot
-                (self.grid_size // 2, self.grid_size // 2),
-                (self.grid_size // 4, 3 * self.grid_size // 4),       # Top-left hotspot
-                (3 * self.grid_size // 4, 3 * self.grid_size // 4)    # Top-right hotspot
-            ]
-            
+            hotspots = self.hotspot_locations
+
             # Probability weights for each hotspot (should sum to 1.0)
-            probability_weights = [0.2, 0.1, 0.2, 0.25, 0.25]  # 20% for bottom-left, 10% for bottom-right, 20% for center, 25% for top-left, 25% for top-right
-            selected_hotspot_idx_reward = [35, 15, 20, 15, 35]  # Reward weights for each hotspot
+            probability_weights = [0.3, 0.1, 0.2, 0.4]  # 20% for bottom-left, 10% for bottom-right, 20% for center, 25% for top-left, 25% for top-right
+            selected_hotspot_idx_reward = [35, 15, 20, 15]  # Reward weights for each hotspot
             for request_idx in range(num_requests):
                 self.request_counter += 1
                 
@@ -2221,8 +2349,8 @@ class ChargingIntegratedEnvironment(Environment):
                               if v['assigned_request'] is None and v['passenger_onboard'] is None and v['charging_station'] is None and v['target_location'] is None and  v['penalty_timer']==0]
             idle_vehicles_2  = [vehicle_id for vehicle_id, v in self.vehicles.items() 
                               if v['needs_emergency_charging']]
-            idle_vehicles_ev = [vid for vid in idle_vehicles_1 if self._is_ev(vid) and self.vehicles[vid]['target_location'] is not None]
-            idle_vehicles_1 = idle_vehicles_1 + idle_vehicles_2+idle_vehicles_ev
+            # idle_vehicles_ev = [vid for vid in idle_vehicles_1 if self._is_ev(vid) and self.vehicles[vid]['target_location'] is not None]
+            idle_vehicles_1 = idle_vehicles_1 + idle_vehicles_2
             for vehicle_id, vehicle in self.vehicles.items():
                 # Include strict idle vehicles first
                 if vehicle_id in leftover_vehicleslist:
@@ -2264,10 +2392,10 @@ class ChargingIntegratedEnvironment(Environment):
                     charging_stations = []
                     charging_stations = [station for station in self.charging_manager.stations.values() 
                                if station.available_slots > 0]
-                    rebalancing_assignments_ev = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests, charging_stations)
-                    for vehicle_id, target_request in rebalancing_assignments_ev.items():
+                    rebalancing_assignments = self.gurobi_optimizer._heuristic_assignment_with_reject(vehicles_to_rebalance, available_requests, charging_stations)
+                    for vehicle_id, target_request in rebalancing_assignments.items():
                         if target_request is None:
-                            rebalancing_assignments_ev[vehicle_id] = None
+                            rebalancing_assignments[vehicle_id] = None
                 # Debug: Count assignments made
                 new_assignments = 0
                 re_assignments_len = len(rebalancing_assignments)
@@ -2320,6 +2448,8 @@ class ChargingIntegratedEnvironment(Environment):
                                                      next_value=self.active_requests[target_request.request_id].final_value)
                             else:
                                 vehicle['continual_reject'] += 1
+                                vehicle['assigned_request'] = None  # Clear the rejected request assignment
+                                #print(f"❌ Vehicle {vehicle_id} rejected request {target_request.request_id} at step {self.current_time} (continual_reject={vehicle['continual_reject']})")
                                 if vehicle['continual_reject'] >= self.penalty_reject_requestnum:
                                     vehicle['penalty_timer'] = self.ev_penalty_duration
                                 
@@ -2599,6 +2729,7 @@ class ChargingIntegratedEnvironment(Environment):
                                                     next_value=self.active_requests[target_request.request_id].final_value)
                         else:
                             vehicle['continual_reject'] += 1
+                            vehicle['assigned_request'] = None
                             if vehicle['continual_reject'] >= self.penalty_reject_requestnum:
                                 vehicle['penalty_timer'] = self.ev_penalty_duration
                             
@@ -2633,7 +2764,10 @@ class ChargingIntegratedEnvironment(Environment):
                         assigned_request.append(self.vehicles[vehicle_id]['passenger_onboard'])
                 
                 # print("Assigned requests:", assigned_request)
-                available_requests = [req for req in current_active_requests if req.request_id not in assigned_request]
+                # Filter out both assigned AND expired requests
+                available_requests = [req for req in current_active_requests 
+                                    if req.request_id not in assigned_request 
+                                    and self.current_time <= req.pickup_deadline]
                 
 
                 charging_stations = [station for station in self.charging_manager.stations.values() 
@@ -3066,6 +3200,7 @@ class ChargingIntegratedEnvironment(Environment):
                                                     next_value=self.active_requests[target_request.request_id].final_value)
                         else:
                             vehicle['continual_reject'] += 1
+                            vehicle['assigned_request'] = None
                             if vehicle['continual_reject'] >= self.penalty_reject_requestnum:
                                 vehicle['penalty_timer'] = self.ev_penalty_duration
                             

@@ -365,7 +365,7 @@ class GurobiOptimizer:
                 
                 # Vehicle type compatibility score
                 type_score = 1.0
-                if vehicle['type'] == 'AEV':
+                if vehicle['type'] == 2:
                     type_score = 1.2  # AEV vehicles are preferred for service
                 
                 # Combined score: distance + battery + type
@@ -395,7 +395,7 @@ class GurobiOptimizer:
             vehicle = self.env.vehicles[vehicle_id]
             # Base score considers battery level and vehicle type
             base_score = vehicle['battery'] * 0.6
-            if vehicle['type'] == 'AEV':
+            if vehicle['type'] == 2:
                 base_score += 0.3  # AEV bonus for reliability
             vehicle_scores[vehicle_id] = base_score
 
@@ -2431,6 +2431,22 @@ class GurobiOptimizer:
         if not vehicle_ids:
             return assignments
         
+
+
+        assigned_requests = []
+        for vehicle_id in vehicle_ids:
+            vehicle = self.env.vehicles[vehicle_id]
+            for vehicle_id in self.env.vehicles.keys():
+                if self.env.vehicles[vehicle_id]['assigned_request'] is not None:
+                    assigned_requests.append(self.env.vehicles[vehicle_id]['assigned_request'])
+                if self.env.vehicles[vehicle_id]['passenger_onboard'] is not None:
+                    assigned_requests.append(self.env.vehicles[vehicle_id]['passenger_onboard'])
+                
+
+        available_requests = list(self.env.active_requests.values())
+        available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
+
+
         # 第一步：识别低电量车辆（电池 < 0.5）
         low_battery_vehicles = []
         high_battery_vehicles = []
@@ -2468,7 +2484,7 @@ class GurobiOptimizer:
                 if best_station:
                     assignments[vehicle_id] = f"charge_{best_station.id}"
         
-        high_battery_ev = [v_id for v_id in high_battery_vehicles 
+        high_battery_ev = [v_id for v_id in vehicle_ids 
                            if self.env.vehicles[v_id]['type'] == 1]
         high_battery_aev = [v_id for v_id in high_battery_vehicles 
                             if self.env.vehicles[v_id]['type'] != 1]
@@ -2586,8 +2602,21 @@ class GurobiOptimizer:
                         
         for vehicle_id in vehicle_ids:
             if vehicle_id not in assignments:
-                assignments[vehicle_id] = "idle"
+                if self.env.vehicles[vehicle_id]['type'] == 2:
+                    zone_id = np.random.randint(0, self.env.hotspot_locations_num)
+                    assignments[vehicle_id] = "idle_at_{}".format(zone_id)
+                else:
+                    assignments[vehicle_id] = "reloc"
         return assignments
+
+
+
+
+
+
+
+
+
 
     def optimize_vehicle_rebalancing_state(self, vehicle_ids):
         """Optimize vehicle rebalancing using state-based value function (src2-style approach)"""

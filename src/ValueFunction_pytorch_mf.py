@@ -2393,6 +2393,161 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         plt.show()
         return fig
+    
+    def compute_mean_field(self, environment, agent_id, agent_locations=None, neighbor_radius=5.0):
+        """
+        计算agent周围邻居智能体的平均动作分布（mean field）
+        
+        Args:
+            environment: 环境实例
+            agent_id: 当前agent的ID
+            agent_locations: Dict of {agent_id: (x, y)} 位置，可选
+            neighbor_radius: 邻居半径
+            
+        Returns:
+            mean_field: 动作分布的均值（长度为action_dim的tensor）
+        """
+        # 获取所有agent的位置（如果没有提供）
+        if agent_locations is None:
+            agent_locations = {}
+            for vid, vehicle in environment.vehicles.items():
+                loc = vehicle.get('location', 0)
+                x = loc % environment.grid_size
+                y = loc // environment.grid_size
+                agent_locations[vid] = (x, y)
+        
+        # 获取当前agent的位置
+        current_vehicle = environment.vehicles.get(agent_id, {})
+        current_loc = current_vehicle.get('location', 0)
+        current_x = current_loc % environment.grid_size
+        current_y = current_loc // environment.grid_size
+        
+        # 找到邻居范围内的所有agents
+        neighbor_ids = []
+        for vid, (x, y) in agent_locations.items():
+            if vid != agent_id:
+                distance = math.sqrt((x - current_x)**2 + (y - current_y)**2)
+                if distance <= neighbor_radius:
+                    neighbor_ids.append(vid)
+        
+        # 计算mean action distribution
+        if len(neighbor_ids) == 0:
+            # 没有邻居：返回均匀分布
+            action_dim = 3  # 简化：assign, idle, charge 三种动作
+            mean_field = torch.ones(action_dim, device=self.device) / action_dim
+        else:
+            # 从邻居的历史动作分布中计算均值
+            action_dim = 3  # assign, idle, charge
+            neighbor_actions_sum = torch.zeros(action_dim, device=self.device)
+            
+            for nid in neighbor_ids:
+                # 从agent的动作历史中获取动作分布
+                if hasattr(self, 'agent_action_distributions') and nid in self.agent_action_distributions:
+                    neighbor_actions_sum += self.agent_action_distributions[nid]
+                else:
+                    # 如果没有历史，使用均匀分布
+                    neighbor_actions_sum += torch.ones(action_dim, device=self.device) / action_dim
+            
+            mean_field = neighbor_actions_sum / len(neighbor_ids)
+        
+        return mean_field
+    
+    def batch_get_q_value_with_mean_field(self, batch_inputs, mean_fields):
+        """
+        批量计算带有mean field的Q值：Q(s, a, μ)
+        
+        Args:
+            batch_inputs: List of input dictionaries
+            mean_fields: List of mean field tensors for each input
+            
+        Returns:
+            List of Q-values
+        """
+        if not batch_inputs or not mean_fields:
+            return []
+        
+        if len(batch_inputs) != len(mean_fields):
+            raise ValueError(f"Batch inputs ({len(batch_inputs)}) and mean fields ({len(mean_fields)}) must have the same length")
+        
+        batch_size = len(batch_inputs)
+        
+        try:
+            # 准备批量网络输入
+            batch_network_inputs = []
+            for i in range(batch_size):
+                input_data = batch_inputs[i]
+                action_type = f"assign_{input_data['target_id']}"
+                network_input = self._prepare_network_input_with_battery(
+                    input_data['vehicle_location'], 
+                    input_data['target_location'], 
+                    input_data['current_time'],
+                    input_data['other_vehicles'], 
+                    input_data['num_requests'], 
+                    action_type,
+                    input_data['battery_level'], 
+                    input_data['request_value']
+                )
+                batch_network_inputs.append(network_input)
+            
+            # 批量转换为张量
+            batch_tensors = self._batch_prepare_tensors(batch_network_inputs)
+            
+            # Stack mean fields into batch
+            mean_field_batch = torch.stack(mean_fields).to(self.device)
+            
+            # 使用神经网络进行批量前向传播（带mean field）
+            with torch.no_grad():
+                # 如果网络支持mean field，使用它；否则使用常规方法
+                if hasattr(self.network, 'forward_with_mean_field'):
+                    batch_q_values = self.network.forward_with_mean_field(
+                        path_locations=batch_tensors['path_locations'],
+                        path_delays=batch_tensors['path_delays'],
+                        current_time=batch_tensors['current_time'],
+                        other_agents=batch_tensors['other_agents'],
+                        num_requests=batch_tensors['num_requests'],
+                        battery_level=batch_tensors['battery_level'],
+                        request_value=batch_tensors['request_value'],
+                        mean_field=mean_field_batch
+                    )
+                else:
+                    # 回退到常规方法（忽略mean field）
+                    batch_q_values = self.network(
+                        path_locations=batch_tensors['path_locations'],
+                        path_delays=batch_tensors['path_delays'],
+                        current_time=batch_tensors['current_time'],
+                        other_agents=batch_tensors['other_agents'],
+                        num_requests=batch_tensors['num_requests'],
+                        battery_level=batch_tensors['battery_level'],
+                        request_value=batch_tensors['request_value'],
+                        action_type=None,
+                        vehicle_id=None,
+                        vehicle_type=None
+                    )
+            
+            # 转换为Python列表
+            q_values = batch_q_values.cpu().numpy().flatten().tolist()
+            
+            return q_values
+            
+        except Exception as e:
+            print(f"Mean Field batch Q-value calculation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # 回退到普通批量计算
+            return self.batch_get_assignment_q_value(batch_inputs)
+    
+    def update_agent_action_distribution(self, agent_id, action_distribution):
+        """
+        更新agent的动作分布历史（用于mean field计算）
+        
+        Args:
+            agent_id: Agent的ID
+            action_distribution: 动作分布tensor [action_dim]
+        """
+        if not hasattr(self, 'agent_action_distributions'):
+            self.agent_action_distributions = {}
+        
+        self.agent_action_distributions[agent_id] = action_distribution.detach().clone()
 
 
 class PyTorchPathBasedNetwork(nn.Module):
