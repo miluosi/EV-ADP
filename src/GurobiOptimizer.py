@@ -80,7 +80,23 @@ class GurobiOptimizer:
                     assigned_requests.append(self.env.vehicles[vehicle_id]['assigned_request'])
                 if self.env.vehicles[vehicle_id]['passenger_onboard'] is not None:
                     assigned_requests.append(self.env.vehicles[vehicle_id]['passenger_onboard'])
-                
+        # vehicle_id_ev = []
+        # for vehicle_id in vehicle_ids:
+        #     if self.env.vehicles[vehicle_id]['type'] == 1:
+        #         vehicle_id_ev.append(vehicle_id)              
+        # assigned_requests_ev = {}
+        # for vehicle_id in vehicle_id_ev:
+        #     vehicle = self.env.vehicles[vehicle_id]
+        #     if self.env.vehicles[vehicle_id]['assigned_request'] is not None:
+        #         assigned_requests_ev[self.env.vehicles[vehicle_id]['assigned_request']] = vehicle_id
+        #     if self.env.vehicles[vehicle_id]['passenger_onboard'] is not None:
+        #         assigned_requests_ev[self.env.vehicles[vehicle_id]['passenger_onboard']] = vehicle_id
+        # for assigned_request in assigned_requests_ev.keys():
+        #     if ifaccept (self.env.value_function_ev.update_accept_assignment(assigned_request)):
+        #         continue
+        #     else:
+        #         assigned_requests_ev.pop(assigned_request)
+
 
         available_requests = list(self.env.active_requests.values())
         available_requests = [req for req in available_requests if req.request_id not in assigned_requests]
@@ -691,7 +707,7 @@ class GurobiOptimizer:
                 
                 for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
                     try:
-                        q_value = self.env.evaluate_service_option(vehicle_id, request)
+                        q_value = self.env.evaluate_service_option(vehicle_id, request, True)
                         option_q_cache[(vehicle_id, request.request_id)] = q_value
                         
                         # 使用批量计算的拒绝概率
@@ -816,8 +832,73 @@ class GurobiOptimizer:
         service_consumption = 0.05 # Battery consumption per service
         request_decision =[[model.addVar(vtype=self.GRB.BINARY,
                      name=f'request_{vehicle_id}_{request.request_id}') for request in available_requests] for i, vehicle_id in enumerate(vehicle_ids)]
-            
-        # Decision variables for charging assignments
+
+        # available_requests_ev = []
+
+        # # 使用神经网络预测筛选EV可能接受的请求
+        # if hasattr(self.env, 'rejection_pretrained') and self.env.rejection_pretrained:
+        #     # 如果已经训练了拒绝预测器，使用它来筛选请求
+        #     if hasattr(self.env, 'value_function_ev') and self.env.value_function_ev is not None:
+        #         value_func_ev = self.env.value_function_ev
+                
+        #         # 检查是否有rejection_predictor
+        #         if hasattr(value_func_ev, 'rejection_predictor') and value_func_ev.rejection_predictor is not None:
+        #             # 收集拒绝概率用于调试
+        #             rejection_probs = []
+                    
+        #             for request in available_requests:
+        #                 # 对每个请求，检查是否有EV可能接受它
+        #                 min_rejection_prob = 1.0
+        #                 likely_accepted_by_any_ev = False
+                        
+        #                 for vehicle_id in vehicle_ids:
+        #                     vehicle = self.env.vehicles[vehicle_id]
+        #                     if vehicle['type'] == 1:  # EV
+        #                         # 使用rejection_predictor预测拒绝概率
+        #                         try:
+        #                             rejection_prob = value_func_ev.predict_rejection_probability(
+        #                                 vehicle_id=vehicle_id,
+        #                                 request_id=request.request_id,
+        #                                 vehicle_location=vehicle['location'],
+        #                                 pickup_location=request.pickup,
+        #                                 current_time=self.env.current_time
+        #                             )
+                                    
+        #                             min_rejection_prob = min(min_rejection_prob, rejection_prob)
+                                    
+        #                             # 如果拒绝概率小于0.5，说明可能接受
+        #                             if rejection_prob < 0.5:
+        #                                 likely_accepted_by_any_ev = True
+        #                                 break
+        #                         except Exception as e:
+        #                             # 如果预测失败，保守地认为可能接受
+        #                             likely_accepted_by_any_ev = True
+        #                             min_rejection_prob = 0.0
+        #                             break
+                        
+        #                 if likely_accepted_by_any_ev:
+        #                     available_requests_ev.append(request)
+                        
+        #                 rejection_probs.append(min_rejection_prob)
+                    
+        #             # 输出筛选结果和统计信息
+        #             if len(available_requests) > 0:
+        #                 avg_prob = sum(rejection_probs) / len(rejection_probs) if rejection_probs else 0
+        #                 filtered_count = len(available_requests) - len(available_requests_ev)
+        #                 if filtered_count > 0:
+        #                     print(f"  📊 EV请求筛选: {len(available_requests)} → {len(available_requests_ev)} (过滤{filtered_count}个, 平均拒绝概率: {avg_prob:.3f})")
+        #         else:
+        #             # 如果没有rejection_predictor，使用所有请求
+        #             available_requests_ev = available_requests.copy()
+        #     else:
+        #         # 如果没有value_function_ev，使用所有请求
+        #         available_requests_ev = available_requests.copy()
+        # else:
+        #     # 如果没有训练rejection_pretrained，使用所有请求
+        #     available_requests_ev = available_requests.copy()
+
+
+
         charge_decision = {}
         if charging_stations:
             for i, vehicle_id in enumerate(vehicle_ids):
@@ -1035,7 +1116,6 @@ class GurobiOptimizer:
                     
                     batch_q_values_ev = self.env.batch_evaluate_service_options(vehicle_request_pairs_ev,True)
                     batch_q_values_aev = self.env.batch_evaluate_service_options(vehicle_request_pairs_aev,False)
-                    
                     # 批量计算拒绝概率（只对EV）
                     batch_rejection_probs = self._batch_calculate_reject_pro_network(vehicle_request_pairs_ev)
                     
@@ -1069,7 +1149,7 @@ class GurobiOptimizer:
 
         for i, vehicle_id in enumerate(vehicle_ids):
             vehicle = self.env.vehicles[vehicle_id]
-
+            request_list = {}
             for j, request in enumerate(available_requests):
                 if adp_weight <= 0:
                     # 回退到基础计算
@@ -1084,10 +1164,16 @@ class GurobiOptimizer:
                 else:
                     # 使用批量计算的Q值和拒绝感知的调整价值
                     base_q_value = option_q_cache.get((vehicle_id, request.request_id), 0.0)
+                    pickupdistance = abs((request.pickup // self.env.grid_size) - vehicle['coordinates'][1]) + abs((request.pickup % self.env.grid_size) - vehicle['coordinates'][0])
                     
-                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
+                    if base_q_value > 0:
+                        request_list[request.request_id] = (request, base_q_value, pickupdistance)
+                    
                     objective_terms += base_q_value * adp_weight * request_decision[i][j]
-                
+            request_list = dict(sorted(request_list.items(), key=lambda x: x[1][1], reverse=True))
+            # if len(request_list) > 0 and vehicle['type'] == 1:
+            #     print("sorted request list for vehicle",vehicle_id,":",[(req_id, data[0].final_value, data[1], data[2]) for req_id, data in list(request_list.items())[:25]])
+                    #adjusted_value = rejection_adjusted_values.get((vehicle_id, request.request_id), base_q_value)
                 # Process charging assignments
             if charging_stations:
                 for j, station in enumerate(charging_stations):
@@ -1151,7 +1237,6 @@ class GurobiOptimizer:
                             vehicle_id=vehicle_ids[i],
                             target_loc=idle_loc
                         )
-                        idle_q_value =-10000
                     except Exception as e:
                         print(f"Warning: Failed to get idle Q-value for vehicle {vehicle_ids[i]} at location {j}: {e}")
                         # 使用默认的idle奖励作为后备
@@ -1463,7 +1548,7 @@ class GurobiOptimizer:
                 
                 for i, (vehicle_id, request) in enumerate(vehicle_request_pairs):
                     try:
-                        q_value = self.env.evaluate_service_option(vehicle_id, request)
+                        q_value = self.env.evaluate_service_option(vehicle_id, request, False)
                         option_q_cache[(vehicle_id, request.request_id)] = q_value
                         
                         # 使用批量计算的拒绝概率

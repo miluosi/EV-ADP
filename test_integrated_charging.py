@@ -88,10 +88,29 @@ def load_q_network_checkpoint(value_function, checkpoint_path):
         episode = checkpoint.get('episode', 0)
         buffer_size = checkpoint.get('experience_buffer_size', 0)
         
+        # 🔥 清空旧的经验回放数据（因为奖励结构已改变）
+        if hasattr(value_function, 'experience_buffer'):
+            old_buffer_size = len(value_function.experience_buffer)
+            value_function.experience_buffer.clear()
+            print(f"⚠️  已清空旧经验回放缓冲区（{old_buffer_size}条数据），使用新奖励结构重新收集")
+        
+        # 🔥 处理rejection_predictor加载（检查维度是否匹配）
+        if 'rejection_predictor_state_dict' in checkpoint and hasattr(value_function, 'rejection_predictor'):
+            try:
+                value_function.rejection_predictor.load_state_dict(checkpoint['rejection_predictor_state_dict'])
+                print(f"✓ Rejection predictor权重已恢复")
+            except Exception as e:
+                print(f"⚠️  Rejection predictor维度不匹配（可能由于特征数量改变），将重新初始化")
+                # 重新初始化rejection_predictor
+                value_function._init_rejection_predictor()
+                # 清空rejection_buffer
+                value_function.rejection_buffer.clear()
+                print(f"✓ Rejection predictor已重新初始化，rejection buffer已清空")
+        
         print(f"✓ 成功加载检查点: {checkpoint_path}")
         print(f"  - Episode: {episode}")
         print(f"  - Training step: {value_function.training_step}")
-        print(f"  - Experience buffer size: {buffer_size}")
+        print(f"  - 网络权重已恢复，经验数据已清空（奖励结构已更新）")
         
         return True
         
@@ -147,6 +166,12 @@ def save_q_network_checkpoint(value_function, episode, checkpoint_dir="checkpoin
             'training_losses': value_function.training_losses[-100:] if value_function.training_losses else [],
             'q_values_history': value_function.q_values_history[-100:] if value_function.q_values_history else []
         }
+        
+        # 保存rejection_predictor（如果存在）
+        if hasattr(value_function, 'rejection_predictor'):
+            full_state['rejection_predictor_state_dict'] = value_function.rejection_predictor.state_dict()
+            full_state['rejection_buffer_size'] = len(value_function.rejection_buffer) if hasattr(value_function, 'rejection_buffer') else 0
+        
         torch.save(full_state, paths['full_state'])
         
         print(f"✓ Episode {episode}: 成功保存Q-network检查点")
@@ -234,15 +259,20 @@ def set_random_seeds(seed=42):
     print(f"✓ Random seeds set to {seed} for all generators (Python, NumPy, PyTorch)")
 
 
-def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 20,num_ev = 10, transportation_mode = 'integrated'):
-    """Run charging integration test with EV/AEV analysis"""
+def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,assignmentgurobi,batch_size=256, num_vehicles = 6,num_ev = 3, transportation_mode = 'integrated', start_training_episode=2):
+    """Run charging integration test with EV/AEV analysis
+    
+    Args:
+        start_training_episode: 从哪个episode开始训练神经网络（默认2，即第1个episode不训练）
+    """
     print("=== Starting Enhanced Charging Behavior Integration Test ===")
+    print(f"📊 Training will start from episode {start_training_episode}")
     
     # 设置全局随机数种子，确保车辆初始化一致
     set_random_seeds(seed=42)
     
 
-    num_stations = 8
+    num_stations = 4
     env = ChargingIntegratedEnvironment(
         num_vehicles=num_vehicles, 
         num_stations=num_stations, 
@@ -381,7 +411,12 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
                 aev_buffer_before = len(value_function.experience_buffer)
                 ev_buffer_before = len(value_function_ev.experience_buffer)
                 print(f"📦 Buffer size after step {step}: AEV={aev_buffer_before}, EV={ev_buffer_before}")
-            # Debug: Output step statistics every 100 steps
+            # Debug: Output step statistics every 100 steps、、
+
+
+            
+
+
             if step % 25 == 0:
                 stats = env.get_stats()
                 active_requests = len(env.active_requests) if hasattr(env, 'active_requests') else 0
@@ -425,6 +460,7 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
                 # Neural network monitoring (if using neural network)
                 if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
                     recent_loss = value_function.training_losses[-1] if value_function.training_losses else 0.0
+                    recent_loss_ev  = value_function_ev.training_losses[-1] if value_function_ev.training_losses else 0.0
                     buffer_size = len(value_function.experience_buffer)
                     training_step = value_function.training_step
                     
@@ -437,12 +473,12 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
                         
                         try:
                             # Test different action types - these are the raw Q-values Gurobi uses
-                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, current_time=step)
+                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location,sample_location, sample_battery, current_time=step)
                             assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, current_time=step, battery_level=sample_battery)
                             charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, current_time=step, battery_level=sample_battery)
                             
                             print(f"  Neural Network Status:")
-                            print(f"    Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
+                            print(f"    Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}, EV Recent loss: {recent_loss_ev:.4f}")
                             print(f"    Raw Q-values (no normalization): Idle={idle_q:.3f}, Assign={assign_q:.3f}, Charge={charge_q:.3f}")
                             print(f"    Note: Gurobi uses these raw Q-values directly in optimization objective")
                             
@@ -467,26 +503,75 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
             # This ensures consistency between traditional Q-table and neural network training
             
             # Enhanced training: much more frequent training for better learning (only if using neural network)
-            if use_neural_network and len(value_function.experience_buffer) >= warmup_steps:
+            # 只在指定的episode之后才开始训练
+            if use_neural_network and len(value_function.experience_buffer) >= warmup_steps and episode >= start_training_episode:
                 # Train more frequently based on our new parameters
                 if step % training_frequency == 0:
                     # 在训练前记录缓冲区大小
                     if step % 100 == 0:
                         aev_buffer_size = len(value_function.experience_buffer)
                         ev_buffer_size = len(value_function_ev.experience_buffer)
-                        print(f"🔄 Before training: AEV buffer={aev_buffer_size}, EV buffer={ev_buffer_size}")
+                        print(f"🔄 Training (Episode {episode}): AEV buffer={aev_buffer_size}, EV buffer={ev_buffer_size}")
                     
-                    training_loss = value_function.train_step(batch_size=batch_size)  # Larger batch
+                    training_loss = value_function.train_step(batch_size=batch_size, ifEV=False)  # Larger batch
                     if training_loss > 0:
                         episode_losses.append(training_loss)
-                    training_loss_ev = value_function_ev.train_step(batch_size=batch_size)  # Larger batch
-                    if training_loss_ev > 0:
-                        episode_losses_ev.append(training_loss_ev)
+                    
+                    # EV训练3次 - 因为EV的拒绝经验需要更多训练来学习
+                    for _ in range(3):
+                        training_loss_ev = value_function_ev.train_step(batch_size=batch_size, ifEV=True)  # Larger batch
+                        if training_loss_ev > 0:
+                            episode_losses_ev.append(training_loss_ev)
+            elif use_neural_network and episode < start_training_episode and step % 100 == 0:
+                # 在训练开始前，仍然收集经验但不训练
+                aev_buffer_size = len(value_function.experience_buffer)
+                ev_buffer_size = len(value_function_ev.experience_buffer)
+                print(f"📦 Collecting experience (Episode {episode}, no training yet): AEV buffer={aev_buffer_size}, EV buffer={ev_buffer_size}")
             episode_reward += sum(rewards.values())
             episode_charging_events.extend(info.get('charging_events', []))
             
-            if done:
-                break
+        if episode %10==0:
+            print("store checkpoint at episode:",episode+1)
+            if transportation_mode == 'integrated':
+                # 保存AEV的Q-network
+                checkpoint_paths_aev = save_q_network_checkpoint(
+                    value_function, 
+                    episode + 1, 
+                    checkpoint_dir=f"checkpoints/q_networks_{transportation_mode}_{num_ev}_{use_intense_requests}_aev"
+                )
+                # 保存EV的Q-network
+                checkpoint_paths_ev = save_q_network_checkpoint(
+                    value_function_ev, 
+                    episode + 1, 
+                    checkpoint_dir=f"checkpoints/q_networks_{transportation_mode}_{num_ev}_{use_intense_requests}_ev"
+                )
+                print(f"✓ 已保存 {transportation_mode} 模式的两个Q-network (AEV + EV)")
+            elif transportation_mode == 'evfirst':
+                # 只保存EV的Q-network
+                checkpoint_paths_ev = save_q_network_checkpoint(
+                    value_function_ev, 
+                    episode + 1, 
+                    checkpoint_dir=f"checkpoints/q_networksevfirst_{transportation_mode}_{num_ev}_{use_intense_requests}_ev"
+                )
+                checkpoint_paths_aev =save_q_network_checkpoint(
+                    value_function, 
+                    episode + 1, 
+                    checkpoint_dir=f"checkpoints/q_networksevfirst_{transportation_mode}_{num_ev}_{use_intense_requests}_aev"
+                )
+            elif transportation_mode == 'aevfirst':
+                # 只保存AEV的Q-network
+                checkpoint_paths_aev = save_q_network_checkpoint(
+                    value_function, 
+                    episode + 1, 
+                    checkpoint_dir=f"checkpoints/q_networksaevfirst_{transportation_mode}_{num_ev}_{use_intense_requests}_aev"
+                )
+                checkpoint_paths_ev =save_q_network_checkpoint(
+                    value_function_ev,
+                    episode + 1,
+                    checkpoint_dir=f"checkpoints/q_networksaevfirst_{transportation_mode}_{num_ev}_{use_intense_requests}_ev"
+                )
+
+        # Episode结束，记录统计信息
         results['Idle_average'].append(sum(Idle_list)/len(Idle_list) if Idle_list else 0)
         results['episode_rewards'].append(episode_reward)
         results['charging_events'].extend(episode_charging_events)
@@ -516,7 +601,7 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
         print(f"  Orders: Total={episode_stats['total_orders']}, Accepted={episode_stats['accepted_orders']}, Completed={episode_stats['completed_orders']}, Rejected={episode_stats['rejected_orders']}")
         print(f"  Battery: {episode_stats['avg_battery_level']:.2f}")
         print(f"  Rebalancing: Calls={rebalancing_calls}, Total Assignments={total_assignments}, Avg Assignments={avg_assignments:.2f}, Avg Rebalance Whole={avg_whole:.2f}")
-
+        print("avg_request_value:",stats['completed_orders_req'])
         # Add neural network Q-value summary
         if use_neural_network:
             idle_q = episode_stats.get('sample_idle_q_value', 0.0)
@@ -539,7 +624,7 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
                     sample_battery = list(env.vehicles.values())[0]['battery'] if env.vehicles else 1.0
                     
                     # Get sample Q-values for statistics
-                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, current_time=env.current_time)
+                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location,sample_location, sample_battery, current_time=env.current_time)
                     assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, current_time=env.current_time, battery_level=sample_battery)
                     charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, current_time=env.current_time, battery_level=sample_battery)
                     
@@ -576,7 +661,7 @@ def run_charging_integration_test(adpvalue,num_episodes, use_intense_requests,as
         vehicle_visit_stats = analyze_vehicle_visit_patterns(env)
         results['vehicle_visit_stats'].append(vehicle_visit_stats)
         
-
+    print("final reward:",results['episode_rewards'])
     print("\n=== Integration Test Complete ===")
     if use_neural_network:
         print(f"✓ Neural Network ValueFunction trained over {num_episodes} episodes")
@@ -779,6 +864,7 @@ def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_re
 
                 if use_neural_network and hasattr(value_function, 'training_losses') and value_function.training_losses:
                     recent_loss = value_function.training_losses[-1] if value_function.training_losses else 0.0
+                    recent_loss_ev  = value_function_ev.training_losses[-1] if value_function_ev.training_losses else 0.0
                     buffer_size = len(value_function.experience_buffer)
                     training_step = value_function.training_step
                     
@@ -791,7 +877,7 @@ def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_re
                         
                         try:
                             # Test different action types - these are the raw Q-values Gurobi uses
-                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, current_time=step)
+                            idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_location,sample_battery, current_time=step)
                             assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, current_time=step, battery_level=sample_battery)
                             charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, current_time=step, battery_level=sample_battery)
                             
@@ -812,7 +898,7 @@ def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_re
                                     print(f"      Action Success Rates: Assign={action_stats['assign_positive_ratio']:.1%}, Charge={action_stats['charge_positive_ratio']:.1%}, Idle={action_stats['idle_positive_ratio']:.1%}")
                                     
                         except Exception as e:
-                            print(f"  Neural Network Status: Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}")
+                            print(f"  Neural Network Status: Training step: {training_step}, Buffer: {buffer_size}, Recent loss: {recent_loss:.4f}, EV Recent loss: {recent_loss_ev:.4f}")
                             print(f"    Error getting sample Q-values: {e}")
                 else:
                     print(f"  Neural Network: {'Not training yet' if use_neural_network else 'Disabled'}")
@@ -877,7 +963,7 @@ def run_charging_integration_test_threshold(adpvalue,num_episodes,use_intense_re
                     sample_battery = list(env.vehicles.values())[0]['battery'] if env.vehicles else 1.0
                     
                     # Get sample Q-values for statistics
-                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location, sample_battery, current_time=env.current_time)
+                    idle_q = value_function.get_idle_q_value(sample_vehicle_id, sample_location,sample_location, sample_battery, current_time=env.current_time)
                     assign_q = value_function.get_q_value(sample_vehicle_id, "assign_1", sample_location, sample_location+1, current_time=env.current_time, battery_level=sample_battery)
                     charge_q = value_function.get_q_value(sample_vehicle_id, "charge_1", sample_location, sample_location+5, current_time=env.current_time, battery_level=sample_battery)
                     
@@ -1127,11 +1213,11 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
     """Save detailed episode statistics to Excel file including vehicle visit patterns, ADP values, and spatial analysis"""
     if not episode_stats:
         print("⚠ No episode statistics to save")
-        return
+        return None, None
     
     # Create DataFrame from episode statistics
     df = pd.DataFrame(episode_stats)
-    ev_num = env.ev_num_vehicles
+    num_ev = env.ev_num_vehicles
     # Extract ADP value and demand pattern information
     adpvalue = getattr(env, 'adp_value', 1.0)
     demand_pattern = "intense" if getattr(env, 'use_intense_requests', True) else "random"
@@ -1140,7 +1226,7 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
     
     # Add timestamp to filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_filename = f"episode_statistics_adp_{transportation_mode}_{adpvalue}_demand{demand_pattern}_{env.heuristic_battery_threshold}_{ev_num}_{timestamp}.xlsx"
+    excel_filename = f"episode_statistics_adp_{transportation_mode}_{adpvalue}_demand{demand_pattern}_{env.heuristic_battery_threshold}_{num_ev}_{timestamp}.xlsx"
     excel_path = results_dir / excel_filename
     
     # Generate spatial visualization
@@ -1364,15 +1450,20 @@ def save_episode_stats_to_excel(env, episode_stats, results_dir, vehicle_visit_s
             print(f"  - Location_Heatmap: Aggregated location popularity")
         
         return excel_path, spatial_image_path
-        print(f"  - Summary: Overall performance metrics")
-        print(f"  - Vehicle_Comparison: EV vs AEV performance comparison")
         
     except Exception as e:
         print(f"❌ Error saving Excel file: {e}")
+        import traceback
+        traceback.print_exc()
         # Save as CSV as backup
         csv_path = results_dir / f"episode_statistics_{timestamp}.csv"
-        df.to_csv(csv_path, index=False)
-        print(f"✓ Backup saved as CSV: {csv_path}")
+        try:
+            df.to_csv(csv_path, index=False)
+            print(f"✓ Backup saved as CSV: {csv_path}")
+            return csv_path, None
+        except Exception as csv_error:
+            print(f"❌ Error saving backup CSV: {csv_error}")
+            return None, None
 
 
 def analyze_results(results):
@@ -1684,15 +1775,34 @@ def main():
         results_folder = "results/integrated_tests/" if assignmentgurobi else "results/integrated_tests_h/"
         print(f"📁 请检查 {results_folder} 文件夹中的详细结果")
         print("="*60)
-        adplist = [1]
+        
+        # 训练控制参数
+        start_training_episode = 0  # 从第2个episode开始训练（第1个episode只收集经验）
+        num_episodes = 50  # 总共运行50个episodes
+        
+        print(f"🎯 训练设置：")
+        print(f"   - 总Episodes: {num_episodes}")
+        print(f"   - 开始训练: Episode {start_training_episode}")
+        print(f"   - Episode 1 将只收集经验，不进行训练")
+        print(f"   - 这样可以对比Episode 1（未训练）和后续Episodes（已训练）的表现")
+        print("="*60)
+        
+        adplist = [0]
         for adpvalue in adplist:
             assignment_type = "Gurobi" if assignmentgurobi else "Heuristic"
             print(f"\n⚡ 开始集成测试 (ADP={adpvalue}, Assignment={assignment_type})")
             transportation_mode_list = ['integrated','evfirst','aevfirst']
-            # transportation_mode_list = ['integrated']
+            #transportation_mode_list = ['integrated']
             for transportation_mode in transportation_mode_list:
             #     print(f"\n🚦 交通模式: {transportation_mode.upper()}")
-                results, env = run_charging_integration_test(adpvalue, num_episodes=num_episodes, use_intense_requests=use_intense_requests, assignmentgurobi=assignmentgurobi, transportation_mode=transportation_mode)
+                results, env = run_charging_integration_test(
+                    adpvalue, 
+                    num_episodes=num_episodes, 
+                    use_intense_requests=use_intense_requests, 
+                    assignmentgurobi=assignmentgurobi, 
+                    transportation_mode=transportation_mode,
+                    start_training_episode=start_training_episode
+                )
 
             
             

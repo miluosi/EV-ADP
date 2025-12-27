@@ -321,7 +321,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         )
         
         # Training data buffer - increased size for more diverse experiences
-        self.experience_buffer = deque(maxlen=20000)  # Doubled buffer size
+        self.experience_buffer = deque(maxlen=50000)  # Doubled buffer size
         
         # Training metrics tracking
         self.training_losses = []
@@ -347,10 +347,10 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 self.network = nn.Sequential(
                     nn.Linear(input_dim, hidden_dim),
                     nn.ReLU(),
-                    nn.Dropout(0.1),
+                    
                     nn.Linear(hidden_dim, hidden_dim // 2),
                     nn.ReLU(),
-                    nn.Dropout(0.1),
+                    
                     nn.Linear(hidden_dim // 2, 1),
                     nn.Sigmoid()  # 输出0-1之间的拒绝概率
                 )
@@ -372,7 +372,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                    battery_level: float = 1.0, request_value: float = 0.0) -> float:
         """
         Neural network-based Q-value calculation using PyTorchPathBasedNetwork
-        现在支持vehicle_id、battery_level、request_value和action_type参数
+        现在支持vehicle_id、battery_level、request_value、action_type以及🆕 target location和zone_id信息
         """
         # 将action_type字符串转换为数值编码
         if action_type == 'idle':
@@ -389,22 +389,49 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # 实际应用中应该从环境或配置中获取
         vehicle_type_id = 1 if vehicle_id % 2 == 0 else 2  # 1=EV, 2=AEV
         
-        # 使用支持battery和request_value的输入准备方法
+        # 🆕 计算target location的曼哈顿距离并归一化
+        if hasattr(self, 'env') and self.env is not None and hasattr(self.env, '_manhattan_distance_loc'):
+            manhattan_distance = self.env._manhattan_distance_loc(vehicle_location, target_location)
+        else:
+            # Fallback: 手动计算
+            grid_size = self.grid_size if hasattr(self, 'grid_size') else int(math.sqrt(self.num_locations))
+            vehicle_x = vehicle_location % grid_size
+            vehicle_y = vehicle_location // grid_size
+            target_x = target_location % grid_size
+            target_y = target_location // grid_size
+            manhattan_distance = abs(vehicle_x - target_x) + abs(vehicle_y - target_y)
+        normalized_distance = manhattan_distance
+        
+        # 🆕 从environment获取target location的zone_id
+        target_zoneid = 0  # 默认值
+        if hasattr(self, 'env') and self.env is not None and hasattr(self.env, 'get_zone_id'):
+            target_zoneid = self.env.get_zone_id(target_location)
+        
+        # 使用支持battery、request_value、target_distance和target_zoneid的输入准备方法
         inputs = self._prepare_network_input_with_battery(
             vehicle_location, target_location, current_time, 
-            other_vehicles, num_requests, action_type, battery_level, request_value
+            other_vehicles, num_requests, action_type, battery_level, request_value,
+            normalized_distance, target_zoneid  # 🆕 传入target信息
         )
         
-        # 处理返回的输入（可能包含或不包含battery和request_value）
-        if len(inputs) == 7:  # 包含battery和request_value
+        # 处理返回的输入（包含battery、request_value、target_distance和target_zoneid）
+        if len(inputs) == 9:  # 🆕 完整输入：包含所有特征
+            path_locations, path_delays, time_tensor, others_tensor, requests_tensor, battery_tensor, value_tensor, distance_tensor, zoneid_tensor = inputs
+        elif len(inputs) == 7:  # 向后兼容：包含battery和request_value
             path_locations, path_delays, time_tensor, others_tensor, requests_tensor, battery_tensor, value_tensor = inputs
+            distance_tensor = torch.tensor([[normalized_distance]], dtype=torch.float32).to(self.device)
+            zoneid_tensor = torch.tensor([[target_zoneid]], dtype=torch.long).to(self.device)
         elif len(inputs) == 6:  # 只包含battery
             path_locations, path_delays, time_tensor, others_tensor, requests_tensor, battery_tensor = inputs
             value_tensor = torch.tensor([[request_value]], dtype=torch.float32).to(self.device)
+            distance_tensor = torch.tensor([[normalized_distance]], dtype=torch.float32).to(self.device)
+            zoneid_tensor = torch.tensor([[target_zoneid]], dtype=torch.long).to(self.device)
         else:  # 不包含battery（向后兼容）
             path_locations, path_delays, time_tensor, others_tensor, requests_tensor = inputs
             battery_tensor = torch.tensor([[battery_level]], dtype=torch.float32).to(self.device)
             value_tensor = torch.tensor([[request_value]], dtype=torch.float32).to(self.device)
+            distance_tensor = torch.tensor([[normalized_distance]], dtype=torch.float32).to(self.device)
+            zoneid_tensor = torch.tensor([[target_zoneid]], dtype=torch.long).to(self.device)
         
         # 创建vehicle和action相关的tensors
         action_type_tensor = torch.tensor([[action_type_id]], dtype=torch.long).to(self.device)
@@ -422,6 +449,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 num_requests=requests_tensor,
                 battery_level=battery_tensor,
                 request_value=value_tensor,
+                target_distance=distance_tensor,      # 🆕 传入target距离
+                target_zoneid=zoneid_tensor,          # 🆕 传入target zone_id
                 action_type=action_type_tensor,
                 vehicle_id=vehicle_id_tensor,
                 vehicle_type=vehicle_type_tensor
@@ -458,8 +487,9 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             elif isinstance(location, int):
                 return location
             else:
-                # Fallback for unexpected types
-                print(f"Warning: Unexpected location type {type(location)}: {location}")
+                # Fallback for unexpected types (silent handling)
+                if location is None:
+                    return 0
                 return 0
         
         # Convert locations to indices and ensure they are within valid range [0, num_locations-1]
@@ -495,11 +525,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         others_tensor = torch.tensor([[min(other_vehicles, self.num_vehicles) / self.num_vehicles]], dtype=torch.float32)
         requests_tensor = torch.tensor([[min(num_requests, self.max_requests) / self.max_requests]], dtype=torch.float32)
         
-        # Debug: Log extreme values for monitoring
-        if other_vehicles > self.num_vehicles:
-            print(f"WARNING: other_vehicles ({other_vehicles}) > num_vehicles ({self.num_vehicles})")
-        if num_requests > self.max_requests:
-            print(f"WARNING: num_requests ({num_requests}) > max_requests ({self.max_requests}), clamping to {self.max_requests}")
+
         
         # Move to device
         return (path_locations.to(self.device), 
@@ -537,9 +563,10 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
     def _prepare_network_input_with_battery(self, vehicle_location: int, target_location: int, 
                                            current_time: float, other_vehicles: int, 
                                            num_requests: int, action_type: str, 
-                                           battery_level: float = 1.0, request_value: float = 0.0):
+                                           battery_level: float = 1.0, request_value: float = 0.0,
+                                           target_distance: float = None, target_zoneid: int = None):
         """
-        Prepare input tensors for the neural network including battery and request value information
+        Prepare input tensors for the neural network including battery, request value, and 🆕 target information
         
         Args:
             vehicle_location: 车辆当前位置
@@ -550,7 +577,19 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             action_type: 动作类型
             battery_level: 电池电量 (0-1)
             request_value: 请求价值 (只对assign动作有效)
+            target_distance: 🆕 到target的曼哈顿距离（已归一化）
+            target_zoneid: 🆕 target location的zone ID
         """
+        # 验证和修正输入值 - 处理None或无效值（静默处理）
+        if vehicle_location is None:
+            vehicle_location = 0  # 默认值
+        if target_location is None:
+            target_location = vehicle_location if vehicle_location is not None else 0  # 使用当前位置作为默认值
+        
+        # 确保位置值在有效范围内
+        vehicle_location = int(vehicle_location) if isinstance(vehicle_location, (int, float)) else 0
+        target_location = int(target_location) if isinstance(target_location, (int, float)) else vehicle_location
+        
         # 根据动作类型选择合适的输入准备方法
         if action_type == 'idle':
             # 对于idle状态，处理目标位置为当前位置
@@ -577,17 +616,19 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             others_tensor = torch.tensor([[min(other_vehicles, self.num_vehicles) / self.num_vehicles]], dtype=torch.float32)
             requests_tensor = torch.tensor([[min(num_requests, self.max_requests) / self.max_requests]], dtype=torch.float32)
             
-            # Debug: Log extreme values for monitoring
-            if other_vehicles > self.num_vehicles:
-                print(f"WARNING: other_vehicles ({other_vehicles}) > num_vehicles ({self.num_vehicles})")
-            if num_requests > self.max_requests:
-                print(f"WARNING: num_requests ({num_requests}) > max_requests ({self.max_requests}), clamping to {self.max_requests}")
+
             
             # 归一化电池电量
             battery_tensor = torch.tensor([[battery_level]], dtype=torch.float32)
             
             # 归一化请求价值 (对idle动作，request_value应该为0)
             value_tensor = torch.tensor([[request_value / 100.0]], dtype=torch.float32)  # 假设最大价值100
+            
+            # 🆕 Target信息 (对idle动作，target_distance和target_zoneid为0)
+            # 归一化distance: 假设最大曼哈顿距离为20（10x10网格的对角线距离约18）
+            normalized_distance = (target_distance if target_distance is not None else 0.0) 
+            distance_tensor = torch.tensor([[normalized_distance]], dtype=torch.float32)
+            zoneid_tensor = torch.tensor([[target_zoneid if target_zoneid is not None else 0]], dtype=torch.long)
             
             # Move to device
             return (path_locations.to(self.device), 
@@ -596,7 +637,9 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                     others_tensor.to(self.device),
                     requests_tensor.to(self.device),
                     battery_tensor.to(self.device),
-                    value_tensor.to(self.device))
+                    value_tensor.to(self.device),
+                    distance_tensor.to(self.device),      # 🆕
+                    zoneid_tensor.to(self.device))        # 🆕
         else:
             # 对于非idle动作，使用标准方法并添加battery和request_value信息
             path_locations, path_delays, time_tensor, others_tensor, requests_tensor = self._prepare_network_input(
@@ -611,8 +654,15 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             normalized_value = request_value / 100.0 if action_type.startswith('assign') else 0.0
             value_tensor = torch.tensor([[normalized_value]], dtype=torch.float32).to(self.device)
             
+            # 🆕 添加target信息 - 归一化distance
+            # 归一化distance: 假设最大曼哈顿距离为20（10x10网格的对角线距离约18）
+            normalized_distance = (target_distance if target_distance is not None else 0.0) 
+            distance_tensor = torch.tensor([[normalized_distance]], dtype=torch.float32).to(self.device)
+            zoneid_tensor = torch.tensor([[target_zoneid if target_zoneid is not None else 0]], dtype=torch.long).to(self.device)
+            
             return (path_locations, path_delays, time_tensor, 
-                   others_tensor, requests_tensor, battery_tensor, value_tensor)
+                   others_tensor, requests_tensor, battery_tensor, value_tensor,
+                   distance_tensor, zoneid_tensor)  # 🆕
     
     def get_assignment_q_value(self, vehicle_id: int, target_id: int, 
                               vehicle_location: int, target_reject: int, target_location: int, 
@@ -676,7 +726,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         num_requests_list = []
         battery_levels = []
         request_values = []
-        
+        pickupdistances = []
+        pickzoneids = []
         for input_data in batch_inputs:
             vehicle_ids.append(input_data['vehicle_id'])
             target_ids.append(input_data['target_id'])
@@ -687,16 +738,42 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             num_requests_list.append(input_data.get('num_requests', 0))
             battery_levels.append(input_data.get('battery_level', 1.0))
             request_values.append(input_data.get('request_value', 0.0))
+            pickupdistances.append(input_data.get('pickup_dist', 0.0))
+            pickzoneids.append(input_data.get('pick_zone', 0))
         
         # 批量准备神经网络输入
         try:
             batch_network_inputs = []
             for i in range(batch_size):
                 action_type = f"assign_{target_ids[i]}"
+                # 🆕 计算target distance（如果未提供）
+                target_distance = pickupdistances[i]
+                if target_distance == 0.0:
+                    if hasattr(self, 'env') and self.env is not None and hasattr(self.env, '_manhattan_distance_loc'):
+                        manhattan_dist = self.env._manhattan_distance_loc(vehicle_locations[i], target_locations[i])
+                    elif hasattr(self, 'grid_size'):
+                        # Fallback: 手动计算
+                        grid_size = self.grid_size
+                        v_x = vehicle_locations[i] % grid_size
+                        v_y = vehicle_locations[i] // grid_size
+                        t_x = target_locations[i] % grid_size
+                        t_y = target_locations[i] // grid_size
+                        manhattan_dist = abs(v_x - t_x) + abs(v_y - t_y)
+                    else:
+                        manhattan_dist = 0
+                    target_distance = manhattan_dist
+                
+                # 🆕 获取target zone_id（如果未提供）
+                target_zoneid = pickzoneids[i]
+                if target_zoneid == 0 and hasattr(self, 'env') and self.env is not None:
+                    if hasattr(self.env, 'get_zone_id'):
+                        target_zoneid = self.env.get_zone_id(target_locations[i])
+                
                 network_input = self._prepare_network_input_with_battery(
                     vehicle_locations[i], target_locations[i], current_times[i],
                     other_vehicles_list[i], num_requests_list[i], action_type,
-                    battery_levels[i], request_values[i]
+                    battery_levels[i], request_values[i],
+                    target_distance, target_zoneid  # 🆕 传入target信息
                 )
                 batch_network_inputs.append(network_input)
             
@@ -713,6 +790,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                     num_requests=batch_tensors['num_requests'],
                     battery_level=batch_tensors['battery_level'],
                     request_value=batch_tensors['request_value'],
+                    target_distance=batch_tensors['target_distance'],  # 🆕
+                    target_zoneid=batch_tensors['target_zoneid'],      # 🆕
                     action_type=None,  # 让网络自动推断
                     vehicle_id=None,   # 批量处理时不使用vehicle_id embedding
                     vehicle_type=None  # 批量处理时不使用vehicle_type embedding
@@ -739,7 +818,40 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # 获取第一个输入的维度信息
         first_input = batch_network_inputs[0]
-        if len(first_input) >= 7:  # 包含battery和request_value
+        if len(first_input) >= 9:  # 🆕 包含battery, request_value, target_distance, target_zoneid
+            path_locations_list = []
+            path_delays_list = []
+            current_time_list = []
+            other_agents_list = []
+            num_requests_list = []
+            battery_level_list = []
+            request_value_list = []
+            target_distance_list = []  # 🆕
+            target_zoneid_list = []    # 🆕
+            
+            for network_input in batch_network_inputs:
+                path_locations, path_delays, current_time, other_agents, num_requests, battery_level, request_value, target_distance, target_zoneid = network_input
+                path_locations_list.append(path_locations.squeeze(0))
+                path_delays_list.append(path_delays.squeeze(0))
+                current_time_list.append(current_time.squeeze(0))
+                other_agents_list.append(other_agents.squeeze(0))
+                num_requests_list.append(num_requests.squeeze(0))
+                battery_level_list.append(battery_level.squeeze(0))
+                request_value_list.append(request_value.squeeze(0))
+                target_distance_list.append(target_distance.squeeze(0))  # 🆕
+                target_zoneid_list.append(target_zoneid.squeeze(0))      # 🆕
+            
+            # 堆叠为批量张量
+            batch_tensors['path_locations'] = torch.stack(path_locations_list)
+            batch_tensors['path_delays'] = torch.stack(path_delays_list)
+            batch_tensors['current_time'] = torch.stack(current_time_list)
+            batch_tensors['other_agents'] = torch.stack(other_agents_list)
+            batch_tensors['num_requests'] = torch.stack(num_requests_list)
+            batch_tensors['battery_level'] = torch.stack(battery_level_list)
+            batch_tensors['request_value'] = torch.stack(request_value_list)
+            batch_tensors['target_distance'] = torch.stack(target_distance_list)  # 🆕
+            batch_tensors['target_zoneid'] = torch.stack(target_zoneid_list)      # 🆕
+        elif len(first_input) >= 7:  # 向后兼容：只有battery和request_value
             path_locations_list = []
             path_delays_list = []
             current_time_list = []
@@ -766,6 +878,9 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             batch_tensors['num_requests'] = torch.stack(num_requests_list)
             batch_tensors['battery_level'] = torch.stack(battery_level_list)
             batch_tensors['request_value'] = torch.stack(request_value_list)
+            # 创建默认的target信息
+            batch_tensors['target_distance'] = torch.zeros(batch_size, 1).to(self.device)
+            batch_tensors['target_zoneid'] = torch.zeros(batch_size, 1, dtype=torch.long).to(self.device)
         else:
             # 向后兼容处理
             raise ValueError("Insufficient input dimensions for batch processing")
@@ -822,7 +937,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             adjustment += aev_bonus
             
         return adjustment
-    def get_idle_q_value(self, vehicle_id: int, vehicle_location: int, 
+    def get_idle_q_value(self, vehicle_id: int, vehicle_location: int, target_location: int,
                         battery_level: float, current_time: float = 0.0, 
                         other_vehicles: int = 0, num_requests: int = 0) -> float:
         """
@@ -835,12 +950,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         current_x = vehicle_location % self.grid_size
         current_y = vehicle_location // self.grid_size
         
-        # Generate random target coordinates within 2 steps (matching Environment logic)
-        target_x = max(0, min(self.grid_size-1, 
-                                    current_x + random.randint(-1, 1)))
-        target_y = max(0, min(self.grid_size-1, 
-                                    current_y + random.randint(-1, 1)))
-        target_location = target_y * self.grid_size + target_x
+
         
         # Use the generated random target location for Q-value calculation
         return self.get_q_value(vehicle_id, "idle", vehicle_location, target_location, 
@@ -854,7 +964,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         Unlike idle action, waiting means the vehicle stays at the current location
         """
         # For waiting action, target location equals current location (no movement)
-        return self.get_q_value(vehicle_id, "idle", vehicle_location, vehicle_location, 
+        return self.get_q_value(vehicle_id, "idle", vehicle_location, vehicle_location, vehicle_location,
                                current_time, other_vehicles, num_requests, battery_level)
 
 
@@ -899,7 +1009,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # 准备神经网络输入特征
         features = torch.tensor([
-            distance / 20.0,  # 归一化距离（假设最大距离为20）
+            distance ,  # 归一化距离（假设最大距离为20）
             battery_level,    # 电池电量
             current_time / 300.0,  # 归一化时间
             num_requests / 50.0,   # 归一化请求数量
@@ -948,7 +1058,7 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
     
     def store_experience(self, vehicle_id: int, action_type: str, vehicle_location: int,
                         target_location: int, current_time: float, reward: float,
-                        next_vehicle_location: int, battery_level: float = 1.0, 
+                        next_vehicle_location: int, next_target_location: int, battery_level: float = 1.0, 
                         next_battery_level: float = 1.0, other_vehicles: int = 0, 
                         num_requests: int = 0, request_value: float = 0.0,
                         next_action_type: str = None, next_request_value: float = 0.0,
@@ -976,6 +1086,32 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # 从vehicle_id推断车辆类型（简化处理）
         vehicle_type = 1 if vehicle_id % 2 == 0 else 2  # 1=EV, 2=AEV
         
+        # 🔧 确保location是int类型，如果是tuple则转换为location ID
+        def ensure_location_id(loc):
+            """确保location是int ID而不是tuple坐标"""
+            if loc is None:
+                return 0  # 默认值
+            if isinstance(loc, tuple):
+                # 如果是(x, y)坐标，转换为location ID
+                x, y = loc
+                return int(y * self.env.grid_size + x)
+            return int(loc)
+        
+        # 确保 target_location 和 next_target_location 不为 None
+        if target_location is None:
+            target_location = 0
+        if next_target_location is None:
+            next_target_location = 0
+        
+        vehicle_location = ensure_location_id(vehicle_location)
+        target_location = ensure_location_id(target_location)
+        next_vehicle_location = ensure_location_id(next_vehicle_location)
+        next_target_location = ensure_location_id(next_target_location)
+        reject_dist = self.env._manhattan_distance_loc(vehicle_location, target_location) if hasattr(self.env, '_manhattan_distance_loc') else 0
+        #if action_type.startswith('assign') and reward<-10:
+            #print(f"❌🚫 EV REJECTION - Distance: {reject_dist} | Vehicle: {vehicle_id} | Reward: {reward:.2f}")
+        #if action_type.startswith('assign') and reward>10 and self.env.vehicles[vehicle_id]['type']==1:
+            #print(f"✅ EV ASSIGNED - Distance: {reject_dist} | Vehicle: {vehicle_id} | Reward: {reward:.2f} | Battery: {battery_level:.2f}")
         experience = {
             'vehicle_id': vehicle_id,
             'vehicle_type': vehicle_type,  # 添加车辆类型
@@ -984,6 +1120,9 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             'target_location': target_location,
             'battery_level': battery_level,  # 添加当前电池电量
             'current_time': current_time,
+            'target_distance': self.env._manhattan_distance_loc(vehicle_location, target_location),
+            'pickup_dist': self.env._manhattan_distance_loc(vehicle_location, target_location),  # 添加pickup_dist用于统计
+            'target_zoneid': self.env.get_zone_id(target_location),
             'reward': reward,
             'next_vehicle_location': next_vehicle_location,
             'next_battery_level': next_battery_level,  # 添加下一状态电池电量
@@ -992,6 +1131,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             'num_requests': num_requests,
             'request_value': request_value,  # 添加请求价值信息
             'next_request_value': next_request_value,  # 下一状态请求价值
+            'next_target_distance': self.env._manhattan_distance_loc(next_vehicle_location, next_target_location),
+            'next_target_zoneid': self.env.get_zone_id(next_target_location),
             'is_idle': action_type == 'idle',  # 自动标记idle状态
             'dur_time': dur_time,  # 添加动作持续时间
             'is_system_done': is_system_done  # 添加系统结束状态
@@ -1174,10 +1315,14 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
 
     
-    def train_rejection_predictor(self, batch_size=64):
+    def train_rejection_predictor(self, batch_size=64, num_epochs=10):
         """
         训练拒绝概率预测神经网络
         使用存储的拒绝和接受数据进行监督学习
+        
+        Args:
+            batch_size: 批次大小
+            num_epochs: 训练轮数
         """
         print("Training rejection predictor...")
         print(f"Rejection buffer size: {len(self.rejection_buffer)}")
@@ -1193,12 +1338,13 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         labels = []
         
         for sample in data:
+            # 归一化特征 - 与predict_rejection_probability保持一致
             feature = [
-                sample['distance'],
-                sample['battery_level'],
-                sample['current_time'],
-                sample['num_requests'],
-                sample['vehicle_type']
+                sample['distance'] ,  # 假设最大距离为20
+                sample['battery_level'],    # 已经是0-1
+                sample['current_time'] / 300.0,  # 假设最大时间为300
+                sample['num_requests'] / 100.0,   # 归一化请求数量
+                sample['vehicle_type'] / 2.0  # 1或2 -> 0.5或1.0
             ]
             features.append(feature)
             labels.append(1.0 if sample['was_rejected'] else 0.0)
@@ -1207,39 +1353,107 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         X = torch.tensor(features, dtype=torch.float32).to(self.device)
         y = torch.tensor(labels, dtype=torch.float32).to(self.device)
         
-        # 小批量训练
+        # 创建数据集和数据加载器
         dataset = TensorDataset(X, y)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
-        epoch_loss = 0.0
-        num_batches = 0
+        # 多轮训练
+        total_loss = 0.0
+        total_batches = 0
         
-        for batch_X, batch_y in dataloader:
-            self.rejection_optimizer.zero_grad()
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            num_batches = 0
             
-            # 前向传播
-            predictions = self.rejection_predictor(batch_X).squeeze(-1)  # 只移除最后一个维度
-            # 确保维度匹配
-            if predictions.dim() == 0:  # 如果是标量，添加一个维度
-                predictions = predictions.unsqueeze(0)
-            if batch_y.dim() == 0:  # 如果batch_y是标量，添加一个维度
-                batch_y = batch_y.unsqueeze(0)
+            for batch_X, batch_y in dataloader:
+                self.rejection_optimizer.zero_grad()
+                
+                # 前向传播
+                predictions = self.rejection_predictor(batch_X).squeeze(-1)  # 只移除最后一个维度
+                # 确保维度匹配
+                if predictions.dim() == 0:  # 如果是标量，添加一个维度
+                    predictions = predictions.unsqueeze(0)
+                if batch_y.dim() == 0:  # 如果batch_y是标量，添加一个维度
+                    batch_y = batch_y.unsqueeze(0)
+                
+                loss = self.rejection_criterion(predictions, batch_y)
+                
+                # 反向传播
+                loss.backward()
+                self.rejection_optimizer.step()
+                
+                epoch_loss += loss.item()
+                num_batches += 1
             
-            loss = self.rejection_criterion(predictions, batch_y)
+            avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+            total_loss += epoch_loss
+            total_batches += num_batches
             
-            # 反向传播
-            loss.backward()
-            self.rejection_optimizer.step()
-            
-            epoch_loss += loss.item()
-            num_batches += 1
+            if self.debug_mode and (epoch == 0 or (epoch + 1) % 5 == 0 or epoch == num_epochs - 1):
+                print(f"  Epoch {epoch+1}/{num_epochs}: avg_loss={avg_epoch_loss:.4f}")
         
-        avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        avg_loss = total_loss / total_batches if total_batches > 0 else 0
         
-        if self.debug_mode:
-            print(f"Rejection predictor training: {len(data)} samples, avg_loss={avg_loss:.4f}")
+        print(f"Rejection predictor training complete: {len(data)} samples, {num_epochs} epochs, final avg_loss={avg_loss:.4f}")
         
         return avg_loss
+    
+    def predict_rejection_probability(self, vehicle_id, request_id, vehicle_location, pickup_location, current_time):
+        """
+        使用训练好的rejection_predictor预测EV拒绝某个请求的概率
+        
+        Args:
+            vehicle_id: 车辆ID
+            request_id: 请求ID
+            vehicle_location: 车辆当前位置
+            pickup_location: 接客位置
+            current_time: 当前时间
+            
+        Returns:
+            float: 拒绝概率 (0-1之间)
+        """
+        if not hasattr(self, 'rejection_predictor') or self.rejection_predictor is None:
+            # 如果没有训练rejection_predictor，返回默认值
+            return 0.0
+        
+        # 计算距离
+        if hasattr(self, 'env') and self.env is not None:
+            grid_size = self.env.grid_size
+        else:
+            grid_size = int(math.sqrt(max(vehicle_location, pickup_location) + 1))
+        
+        vehicle_x = vehicle_location % grid_size
+        vehicle_y = vehicle_location // grid_size
+        pickup_x = pickup_location % grid_size
+        pickup_y = pickup_location // grid_size
+        distance = abs(vehicle_x - pickup_x) + abs(vehicle_y - pickup_y)
+        
+        # 获取车辆信息
+        if hasattr(self, 'env') and self.env is not None and vehicle_id in self.env.vehicles:
+            vehicle = self.env.vehicles[vehicle_id]
+            battery_level = vehicle.get('battery', 0.8)
+            vehicle_type = vehicle.get('type', 1)
+        else:
+            battery_level = 0.8
+            vehicle_type = 1
+        
+        # 获取当前请求数
+        if hasattr(self, 'env') and self.env is not None:
+            num_requests = len(self.env.active_requests)
+        else:
+            num_requests = 10
+        
+        # 准备输入特征 - 使用与训练时相同的归一化
+        features = torch.tensor([
+            [distance , battery_level, current_time / 300.0, num_requests / 100.0, vehicle_type / 2.0]
+        ], dtype=torch.float32).to(self.device)
+        
+        # 预测
+        self.rejection_predictor.eval()
+        with torch.no_grad():
+            rejection_prob = self.rejection_predictor(features).item()
+        
+        return rejection_prob
     
     def get_rejection_statistics(self):
         """获取拒绝经验的统计信息"""
@@ -1590,7 +1804,16 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         return sampled_batch
 
-    def _action_balanced_sample(self, batch_size: int):
+
+    def _assign_evbalanced_sample(self, batch_size: int):
+        experiences = list(self.experience_buffer)
+
+
+
+
+
+
+    def _action_balanced_sample(self, batch_size: int, ifEV = False):
         """
         基于动作类型的平衡采样，解决动作分布不平衡问题
         确保assign、idle、charge动作在训练batch中有合理的比例
@@ -1615,10 +1838,14 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         # 计算采样比例 - 强制平衡
         if total_assign > 0 and total_idle > 0:
-            # 设定理想比例：assign 50%, idle 30%, charge 20%
-            assign_ratio = 0.6
-            idle_ratio = 0.2
-            charge_ratio = 0.2
+            if ifEV:
+                assign_ratio = 0.8
+                idle_ratio = 0.1
+                charge_ratio = 0.1
+            else:
+                assign_ratio = 0.6
+                idle_ratio = 0.2
+                charge_ratio = 0.2
             
             assign_count = min(int(batch_size * assign_ratio), total_assign)
             idle_count = min(int(batch_size * idle_ratio), total_idle)
@@ -1679,46 +1906,113 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         return sampled_batch
 
-        
-    def train_step(self, batch_size: int = 64, tau: float = 0.005):  # 软更新系数，推荐0.001~0.01，可调
+    def train_step(self, batch_size: int = 64, tau: float = 0.005,ifEV=False):  # 软更新系数，推荐0.001~0.01，可调
         """Perform one training step using stored experiences with proper DQN algorithm"""
         if len(self.experience_buffer) < batch_size   :  # Wait for more experiences
             return 0.0
         
 
-        batch = self._action_balanced_sample(batch_size)
+        batch = self._action_balanced_sample(batch_size,ifEV)
 
         
         # 如果平衡采样失败，回退到随机采样
         if not batch or len(batch) < batch_size // 2:
             batch = random.sample(list(self.experience_buffer), min(batch_size, len(self.experience_buffer)))
 
-    
+        # 统计批次中拒绝和接受订单的distance（AEV版本）
+        reject_distances = []
+        accept_distances = []
+        reject_details = []  # 存储拒绝订单的详细信息
+        accept_details = []  # 存储接受订单的详细信息
+        
+        for exp in batch:
+            if 'pickup_dist' in exp:
+                dist = exp['pickup_dist']
+                reward = exp['reward']
+                action_type = exp.get('action_type', 'unknown')
+                
+                if reward < 0:  # 拒绝订单（负奖励）
+                    reject_distances.append(dist)
+                    reject_details.append({
+                        'dist': dist,
+                        'reward': reward,
+                        'action': action_type,
+                        'vehicle_id': exp.get('vehicle_id', -1)
+                    })
+                else:  # 接受订单（正奖励）
+                    accept_distances.append(dist)
+                    accept_details.append({
+                        'dist': dist,
+                        'reward': reward,
+                        'action': action_type,
+                        'vehicle_id': exp.get('vehicle_id', -1)
+                    })
+        
+        # 每100个training step打印一次统计信息
+        # if self.training_step % 100 == 0 and (reject_distances or accept_distances):
+        #     print(f"\n📊 AEV Train Step {self.training_step} - Distance Analysis:")
+        #     if reject_distances:
+        #         print(f"   ❌ REJECT: n={len(reject_distances)}, "
+        #               f"mean={sum(reject_distances)/len(reject_distances):.2f}, "
+        #               f"min={min(reject_distances):.1f}, max={max(reject_distances):.1f}")
+        #         # 打印前5个拒绝订单的详细信息
+        #         print(f"      Sample reject orders (first 5):")
+        #         for detail in reject_details[:5]:
+        #             print(f"        pickup_dist={detail['dist']:.1f}, reward={detail['reward']:.2f}, "
+        #                   f"action={detail['action']}, vehicle={detail['vehicle_id']}")
+            
+        #     if accept_distances:
+        #         print(f"   ✅ ACCEPT: n={len(accept_distances)}, "
+        #               f"mean={sum(accept_distances)/len(accept_distances):.2f}, "
+        #               f"min={min(accept_distances):.1f}, max={max(accept_distances):.1f}")
+        #         # 打印前5个接受订单的详细信息
+        #         print(f"      Sample accept orders (first 5):")
+        #         for detail in accept_details[:5]:
+        #             print(f"        pickup_dist={detail['dist']:.1f}, reward={detail['reward']:.2f}, "
+        #                   f"action={detail['action']}, vehicle={detail['vehicle_id']}")
+            
+        #     if reject_distances and accept_distances:
+        #         reject_mean = sum(reject_distances)/len(reject_distances)
+        #         accept_mean = sum(accept_distances)/len(accept_distances)
+        #         print(f"   🔍 Difference: reject_mean - accept_mean = {reject_mean - accept_mean:.2f}")
+
         # Separate current states and next states for batch processing
         current_states = []
         next_states = []
         rewards = []
         
+
+
         for exp in batch:
             # Current state - 使用支持battery和request_value的输入准备方法
             current_battery = exp.get('battery_level', 0.5)  # 向后兼容
             current_request_value = exp.get('request_value', 0.0)  # 提取请求价值
+            current_target_distance = exp.get('target_distance', 0)  # 当前目标距离
+            current_target_zoneid = exp.get('target_zoneid', 0)  # 当前目标区域ID
             current_inputs = self._prepare_network_input_with_battery(
                 exp['vehicle_location'], exp['target_location'], exp['current_time'], 
                 exp['other_vehicles'], exp['num_requests'], exp['action_type'], 
-                current_battery, current_request_value
+                current_battery, current_request_value, current_target_distance, current_target_zoneid
             )
             
-            # 处理返回的输入（现在包含battery和request_value）
-            if len(current_inputs) == 7:  # 包含battery和request_value
+            # 处理返回的输入（现在包含battery、request_value、target_distance、target_zoneid）
+            if len(current_inputs) == 9:  # 🆕 完整输入：包含所有特征
+                current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor, current_battery_tensor, current_value_tensor, current_distance_tensor, current_zoneid_tensor = current_inputs
+            elif len(current_inputs) == 7:  # 向后兼容：包含battery和request_value
                 current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor, current_battery_tensor, current_value_tensor = current_inputs
+                current_distance_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                current_zoneid_tensor = torch.tensor([[0]], dtype=torch.long).to(self.device)
             elif len(current_inputs) == 6:  # 包含battery但没有request_value
                 current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor, current_battery_tensor = current_inputs
                 current_value_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                current_distance_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                current_zoneid_tensor = torch.tensor([[0]], dtype=torch.long).to(self.device)
             else:  # 不包含battery和request_value（向后兼容）
                 current_path_locations, current_path_delays, current_time_tensor, current_others_tensor, current_requests_tensor = current_inputs
                 current_battery_tensor = torch.tensor([[1.0]], dtype=torch.float32).to(self.device)
                 current_value_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                current_distance_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                current_zoneid_tensor = torch.tensor([[0]], dtype=torch.long).to(self.device)
             
             current_states.append({
                 'path_locations': current_path_locations.squeeze(0),
@@ -1728,6 +2022,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 'num_requests': current_requests_tensor.squeeze(0),
                 'battery_level': current_battery_tensor.squeeze(0),  # 添加battery信息
                 'request_value': current_value_tensor.squeeze(0),  # 添加request_value信息
+                'target_distance': current_distance_tensor.squeeze(0),  # 🆕 添加target_distance
+                'target_zoneid': current_zoneid_tensor.squeeze(0),  # 🆕 添加target_zoneid
                 'action_type': exp['action_type'],  # 添加action_type信息
                 'vehicle_id': exp['vehicle_id'],    # 添加vehicle_id信息
                 'vehicle_type': exp.get('vehicle_type', 1)  # 添加vehicle_type信息（向后兼容）
@@ -1737,21 +2033,33 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             next_battery = exp.get('next_battery_level', 1.0)  # 向后兼容
             next_request_value = exp.get('next_request_value', 0.0)  # 下一状态请求价值
             next_action_type = exp.get('next_action_type', exp['action_type'])  # 获取下一个动作类型，如果没有则使用当前动作类型作为备用
+            next_target_distance = exp.get('next_target_distance', 0)  # 下一状态目标距离
+            next_target_zoneid = exp.get('next_target_zoneid', 0)  # 下一状态目标区域ID
             next_inputs = self._prepare_network_input_with_battery(
                 exp['next_vehicle_location'], exp['target_location'], 
                 exp['current_time'] + 1, exp['other_vehicles'], exp['num_requests'], 
-                next_action_type, next_battery, next_request_value
+                next_action_type, next_battery, next_request_value, next_target_distance, next_target_zoneid
             )
             
             
-            # 处理next state的返回值（现在包含battery和request_value）
-            if len(next_inputs) == 7:  # 包含battery和request_value
+            # 处理next state的返回值（现在包含battery、request_value、target_distance、target_zoneid）
+            if len(next_inputs) == 9:  # 🆕 完整输入：包含所有特征
+                next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor, next_battery_tensor, next_value_tensor, next_distance_tensor, next_zoneid_tensor = next_inputs
+            elif len(next_inputs) == 7:  # 向后兼容：包含battery和request_value
                 next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor, next_battery_tensor, next_value_tensor = next_inputs
+                next_distance_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                next_zoneid_tensor = torch.tensor([[0]], dtype=torch.long).to(self.device)
             elif len(next_inputs) == 6:  # 包含battery但没有request_value
                 next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor, next_battery_tensor = next_inputs
+                next_value_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                next_distance_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                next_zoneid_tensor = torch.tensor([[0]], dtype=torch.long).to(self.device)
             else:  # 不包含battery和request_value（向后兼容）
                 next_path_locations, next_path_delays, next_time_tensor, next_others_tensor, next_requests_tensor = next_inputs
                 next_battery_tensor = torch.tensor([[1.0]], dtype=torch.float32).to(self.device)
+                next_value_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                next_distance_tensor = torch.tensor([[0.0]], dtype=torch.float32).to(self.device)
+                next_zoneid_tensor = torch.tensor([[0]], dtype=torch.long).to(self.device)
             
             next_states.append({
                 'path_locations': next_path_locations.squeeze(0),
@@ -1761,6 +2069,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 'num_requests': next_requests_tensor.squeeze(0),
                 'battery_level': next_battery_tensor.squeeze(0),  # 添加battery信息
                 'request_value': next_value_tensor.squeeze(0),  # 添加request_value信息
+                'target_distance': next_distance_tensor.squeeze(0),  # 🆕 添加target_distance
+                'target_zoneid': next_zoneid_tensor.squeeze(0),  # 🆕 添加target_zoneid
                 'action_type': next_action_type,  # 使用下一个动作类型而不是当前动作类型
                 'vehicle_id': exp['vehicle_id'],    # 添加vehicle_id信息
                 'vehicle_type': exp.get('vehicle_type', 1)  # 添加vehicle_type信息（向后兼容）
@@ -1776,6 +2086,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         current_batch_num_requests = torch.stack([state['num_requests'] for state in current_states])
         current_batch_battery_levels = torch.stack([state['battery_level'] for state in current_states])  # 添加battery批处理
         current_batch_request_values = torch.stack([state['request_value'] for state in current_states])  # 添加request_value批处理
+        current_batch_target_distances = torch.stack([state['target_distance'] for state in current_states])  # 🆕 添加target_distance批处理
+        current_batch_target_zoneids = torch.stack([state['target_zoneid'] for state in current_states])  # 🆕 添加target_zoneid批处理
         
         # Convert action_type strings to tensors for current states
         current_action_types = []
@@ -1807,6 +2119,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         next_batch_num_requests = torch.stack([state['num_requests'] for state in next_states])
         next_batch_battery_levels = torch.stack([state['battery_level'] for state in next_states])  # 添加next states的battery批处理
         next_batch_request_values = torch.stack([state['request_value'] for state in next_states])  # 添加next states的request_value批处理
+        next_batch_target_distances = torch.stack([state['target_distance'] for state in next_states])  # 🆕 添加next states的target_distance批处理
+        next_batch_target_zoneids = torch.stack([state['target_zoneid'] for state in next_states])  # 🆕 添加next states的target_zoneid批处理
         # Convert action_type strings to tensors for next states
 
         next_vehicle_ids = []
@@ -1840,6 +2154,8 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
             num_requests=current_batch_num_requests,
             battery_level=current_batch_battery_levels,
             request_value=current_batch_request_values,
+            target_distance=current_batch_target_distances,  # 🆕
+            target_zoneid=current_batch_target_zoneids,      # 🆕
             action_type=current_batch_action_types.unsqueeze(1),
             vehicle_id=current_batch_vehicle_ids.unsqueeze(1),
             vehicle_type=current_batch_vehicle_types.unsqueeze(1)
@@ -1856,14 +2172,19 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
                 num_requests=next_batch_num_requests,
                 battery_level=next_batch_battery_levels,
                 request_value=next_batch_request_values,
+                target_distance=next_batch_target_distances,  # 🆕
+                target_zoneid=next_batch_target_zoneids,      # 🆕
                 action_type=next_batch_action_types.unsqueeze(1),
                 vehicle_id=next_batch_vehicle_ids.unsqueeze(1),
                 vehicle_type=next_batch_vehicle_types.unsqueeze(1)
             )
         
         # Calculate TD targets without normalization
-        gamma = 0.95  # Slightly lower discount factor for stability
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32).to(self.device).unsqueeze(1)
+        gamma = 0.90  # 降低折扣因子，减少未来idle惩罚对当前决策的影响
+        
+        # 奖励缩放：将奖励值缩放到更合理的范围，避免数值过大导致Q值不稳定
+        reward_scale = 1  # 将奖励缩放10倍，使得10-50的订单价值变成1-5
+        rewards_tensor = torch.tensor([r * reward_scale for r in rewards], dtype=torch.float32).to(self.device).unsqueeze(1)
         
         # Extract duration times and system done flags from batch
         dur_times = [exp.get('dur_time', 1.0) for exp in batch]
@@ -1892,6 +2213,42 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         # Compute loss with raw values
         loss = self.loss_fn(current_q_values, target_q_values)
         loss_value = loss.item()  # Define loss_value immediately after loss computation
+        
+        # 每100个training step或loss异常时，打印详细的loss分析（AEV版本）
+        # if self.training_step % 200 == 0 or loss_value > 100.0:
+        #     with torch.no_grad():
+        #         td_errors = (current_q_values - target_q_values).abs()
+        #         print(f"\n📈 AEV Loss Analysis at step {self.training_step}:")
+        #         print(f"   Loss: {loss_value:.4f}")
+        #         print(f"   Current Q: mean={current_q_values.mean().item():.2f}, "
+        #               f"std={current_q_values.std().item():.2f}, "
+        #               f"range=[{current_q_values.min().item():.2f}, {current_q_values.max().item():.2f}]")
+        #         print(f"   Target Q:  mean={target_q_values.mean().item():.2f}, "
+        #               f"std={target_q_values.std().item():.2f}, "
+        #               f"range=[{target_q_values.min().item():.2f}, {target_q_values.max().item():.2f}]")
+        #         print(f"   Rewards:   mean={rewards_tensor.mean().item():.2f}, "
+        #               f"range=[{rewards_tensor.min().item():.2f}, {rewards_tensor.max().item():.2f}]")
+        #         print(f"   TD Error:  mean={td_errors.mean().item():.2f}, max={td_errors.max().item():.2f}")
+                
+        #         # 统计批次中各类动作的数量和奖励
+        #         action_stats = {}
+        #         for exp in batch:
+        #             action = exp['action_type']
+        #             if action not in action_stats:
+        #                 action_stats[action] = {'count': 0, 'rewards': []}
+        #             action_stats[action]['count'] += 1
+        #             action_stats[action]['rewards'].append(exp['reward'])
+                
+        #         print(f"   Batch composition:")
+        #         for action, stats in action_stats.items():
+        #             pick_updist = [exp['pickup_dist'] for exp in batch if exp['action_type'] == action and 'pickup_dist' in exp]
+        #             avg_reward = sum(stats['rewards']) / len(stats['rewards'])
+        #             if pick_updist:
+        #                 avg_dist = sum(pick_updist) / len(pick_updist)
+        #                 print(f"      {action}: n={stats['count']}, avg_reward={avg_reward:.2f}, "
+        #                       f"avg_pickup_dist={avg_dist:.2f} (min={min(pick_updist):.1f}, max={max(pick_updist):.1f})")
+        #             else:
+        #                 print(f"      {action}: n={stats['count']}, avg_reward={avg_reward:.2f}, pickup_dist=N/A")
         
         # 检查损失是否异常
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1945,11 +2302,11 @@ class PyTorchChargingValueFunction(PyTorchValueFunction):
         
         self.training_step += 1
         
-        # 每50步训练一次拒绝预测器
-        if self.training_step % 50 == 0:
-            rejection_loss = self.train_rejection_predictor()
-            if rejection_loss is not None:
-                print(f"  Rejection predictor loss: {rejection_loss:.4f}")
+        # 每10步训练一次拒绝预测器
+        # if self.training_step % 10 == 0:
+        #     rejection_loss = self.train_rejection_predictor()
+        #     if rejection_loss is not None:
+        #         print(f"  Rejection predictor loss: {rejection_loss:.4f}")
         
         # Print training progress occasionally  
         if self.training_step % 100 == 0:
@@ -2431,6 +2788,22 @@ class PyTorchPathBasedNetwork(nn.Module):
             padding_idx=0
         )
         
+        # 🆕 Target location embedding layer (for pickup/dropoff/charge station locations)
+        # 将target location编码为embedding，与path location共享相同的embedding空间
+        self.target_location_embedding = nn.Embedding(
+            num_embeddings=num_locations + 1,
+            embedding_dim=embedding_dim // 4,
+            padding_idx=0
+        )
+        
+        # 🆕 Zone ID embedding layer (for geographical zones)
+        # 假设最多有100个zone (0 for padding, 1-100 for actual zones)
+        self.zone_embedding = nn.Embedding(
+            num_embeddings=101,
+            embedding_dim=embedding_dim // 8,
+            padding_idx=0
+        )
+
         # Action type embedding layer
         # 0: padding, 1: idle, 2: assign, 3: charge
         self.action_type_embedding = nn.Embedding(
@@ -2461,29 +2834,38 @@ class PyTorchPathBasedNetwork(nn.Module):
         self.context_embedding = nn.Sequential(
             nn.Linear(2, embedding_dim // 2),  # battery + request_value
             nn.ELU(),
-            nn.Dropout(0.1)
+            
         )
         
         # Vehicle-specific feature processing
         self.vehicle_feature_embedding = nn.Sequential(
             nn.Linear(embedding_dim // 4 + embedding_dim // 4, embedding_dim // 2),  # vehicle_id + vehicle_type
             nn.ELU(),
-            nn.Dropout(0.1)
+            
+        )
+        
+        # 🆕 Target feature processing (target_location + distance + zone)
+        # 输入: target_location_embed (dim//4) + distance (1) + zone_embed (dim//8)
+        self.target_feature_embedding = nn.Sequential(
+            nn.Linear(embedding_dim // 4 + 1 + embedding_dim // 8, embedding_dim // 2),
+            nn.ELU(),
+            
         )
         
         # State embedding layers - 包含所有特征
         state_input_dim = (lstm_hidden + embedding_dim + 2 +      # path + time + other_agents + num_requests
                           embedding_dim // 2 +                    # action_type_embedding
                           embedding_dim // 2 +                    # context_embedding (battery + request_value)
-                          embedding_dim // 2)                     # vehicle_feature_embedding (vehicle_id + type)
+                          embedding_dim // 2 +                    # vehicle_feature_embedding (vehicle_id + type)
+                          embedding_dim // 2)                     # 🆕 target_feature_embedding (target + distance + zone)
         
         self.state_embedding = nn.Sequential(
             nn.Linear(state_input_dim, dense_hidden),
             nn.ELU(),
-            nn.Dropout(0.1),
+            
             nn.Linear(dense_hidden, dense_hidden),
             nn.ELU(),
-            nn.Dropout(0.1),
+            
             nn.Linear(dense_hidden, 1)
         )
         
@@ -2511,6 +2893,8 @@ class PyTorchPathBasedNetwork(nn.Module):
                 num_requests: torch.Tensor,
                 battery_level: torch.Tensor = None,
                 request_value: torch.Tensor = None,
+                target_distance: torch.Tensor = None,
+                target_zoneid: torch.Tensor = None,
                 action_type: torch.Tensor = None,
                 vehicle_id: torch.Tensor = None,
                 vehicle_type: torch.Tensor = None) -> torch.Tensor:
@@ -2525,11 +2909,32 @@ class PyTorchPathBasedNetwork(nn.Module):
             num_requests: [batch_size, 1] - Number of current requests
             battery_level: [batch_size, 1] - Battery level (0-1), optional
             request_value: [batch_size, 1] - Request value (0-1), optional
+            target_distance: [batch_size, 1] - 🆕 Manhattan distance to target (normalized 0-1), optional
+            target_zoneid: [batch_size, 1] - 🆕 Zone ID of target location (0-100), optional
             action_type: [batch_size, 1] - Action type (1=idle, 2=assign, 3=charge), optional
             vehicle_id: [batch_size, 1] - Vehicle ID (1-num_vehicles), optional
             vehicle_type: [batch_size, 1] - Vehicle type (1=EV, 2=AEV), optional
         """
         batch_size = path_locations.size(0)
+        
+        # 🆕 提取target location (假设是path的最后一个非零位置)
+        # 对于assign动作，target是pickup location；对于charge动作，target是station location
+        mask = (path_locations != 0).long()
+        seq_lengths = mask.sum(dim=1)  # [batch_size]
+        target_location_ids = torch.zeros(batch_size, dtype=torch.long, device=path_locations.device)
+        for i in range(batch_size):
+            if seq_lengths[i] > 0:
+                target_location_ids[i] = path_locations[i, seq_lengths[i]-1]
+        
+        # 🆕 处理target distance
+        if target_distance is None:
+            target_distance = torch.zeros(batch_size, 1).to(path_locations.device)
+        
+        # 🆕 处理target zone ID
+        if target_zoneid is None:
+            target_zoneid = torch.zeros(batch_size, 1, dtype=torch.long).to(path_locations.device)
+        else:
+            target_zoneid = target_zoneid.long()
         
         # Get location embeddings
         location_embeds = self.location_embedding(path_locations)  # [batch_size, seq_len, embedding_dim]
@@ -2592,6 +2997,12 @@ class PyTorchPathBasedNetwork(nn.Module):
         vehicle_features = torch.cat([vehicle_id_embed, vehicle_type_embed], dim=1)  # [batch_size, embedding_dim//2]
         vehicle_embed = self.vehicle_feature_embedding(vehicle_features)  # [batch_size, embedding_dim//2]
         
+        # 🆕 Process target features (target_location + distance + zone)
+        target_loc_embed = self.target_location_embedding(target_location_ids)  # [batch_size, embedding_dim//4]
+        target_zone_embed = self.zone_embedding(target_zoneid.squeeze(1))  # [batch_size, embedding_dim//8]
+        target_features = torch.cat([target_loc_embed, target_distance, target_zone_embed], dim=1)  # [batch_size, dim//4 + 1 + dim//8]
+        target_embed = self.target_feature_embedding(target_features)  # [batch_size, embedding_dim//2]
+        
         # Combine all features
         combined_features = torch.cat([
             path_representation,     # [batch_size, lstm_hidden]
@@ -2600,7 +3011,8 @@ class PyTorchPathBasedNetwork(nn.Module):
             num_requests,           # [batch_size, 1]
             action_embed,           # [batch_size, embedding_dim//2]
             context_embed,          # [batch_size, embedding_dim//2]
-            vehicle_embed           # [batch_size, embedding_dim//2]
+            vehicle_embed,          # [batch_size, embedding_dim//2]
+            target_embed            # 🆕 [batch_size, embedding_dim//2]
         ], dim=1)  # [batch_size, total_features]
         
         # Get final value prediction
@@ -2983,7 +3395,7 @@ class DQNActionNetwork(nn.Module):
         self.feature_layer = nn.Sequential(
             nn.Linear(total_feature_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            
             nn.Linear(hidden_dim, hidden_dim)
         )
         
